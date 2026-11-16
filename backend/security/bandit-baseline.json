@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 98850,
+      "loc": 98844,
       "nosec": 0,
       "skipped_tests": 72
     },
@@ -387,7 +387,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1190,
+      "loc": 1186,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1843,7 +1843,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 13,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 2326,
+      "loc": 2324,
       "nosec": 0,
       "skipped_tests": 3
     },
@@ -4611,7 +4611,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "720         cur = self._db.execute(\n721             f\"UPDATE wiki_pages SET {set_clause} WHERE id = ? AND vault_id = ? AND version = ?\",\n722             values,\n",
+      "code": "719         cur = self._db.execute(\n720             f\"UPDATE wiki_pages SET {set_clause} WHERE id = ? AND vault_id = ? AND version = ?\",\n721             values,\n",
       "col_offset": 12,
       "end_col_offset": 95,
       "filename": "backend/app/services/wiki_store.py",
@@ -4622,16 +4622,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 721,
+      "line_number": 720,
       "line_range": [
-        721
+        720
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "810                 conflicts = self._db.execute(\n811                     f\"SELECT canonical_name FROM wiki_entities WHERE vault_id = ? AND id != ? AND lower(canonical_name) IN ({placeholders})\",\n812                     [vault_id, existing_entity.id] + [a.lower() for a in merged_aliases],\n",
+      "code": "809                 conflicts = self._db.execute(\n810                     f\"SELECT canonical_name FROM wiki_entities WHERE vault_id = ? AND id != ? AND lower(canonical_name) IN ({placeholders})\",\n811                     [vault_id, existing_entity.id] + [a.lower() for a in merged_aliases],\n",
       "col_offset": 20,
       "end_col_offset": 140,
       "filename": "backend/app/services/wiki_store.py",
@@ -4642,16 +4642,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 811,
+      "line_number": 810,
       "line_range": [
-        811
+        810
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "861             rows = self._db.execute(\n862                 f\"SELECT * FROM wiki_entities WHERE id IN ({placeholders}) AND vault_id = ?\"\n863                 f\" ORDER BY canonical_name{page_clause}\",\n864                 [*ids, vault_id, *page_params],\n",
+      "code": "860             rows = self._db.execute(\n861                 f\"SELECT * FROM wiki_entities WHERE id IN ({placeholders}) AND vault_id = ?\"\n862                 f\" ORDER BY canonical_name{page_clause}\",\n863                 [*ids, vault_id, *page_params],\n",
       "col_offset": 16,
       "end_col_offset": 56,
       "filename": "backend/app/services/wiki_store.py",
@@ -4662,17 +4662,17 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 862,
+      "line_number": 861,
       "line_range": [
-        862,
-        863
+        861,
+        862
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "867             rows = self._db.execute(\n868                 f\"SELECT * FROM wiki_entities WHERE vault_id = ? AND page_id = ?\"\n869                 f\" ORDER BY canonical_name{page_clause}\",\n870                 [vault_id, page_id, *page_params],\n",
+      "code": "866             rows = self._db.execute(\n867                 f\"SELECT * FROM wiki_entities WHERE vault_id = ? AND page_id = ?\"\n868                 f\" ORDER BY canonical_name{page_clause}\",\n869                 [vault_id, page_id, *page_params],\n",
       "col_offset": 16,
       "end_col_offset": 56,
       "filename": "backend/app/services/wiki_store.py",
@@ -4683,17 +4683,17 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 868,
+      "line_number": 867,
       "line_range": [
-        868,
-        869
+        867,
+        868
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "873             rows = self._db.execute(\n874                 f\"SELECT * FROM wiki_entities WHERE vault_id = ?\"\n875                 f\" ORDER BY canonical_name{page_clause}\",\n876                 [vault_id, *page_params],\n",
+      "code": "872             rows = self._db.execute(\n873                 f\"SELECT * FROM wiki_entities WHERE vault_id = ?\"\n874                 f\" ORDER BY canonical_name{page_clause}\",\n875                 [vault_id, *page_params],\n",
       "col_offset": 16,
       "end_col_offset": 56,
       "filename": "backend/app/services/wiki_store.py",
@@ -4704,17 +4704,17 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 874,
+      "line_number": 873,
       "line_range": [
-        874,
-        875
+        873,
+        874
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "962             placeholders = \",\".join(\"?\" * len(ids))\n963             sql = f\"SELECT * FROM wiki_claims WHERE id IN ({placeholders}) AND vault_id = ?\"\n964             params: list[Any] = [*ids, vault_id]\n",
+      "code": "961             placeholders = \",\".join(\"?\" * len(ids))\n962             sql = f\"SELECT * FROM wiki_claims WHERE id IN ({placeholders}) AND vault_id = ?\"\n963             params: list[Any] = [*ids, vault_id]\n",
       "col_offset": 18,
       "end_col_offset": 92,
       "filename": "backend/app/services/wiki_store.py",
@@ -4725,16 +4725,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 963,
+      "line_number": 962,
       "line_range": [
-        963
+        962
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1070         self._db.execute(\n1071             f\"UPDATE wiki_claims SET {set_clause} WHERE id = ? AND vault_id = ?\", values\n1072         )\n",
+      "code": "1069         self._db.execute(\n1070             f\"UPDATE wiki_claims SET {set_clause} WHERE id = ? AND vault_id = ?\", values\n1071         )\n",
       "col_offset": 12,
       "end_col_offset": 80,
       "filename": "backend/app/services/wiki_store.py",
@@ -4745,16 +4745,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1071,
+      "line_number": 1070,
       "line_range": [
-        1071
+        1070
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1153         rows = self._db.execute(\n1154             f\"SELECT * FROM wiki_claim_sources WHERE claim_id IN ({placeholders}) ORDER BY claim_id, id\",\n1155             claim_ids,\n",
+      "code": "1152         rows = self._db.execute(\n1153             f\"SELECT * FROM wiki_claim_sources WHERE claim_id IN ({placeholders}) ORDER BY claim_id, id\",\n1154             claim_ids,\n",
       "col_offset": 12,
       "end_col_offset": 104,
       "filename": "backend/app/services/wiki_store.py",
@@ -4765,16 +4765,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1154,
+      "line_number": 1153,
       "line_range": [
-        1154
+        1153
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2413             rows = self._db.execute(\n2414                 f\"SELECT id FROM {table} WHERE id IN ({ph}) AND vault_id = ?{extra_clauses}\",\n2415                 [*chunk, vault_id, *params],\n",
+      "code": "2412             rows = self._db.execute(\n2413                 f\"SELECT id FROM {table} WHERE id IN ({ph}) AND vault_id = ?{extra_clauses}\",\n2414                 [*chunk, vault_id, *params],\n",
       "col_offset": 16,
       "end_col_offset": 92,
       "filename": "backend/app/services/wiki_store.py",
@@ -4785,16 +4785,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2414,
+      "line_number": 2413,
       "line_range": [
-        2414
+        2413
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2460                 rows = self._db.execute(\n2461                     f\"SELECT * FROM wiki_pages WHERE id IN ({ph}) \"\n2462                     f\"ORDER BY {order_col} {order_dir} LIMIT ?\",\n2463                     [*matched, limit],\n",
+      "code": "2459                 rows = self._db.execute(\n2460                     f\"SELECT * FROM wiki_pages WHERE id IN ({ph}) \"\n2461                     f\"ORDER BY {order_col} {order_dir} LIMIT ?\",\n2462                     [*matched, limit],\n",
       "col_offset": 20,
       "end_col_offset": 63,
       "filename": "backend/app/services/wiki_store.py",
@@ -4805,17 +4805,17 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2461,
+      "line_number": 2460,
       "line_range": [
-        2461,
-        2462
+        2460,
+        2461
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2472                 rows = self._db.execute(\n2473                     f\"SELECT * FROM wiki_claims WHERE id IN ({ph}) \"\n2474                     \"ORDER BY created_at DESC, id DESC LIMIT ?\",\n2475                     [*matched, limit],\n",
+      "code": "2471                 rows = self._db.execute(\n2472                     f\"SELECT * FROM wiki_claims WHERE id IN ({ph}) \"\n2473                     \"ORDER BY created_at DESC, id DESC LIMIT ?\",\n2474                     [*matched, limit],\n",
       "col_offset": 20,
       "end_col_offset": 63,
       "filename": "backend/app/services/wiki_store.py",
@@ -4826,17 +4826,17 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2473,
+      "line_number": 2472,
       "line_range": [
-        2473,
-        2474
+        2472,
+        2473
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2484                 rows = self._db.execute(\n2485                     f\"SELECT * FROM wiki_entities WHERE id IN ({ph}) \"\n2486                     \"ORDER BY canonical_name LIMIT ?\",\n2487                     [*matched, limit],\n",
+      "code": "2483                 rows = self._db.execute(\n2484                     f\"SELECT * FROM wiki_entities WHERE id IN ({ph}) \"\n2485                     \"ORDER BY canonical_name LIMIT ?\",\n2486                     [*matched, limit],\n",
       "col_offset": 20,
       "end_col_offset": 53,
       "filename": "backend/app/services/wiki_store.py",
@@ -4847,17 +4847,17 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2485,
+      "line_number": 2484,
       "line_range": [
-        2485,
-        2486
+        2484,
+        2485
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2651                 for r in self._db.execute(\n2652                     f\"SELECT id, slug FROM wiki_pages WHERE vault_id = ? AND slug IN ({placeholders})\",\n2653                     [vault_id, *unique_slugs],\n",
+      "code": "2650                 for r in self._db.execute(\n2651                     f\"SELECT id, slug FROM wiki_pages WHERE vault_id = ? AND slug IN ({placeholders})\",\n2652                     [vault_id, *unique_slugs],\n",
       "col_offset": 20,
       "end_col_offset": 102,
       "filename": "backend/app/services/wiki_store.py",
@@ -4868,9 +4868,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2652,
+      "line_number": 2651,
       "line_range": [
-        2652
+        2651
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
