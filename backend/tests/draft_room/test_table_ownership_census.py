@@ -43,18 +43,25 @@ so the map cannot silently regress to "single owner" or grow a fifth writer.
 Precision boundary (issue #926), with each limitation's trigger named:
 a verb+table match counts only at a live statement position — comments are
 stripped quote-aware (single/double/backtick/bracket quoting all suppress
-the markers), the verb must start a statement (start-of-string, ``;`` or
-``(`` behind it), and the prose colon after the table rejects sentence
-noise. Disclosed limitations the grammar cannot close: a SQL constant
-defined in one module and executed in another stays invisible (cross-module
-name resolution is out of scope — the name map is module-local);
-``job_lease.py`` writes ``draft_jobs`` through a constructor-supplied table
-attribute, unreachable to any static fold (declared co-owner in
-``draft_store.py``'s map instead); directory symlinks under the scan root
-are not traversed (``rglob`` recursion follows no symlinks); a
-``PermissionError`` on a directory aborts the walk (fail closed); and a
-function-local assignment shadowing a module constant resolves to nothing
-(fail toward missing, never the wrong value).
+the markers; a single-line ``/* */`` comment is replaced by a space so the
+surrounding tokens do not join), the verb must start a statement
+(start-of-string, ``;``, ``(`` or ``)`` behind it — ``)`` admits
+CTE-prefixed writes), single-quoted SQL literal content is BLANKED (a
+literal is data: SQL text held in a string value cannot forge a statement,
+while double-quote/backtick/bracket identifier content — the table-name
+spellings — stays visible), and the prose colon after the table rejects
+sentence noise. Disclosed limitations the grammar cannot close: a SQL
+constant defined in one module and executed in another stays invisible
+(cross-module name resolution is out of scope — the name map is
+module-local); ``job_lease.py`` writes ``draft_jobs`` through a
+constructor-supplied table attribute, unreachable to any static fold
+(declared co-owner in ``draft_store.py``'s map instead); directory
+symlinks under the scan root are not traversed (``rglob`` recursion
+follows no symlinks); a ``PermissionError`` on a directory aborts the walk
+(fail closed); a function-local assignment shadowing a module constant
+resolves to nothing (fail toward missing, never the wrong value); and the
+``)`` anchor admits a write that follows a parenthetical in prose
+(over-counting — the census fails loudly, never silently).
 """
 
 from __future__ import annotations
@@ -221,7 +228,16 @@ def _strip_sql_comments(text: str) -> str:
     and bracket quoting), so a ``--`` inside any quoted token is string
     text, not a comment boundary (``"SELECT '--'; UPDATE drafts ..."``
     keeps its live write). A block comment that spanned lines leaves a
-    newline behind so statement anchors survive.
+    newline behind so statement anchors survive; a single-line block
+    comment is replaced by a space so the surrounding tokens do not join
+    (``UPDATE/* c */drafts`` must not become ``UPDATEdrafts``).
+
+    Implementation-review round 3: single-quoted tokens are SQL string
+    LITERALS (data) — their CONTENT is blanked (same length, benign
+    filler), so SQL text held as data (``SELECT '; UPDATE drafts ...'``)
+    cannot forge a live statement anchor or a verb+table match.
+    Double-quoted, backtick, and bracket tokens are IDENTIFIERS (the
+    table-name spellings) — their content stays visible.
     """
     out: list[str] = []
     i = 0

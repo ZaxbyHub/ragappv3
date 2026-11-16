@@ -36,18 +36,27 @@ Trace: `.agents/issue-traces/1135-926-916-draft-room-residuals` (issue-tracer v3
   The single-transaction settlement alternative remains with #790's
   single-writer consolidation.
 - **Census precision (#926)**: the table-ownership census now recognizes a
-  write only at a live SQL statement position — comments (`--` and `/* */`)
-  are stripped quote-aware across all four SQLite quoting styles, the verb
-  must start a statement (start-of-string/`;`/`(`), and the prose colon
-  after the table rejects sentence noise. Non-first-statement docstrings
+  write only at a live SQL statement position. Comments are stripped
+  quote-aware across all four SQLite quoting styles (a single-line `/* */`
+  comment is replaced by a space so the surrounding tokens do not join), the
+  verb must start a statement (start-of-string, `;`, `(`, or `)` — the `)`
+  anchor admits CTE-prefixed writes such as
+  `WITH x AS (SELECT 1) UPDATE drafts ...`), and the prose colon after the
+  table rejects sentence noise. Single-quoted SQL literals are DATA: their
+  content is blanked (token boundaries kept), so a write embedded in a
+  string value (`SELECT '; UPDATE drafts ...'`) cannot forge a live
+  statement, while double-quote/backtick/bracket identifier content — the
+  table-name spellings — stays visible. Non-first-statement docstrings
   (PEP 258 attribute docstrings, bare strings under `if`/`try`) are excluded,
   and module-level constants feed write expressions across a name boundary
   (`PREFIX + "draft_jobs SET ..."`), counted exactly once per use with
   function-local shadowing resolving to nothing. The census docstring now
   names every disclosed limitation with its trigger (cross-module constants,
   `job_lease` constructor-arg tables, symlinked dirs, `PermissionError`
-  traversal, local shadowing). Real counts pinned exactly: 8 route / 7
-  processor / 11 pipeline, zero unlisted, store floor 40 (46 measured).
+  traversal, local shadowing, and the `)` anchor's over-count of a write
+  that follows a parenthetical in prose — fail-loud, not silent). Real
+  counts pinned exactly: 8 route / 7 processor / 11 pipeline, zero unlisted,
+  store floor 40 (46 measured).
 - **Typed-branch cleanup logs (#916)**: each of the three typed promotion
   branches (`DuplicateError` 409 / `TooLargeError` 413 /
   `PathConflictError` 409) with `cleanup_incomplete=True` now emits ONE
