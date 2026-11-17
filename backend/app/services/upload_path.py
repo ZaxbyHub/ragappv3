@@ -133,6 +133,12 @@ def migrate_uploads(dry_run: bool = False) -> MigrationResult:
         if dest_path.exists():
             failed.append(f.name)
             logger.warning(
+                "Destination already exists for uploaded file (name_len=%d,"
+                " path_len=%d); skipping to avoid overwriting existing bytes",
+                len(f.name),
+                len(str(dest_path)),
+            )
+            logger.debug(
                 "Destination %s already exists for %s; skipping to avoid "
                 "overwriting existing bytes",
                 dest_path,
@@ -141,7 +147,11 @@ def migrate_uploads(dry_run: bool = False) -> MigrationResult:
             continue
 
         if dry_run:
-            logger.info(f"[DRY RUN] Would move {f.name} to vault {vault_id}")
+            logger.info(
+                f"[DRY RUN] Would move uploaded file to vault {vault_id}"
+                f" (name_len={len(f.name)})"
+            )
+            logger.debug(f"[DRY RUN] Would move {f.name} to vault {vault_id}")
             migrated += 1
             continue
 
@@ -158,7 +168,11 @@ def migrate_uploads(dry_run: bool = False) -> MigrationResult:
             if f.stat().st_size != temp_path.stat().st_size:
                 _unlink_quietly(temp_path)  # Rollback copy
                 failed.append(f.name)
-                logger.warning(f"Size mismatch for {f.name}, skipping")
+                logger.warning(
+                    f"Size mismatch for uploaded file (name_len={len(f.name)})"
+                    f", skipping"
+                )
+                logger.debug(f"Size mismatch for {f.name}, skipping")
                 continue
 
             # Bytes complete and size-verified: place them atomically.
@@ -175,7 +189,11 @@ def migrate_uploads(dry_run: bool = False) -> MigrationResult:
             # review PRR-006).
             _unlink_quietly(temp_path)
             failed.append(f.name)
-            logger.error(f"Failed to migrate {f.name}: {e}")
+            logger.error(
+                f"Failed to migrate uploaded file (name_len={len(f.name)},"
+                f" exc={type(e).__name__})"
+            )
+            logger.debug(f"Failed to migrate {f.name}: {e}")
             continue
 
         # The bytes are committed to the new location; move the row with them
@@ -188,8 +206,15 @@ def migrate_uploads(dry_run: bool = False) -> MigrationResult:
         # counting a mismatched migration as migrated.
         try:
             if _set_file_row_path(str(f), str(dest_path)) == 0:
-                raise RuntimeError(
+                # #982: this raised text is formatted by the except arm's
+                # default-level ERRORs — keep the user-derived path out of
+                # it; full path at DEBUG only.
+                logger.debug(
                     f"no files row names the legacy path being migrated ({f})"
+                )
+                raise RuntimeError(
+                    f"no files row names the legacy path being migrated"
+                    f" (path_len={len(str(f))})"
                 )
         except Exception as e:
             failed.append(f.name)
@@ -201,6 +226,17 @@ def migrate_uploads(dry_run: bool = False) -> MigrationResult:
                     # only surviving copy stays at dest_path — never unlink
                     # it; the logged paths let an operator repair the row.
                     logger.error(
+                        "Migration row update failed (name_len=%d) AND the "
+                        "source name reappeared (path_len=%d); bytes remain "
+                        "at a non-default location (dest_path_len=%d) while "
+                        "the row still names the reappeared file — manual "
+                        "row repair needed (update error: %s)",
+                        len(f.name),
+                        len(str(f)),
+                        len(str(dest_path)),
+                        type(e).__name__,
+                    )
+                    logger.debug(
                         "Migration row update failed for %s AND the source "
                         "name %s reappeared; bytes remain at %s while the "
                         "row still names the reappeared file — manual row "
@@ -219,6 +255,13 @@ def migrate_uploads(dry_run: bool = False) -> MigrationResult:
                         backup_path.rename(f)
                         dest_path.unlink()
                         logger.error(
+                            "Migration row update failed (name_len=%d); "
+                            "reverted the bytes to the legacy path the row "
+                            "still names (update error: %s)",
+                            len(f.name),
+                            type(e).__name__,
+                        )
+                        logger.debug(
                             "Migration row update failed for %s; reverted the "
                             "bytes to the legacy path the row still names: %s",
                             f.name,
@@ -226,6 +269,17 @@ def migrate_uploads(dry_run: bool = False) -> MigrationResult:
                         )
                     except OSError as restore_exc:
                         logger.error(
+                            "Migration row update failed (name_len=%d) AND "
+                            "the source restore failed (%s); bytes remain at "
+                            "a non-default location (dest_path_len=%d) while "
+                            "the row still names the legacy path "
+                            "(path_len=%d) — manual row repair needed",
+                            len(f.name),
+                            type(restore_exc).__name__,
+                            len(str(dest_path)),
+                            len(str(f)),
+                        )
+                        logger.debug(
                             "Migration row update failed for %s AND the "
                             "source restore failed (%s); bytes remain at %s "
                             "while the row still names %s — manual row repair "
@@ -237,8 +291,11 @@ def migrate_uploads(dry_run: bool = False) -> MigrationResult:
                         )
             else:
                 logger.error(
-                    "Migration row update failed for %s: %s", f.name, e
+                    "Migration row update failed (name_len=%d, error: %s)",
+                    len(f.name),
+                    type(e).__name__,
                 )
+                logger.debug("Migration row update failed for %s: %s", f.name, e)
             continue
 
         migrated += 1
@@ -297,7 +354,11 @@ def _lookup_vault_id_for_path(path: str) -> int:
         ).fetchone()
         if row:
             return row[0]
-        raise ValueError(f"Could not determine vault for file: {path}")
+        # #982: the caller logs this message at WARNING (default level) —
+        # keep the user-derived path out of the raised text; full path at
+        # DEBUG only.
+        logger.debug(f"Could not determine vault for file: {path}")
+        raise ValueError(f"Could not determine vault for file (path_len={len(path)})")
     finally:
         pool.release_connection(conn)
 

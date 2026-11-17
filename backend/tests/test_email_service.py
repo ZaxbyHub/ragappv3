@@ -1038,7 +1038,13 @@ class TestEmailServiceIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_resolve_vault_id_not_found(self):
         with self.assertRaises(ValueError) as ctx:
             await self.service._resolve_vault_id("NonExistentVault")
-        self.assertIn("NonExistentVault", str(ctx.exception))
+        # #982 Family B: the raised text is formatted by the caller's
+        # per-email ERROR at default level — only a length-bounded form of
+        # the user-chosen name may appear; the full name is DEBUG-only.
+        msg = str(ctx.exception)
+        self.assertIn("does not exist", msg)
+        self.assertIn("name_len=16", msg)
+        self.assertNotIn("NonExistentVault", msg)
 
     async def test_resolve_vault_id_none(self):
         with self.assertRaises(ValueError) as ctx:
@@ -1296,6 +1302,9 @@ class TestVaultNameLogSanitization(unittest.IsolatedAsyncioTestCase):
         missing vault must not carry control chars from the supplied name.
 
         Fails on pre-fix code (raw f-string interpolation in the ValueError).
+        Since #982 (Family B) the message is even stricter: the user-chosen
+        name does not appear at all (length-bounded raise; full name at
+        DEBUG), so control chars cannot leak either.
         """
         tainted_name = "Ghost\nINJECTED LOG LINE"
         with self.assertRaises(ValueError) as ctx:
@@ -1303,9 +1312,10 @@ class TestVaultNameLogSanitization(unittest.IsolatedAsyncioTestCase):
         msg = str(ctx.exception)
         self.assertNotIn("\n", msg, f"newline leaked into ValueError: {msg!r}")
         self.assertNotIn("\r", msg, f"CR leaked into ValueError: {msg!r}")
-        # The sanitized name (newlines -> spaces) should still be present so the
-        # message remains useful to an operator.
-        self.assertIn("Ghost", msg)
+        # #982: only the bounded form remains in the raised message — the
+        # raw (or sanitized) name must be absent entirely.
+        self.assertNotIn("Ghost", msg)
+        self.assertIn("name_len=", msg)
 
     def test_no_raw_vault_name_interpolation_in_source(self):
         """Structural guard for the 'grep confirms no raw interpolation'

@@ -15,6 +15,7 @@ successful listing that lacks the configured model is authoritative
 "unavailable" (genuine misconfiguration surfaces instead of being masked).
 """
 import asyncio
+import logging
 from typing import Any, Dict, Optional
 
 import httpx
@@ -26,8 +27,11 @@ from app.services.circuit_breaker import (
     is_outage_status,
     model_checker_cb,
 )
+from app.services.llm_client import _summarize_provider_body
 from app.services.ssrf import assert_url_safe
 from app.services.telemetry import correlation_headers as _correlation_headers
+
+logger = logging.getLogger(__name__)
 
 
 class ModelCheckerError(Exception):
@@ -88,9 +92,10 @@ def _model_check_error(timeout: float, exc: BaseException) -> Dict[str, Any]:
     if isinstance(exc, httpx.TimeoutException):
         return _ProbeFailureResult({'available': False, 'error': f"Request timed out after {timeout}s"})
     if isinstance(exc, httpx.HTTPStatusError):
+        logger.debug("Model probe error body: %s", exc.response.text)
         return _ProbeFailureResult({
             'available': False,
-            'error': f"HTTP error {exc.response.status_code}: {exc.response.text}",
+            'error': _summarize_provider_body(exc.response.status_code, exc.response.text),
             # Structured status so the breaker wrapper can classify without
             # parsing the message (issue #717).
             'status_code': exc.response.status_code,

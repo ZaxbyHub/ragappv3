@@ -483,6 +483,70 @@ def _is_duplicate_hash_integrity_error(exc: BaseException) -> bool:
     return bool(_FILES_HASH_VAULT_UNIQUE_RE.match(str(exc) or ""))
 
 
+async def _unwind_duplicate_loser_generation(
+    vector_store: Any,
+    pool: Any,
+    file_id: int,
+    vector_target: Optional[object] = None,
+) -> bool:
+    """issue #1131 CC-001: fenced unwind of a duplicate race-loser's vectors.
+
+    The loser already wrote its vector generation before losing the
+    finalization race; when the fenced backstop settles its row to the
+    duplicate terminal state, this removes that orphaned generation.
+
+    Lock order is Lance-first / SQLite-second — the order
+    ``VectorStore.commit_dimension_rebuild`` already establishes: the
+    store's public ``write_locked()`` context is held across an explicit
+    ``BEGIN IMMEDIATE`` claim, so a same-path row reset (:meth:`process_existing_file`
+    reuse UPDATE) in ANY process cannot commit between the claim-read and
+    the delete. A reset that committed earlier is visible in the claim
+    (row no longer terminal-duplicate -> skip the delete entirely); one
+    committing later writes its replacement vectors strictly after this
+    delete.
+
+    Returns True when a still-terminal duplicate row's generation was
+    deleted, False when the claim saw the row move on. Raises only store
+    failures — the caller decides the (best-effort) fallback.
+    """
+    async with vector_store.write_locked():
+        async with write_session(pool) as conn:
+            # Close any latent implicit transaction before the explicit
+            # BEGIN (a bare COMMIT with no open tx is a no-op).
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT status, error_message, file_hash FROM files "
+                    "WHERE id = ?",
+                    (file_id,),
+                ).fetchone()
+                if row is None:
+                    conn.commit()
+                    return False
+                status = row[0]
+                error_message = row[1] or ""
+                file_hash = row[2] or ""
+                if status != "error" or not error_message.startswith(
+                    "DUPLICATE_FILE:"
+                ):
+                    # The row moved on (reset/recovery won the race);
+                    # nothing here is safely deletable.
+                    conn.commit()
+                    return False
+                await vector_store.delete_generation_by_file_locked(
+                    str(file_id), file_hash, target=vector_target
+                )
+                conn.commit()
+                return True
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
+
 def classify_ingest_error(exc: BaseException) -> str:
     """Map an ingestion failure to a stable, user-facing error code.
 
@@ -1435,10 +1499,17 @@ class DocumentProcessor:
 
         if oversized:
             logger.warning(
-                "Document '%s' has %d chunk(s) exceeding effective embedding length (%d chars after prefix): %s. "
+                "Document (name_len=%d) has %d chunk(s) exceeding effective embedding length (%d chars after prefix): %s. "
                 "With fail_fast=False embed_batch returns None placeholders at these positions "
                 "(dropped from the embedded set; the enrichment path treats any None as a chunk-level failure); "
                 "fail_fast=True raises.",
+                len(source_filename),
+                len(oversized),
+                effective_max,
+                ", ".join(f"chunk {i} ({size} chars)" for i, size in oversized),
+            )
+            logger.debug(
+                "Document '%s' has %d chunk(s) exceeding effective embedding length (%d chars after prefix): %s.",
                 source_filename,
                 len(oversized),
                 effective_max,
@@ -3896,9 +3967,14 @@ class DocumentProcessor:
 
         if not image_result.success:
             logger.warning(
-                "Image processing failed for %s: %s. File not indexed "
+                "Image processing failed (path_len=%d): %s. File not indexed "
                 "(issue #703: an image whose OCR could not run is a "
                 "degraded failure, not a clean success).",
+                len(str(file_path)),
+                image_result.error,
+            )
+            logger.debug(
+                "Image processing failed for %s: %s",
                 file_path,
                 image_result.error,
             )
@@ -3917,8 +3993,12 @@ class DocumentProcessor:
             # on the empty chunk list ("No extractable content found"), so the
             # file ends 'error' — the old wording claimed it was recorded.
             logger.warning(
-                "Image %s produced no searchable text; the ingest will fail "
-                "with a no-extractable-content error.",
+                "Image (path_len=%d) produced no searchable text; the ingest "
+                "will fail with a no-extractable-content error.",
+                len(str(file_path)),
+            )
+            logger.debug(
+                "Image %s produced no searchable text",
                 file_path,
             )
             return (
@@ -3957,7 +4037,12 @@ class DocumentProcessor:
             )
             asset_payloads[asset_id] = image_data
         except Exception as exc:  # noqa: BLE001 - asset planning is best-effort
-            logger.warning("Failed to plan image asset for %s: %s", file_path, exc)
+            logger.warning(
+                "Failed to plan image asset (path_len=%d): %s",
+                len(str(file_path)),
+                exc,
+            )
+            logger.debug("Failed to plan image asset for %s: %s", file_path, exc)
 
         atom = DocumentAtom(
             atom_id=make_atom_id(file_id, generation_hash, 0),
@@ -4382,7 +4467,10 @@ class DocumentProcessor:
         return True
 
     async def _settle_duplicate_finalize_race(
-        self, file_id: int, exc: sqlite3.IntegrityError
+        self,
+        file_id: int,
+        exc: sqlite3.IntegrityError,
+        vector_target: Optional[object] = None,
     ) -> None:
         """issue #1112 finalization race backstop, shared by both ingest
         tails (review FB-008 — the tails converge per issue #513 W9/C26, so
@@ -4398,6 +4486,11 @@ class DocumentProcessor:
         semantics. Other integrity failures (FK, CHECK, other tables)
         re-raise unchanged through this same arm. Must be called from the
         ``except sqlite3.IntegrityError`` block of a finalize call.
+
+        issue #1131 CC-001: when the settlement lands, the loser's already
+        written vector generation is unwound (best-effort fenced delete via
+        ``_unwind_duplicate_loser_generation``; ``vector_target`` names the
+        table the loser wrote to, when the tail carried one).
         """
         if not _is_duplicate_hash_integrity_error(exc):
             raise
@@ -4428,6 +4521,30 @@ class DocumentProcessor:
                 message=safe_error,
                 percent=None,
             )
+            # issue #1131 CC-001: the loser wrote its generation before
+            # losing the race — unwind it under the fenced claim. Runs
+            # AFTER the session exits (the write permit is non-reentrant,
+            # same constraint as set_phase above). Best-effort: a failed
+            # delete leaves the orphan exactly as at base (operator
+            # vault reindex recovers it).
+            try:
+                await _unwind_duplicate_loser_generation(
+                    self.vector_store,
+                    self.pool,
+                    file_id,
+                    vector_target=vector_target,
+                )
+            except Exception:
+                logger.warning(
+                    "Duplicate race-loser vector unwind failed for "
+                    "file_id=%d; the orphaned generation remains "
+                    "(operator vault reindex recovers it)",
+                    file_id,
+                )
+                logger.debug(
+                    "Duplicate race-loser unwind failure detail",
+                    exc_info=True,
+                )
         else:
             logger.warning(
                 "Duplicate finalization collision for file_id=%d "
@@ -4605,6 +4722,11 @@ class DocumentProcessor:
                 chunker = self._get_contextual_chunker()
                 if chunker is not None:
                     logger.info(
+                        "Contextual chunking: processing %d chunks (name_len=%d)",
+                        len(chunks),
+                        len(source_filename),
+                    )
+                    logger.debug(
                         "Contextual chunking: processing %d chunks for %s",
                         len(chunks),
                         source_filename,
@@ -4617,12 +4739,22 @@ class DocumentProcessor:
                             source_filename=source_filename,
                         )
                         logger.info(
+                            "Contextual chunking: completed (name_len=%d, %d chunks contextualized)",
+                            len(source_filename),
+                            len(chunks),
+                        )
+                        logger.debug(
                             "Contextual chunking: completed for %s (%d chunks contextualized)",
                             source_filename,
                             len(chunks),
                         )
                     except Exception as e:
                         logger.warning(
+                            "Contextual chunking failed (name_len=%d, exc=%s)",
+                            len(source_filename),
+                            type(e).__name__,
+                        )
+                        logger.debug(
                             "Contextual chunking failed for %s: %s",
                             source_filename,
                             str(e),
@@ -4652,6 +4784,11 @@ class DocumentProcessor:
                     )
                 except Exception as e:
                     logger.warning(
+                        "compute_parent_windows failed (name_len=%d, exc=%s) — parent offsets will be None",
+                        len(Path(file_path).name),
+                        type(e).__name__,
+                    )
+                    logger.debug(
                         "compute_parent_windows failed for %s: %s — parent offsets will be None",
                         Path(file_path).name,
                         e,
@@ -5153,11 +5290,11 @@ class DocumentProcessor:
         _add_elapsed_ms(stage_timings, "sqlite_finalize_ms", stage_started_at)
 
         logger.info(
-            "Ingestion stage timings file_id=%s file_name=%s parse_ms=%.1f chunk_ms=%.1f "
+            "Ingestion stage timings file_id=%s name_len=%d parse_ms=%.1f chunk_ms=%.1f "
             "contextual_ms=%.1f parent_window_ms=%.1f "
             "embedding_ms=%.1f vector_write_ms=%.1f optimize_ms=%.1f sqlite_finalize_ms=%.1f",
             file_id,
-            Path(file_path).name,
+            len(Path(file_path).name),
             stage_timings["parse_ms"],
             stage_timings["chunk_ms"],
             stage_timings["contextual_ms"],
@@ -5166,6 +5303,11 @@ class DocumentProcessor:
             stage_timings["vector_write_ms"],
             stage_timings["optimize_ms"],
             stage_timings["sqlite_finalize_ms"],
+        )
+        logger.debug(
+            "Ingestion stage timings file_id=%s file_name=%s",
+            file_id,
+            Path(file_path).name,
         )
 
         return ProcessedDocument(
@@ -5244,6 +5386,11 @@ class DocumentProcessor:
             # it. The persisted message is a stable code, not the server path
             # (issue #562); the path stays in the server log.
             logger.warning(
+                "process_existing_file: file missing for file_id=%s (path_len=%d)",
+                file_id,
+                len(str(file_path)),
+            )
+            logger.debug(
                 "process_existing_file: file missing for file_id=%s: %s",
                 file_id,
                 file_path,
@@ -5266,6 +5413,11 @@ class DocumentProcessor:
             raise FileNotFoundError(f"File not found: {file_path}")
         if not path.is_file():
             logger.warning(
+                "process_existing_file: path is not a file for file_id=%s (path_len=%d)",
+                file_id,
+                len(str(file_path)),
+            )
+            logger.debug(
                 "process_existing_file: path is not a file for file_id=%s: %s",
                 file_id,
                 file_path,
@@ -5427,6 +5579,11 @@ class DocumentProcessor:
                         )
                     except Exception as e:
                         logger.warning(
+                            "Contextual chunking failed (name_len=%d, exc=%s)",
+                            len(source_filename),
+                            type(e).__name__,
+                        )
+                        logger.debug(
                             "Contextual chunking failed for %s: %s",
                             source_filename,
                             str(e),
@@ -5446,6 +5603,11 @@ class DocumentProcessor:
                     )
                 except Exception as e:
                     logger.warning(
+                        "compute_parent_windows failed (name_len=%d, exc=%s)",
+                        len(Path(file_path).name),
+                        type(e).__name__,
+                    )
+                    logger.debug(
                         "compute_parent_windows failed for %s: %s",
                         Path(file_path).name,
                         e,
@@ -6074,8 +6236,11 @@ class DocumentProcessor:
             )
         except sqlite3.IntegrityError as exc:
             # issue #1112 finalization race backstop (shared helper — the
-            # same fenced settlement its process_file twin applies).
-            await self._settle_duplicate_finalize_race(file_id, exc)
+            # same fenced settlement its process_file twin applies). The
+            # loser wrote to vector_target when one was carried (#1131).
+            await self._settle_duplicate_finalize_race(
+                file_id, exc, vector_target=vector_target
+            )
         if not finalized:
             logger.info(
                 "Ingest generation voided for file_id=%d: row settled "
@@ -6086,11 +6251,11 @@ class DocumentProcessor:
         _add_elapsed_ms(stage_timings, "sqlite_finalize_ms", stage_started_at)
 
         logger.info(
-            "Ingestion stage timings file_id=%s file_name=%s parse_ms=%.1f chunk_ms=%.1f "
+            "Ingestion stage timings file_id=%s name_len=%d parse_ms=%.1f chunk_ms=%.1f "
             "contextual_ms=%.1f parent_window_ms=%.1f "
             "embedding_ms=%.1f vector_write_ms=%.1f optimize_ms=%.1f sqlite_finalize_ms=%.1f",
             file_id,
-            Path(file_path).name,
+            len(Path(file_path).name),
             stage_timings["parse_ms"],
             stage_timings["chunk_ms"],
             stage_timings["contextual_ms"],
@@ -6099,6 +6264,11 @@ class DocumentProcessor:
             stage_timings["vector_write_ms"],
             stage_timings["optimize_ms"],
             stage_timings["sqlite_finalize_ms"],
+        )
+        logger.debug(
+            "Ingestion stage timings file_id=%s file_name=%s",
+            file_id,
+            Path(file_path).name,
         )
 
         return ProcessedDocument(

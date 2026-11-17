@@ -3785,10 +3785,12 @@ class BackgroundProcessor:
                 outcome = await asyncio.to_thread(_insert_job)
             except Exception:  # noqa: BLE001 — degrade to legacy transport
                 logger.warning(
-                    "Jobs-row insert failed for %s; using in-memory queue only",
-                    file_path,
+                    "Jobs-row insert failed (path_len=%d); using in-memory "
+                    "queue only",
+                    len(str(file_path)),
                     exc_info=True,
                 )
+                logger.debug("Jobs-row insert failed for %s", file_path)
                 outcome = None
                 # An insert EXCEPTION is not a dedupe suppression: with no
                 # durable row created, the legacy in-memory put below is the
@@ -3899,6 +3901,11 @@ class BackgroundProcessor:
         never land on that path.
         """
         logger.info(
+            "Cancelling ingestion task (file_id=%s, path_len=%d)",
+            task.file_id,
+            len(task.file_path),
+        )
+        logger.debug(
             "Cancelling ingestion task for %s (file_id=%s)",
             task.file_path,
             task.file_id,
@@ -4153,9 +4160,14 @@ class BackgroundProcessor:
                         # Retry backlog full or shutdown began: fail the task
                         # outright rather than wedge the queue drain.
                         logger.error(
+                            "Ingestion admission deferral (path_len=%d) "
+                            "could not be scheduled (retry backlog full or "
+                            "shutdown); treating as permanent failure",
+                            len(task.file_path),
+                        )
+                        logger.debug(
                             "Ingestion admission deferral for %s could not be "
-                            "scheduled (retry backlog full or shutdown); "
-                            "treating as permanent failure",
+                            "scheduled",
                             task.file_path,
                         )
                         self._mark_task_permanently_failed(
@@ -5124,6 +5136,22 @@ class BackgroundProcessor:
                     None,
                 )
 
+        # issue #1131 RP-001: staged-abort marker + failure-ledger defaults,
+        # initialized BEFORE the outer try so an early SELECT/probe failure
+        # reaching the outer except cannot compose against unbound locals
+        # (plan-critic round-2 finding 14).
+        staged_aborted = False
+        # Issue #702 (P02-SK2-04): the structured failure ledger the lease
+        # caller narrows the next retry attempt with, plus the first
+        # failing exception object so the persisted cap error carries a
+        # real (redacted, #562) reason instead of a literal None.
+        failed_ids: list[int] = []
+        # issue #1112: deterministic duplicate-hash failures tracked
+        # separately from transient failures so the job settlers exclude
+        # them from every retry scope.
+        duplicate_ids: list[int] = []
+        failed_details: list[str] = []
+
         try:
             # Select files to reindex. Issue #702 (P02-SK2-04): a retry
             # attempt narrows the scope to the files that failed the
@@ -5145,27 +5173,43 @@ class BackgroundProcessor:
                         "SELECT id, file_path, vault_id FROM files "
                         "WHERE vault_id = ? AND status IN "
                         "('indexed', 'partial', 'error') "
-                        "AND id IN (SELECT value FROM json_each(?))"
+                        "AND id IN (SELECT value FROM json_each(?)) "
+                        # issue #1131 ABSORB: duplicate-settled rows are
+                        # deterministic no-owner files — re-selecting them
+                        # re-fails the pre-vector guard on every later
+                        # reindex and blocks the readiness lift.
+                        "AND NOT (status = 'error' AND error_message "
+                        "IS NOT NULL AND error_message LIKE "
+                        "'DUPLICATE_FILE:%')"
                     )
                     params: tuple = (vault_id, retry_scope_json)
                 elif vault_id is not None:
                     sql = (
                         "SELECT id, file_path, vault_id FROM files "
                         "WHERE vault_id = ? AND status IN "
-                        "('indexed', 'partial', 'error')"
+                        "('indexed', 'partial', 'error') "
+                        "AND NOT (status = 'error' AND error_message "
+                        "IS NOT NULL AND error_message LIKE "
+                        "'DUPLICATE_FILE:%')"
                     )
                     params = (vault_id,)
                 elif retry_scope_json is not None:
                     sql = (
                         "SELECT id, file_path, vault_id FROM files "
                         "WHERE status IN ('indexed', 'partial', 'error') "
-                        "AND id IN (SELECT value FROM json_each(?))"
+                        "AND id IN (SELECT value FROM json_each(?)) "
+                        "AND NOT (status = 'error' AND error_message "
+                        "IS NOT NULL AND error_message LIKE "
+                        "'DUPLICATE_FILE:%')"
                     )
                     params = (retry_scope_json,)
                 else:
                     sql = (
                         "SELECT id, file_path, vault_id FROM files "
-                        "WHERE status IN ('indexed', 'partial', 'error')"
+                        "WHERE status IN ('indexed', 'partial', 'error') "
+                        "AND NOT (status = 'error' AND error_message "
+                        "IS NOT NULL AND error_message LIKE "
+                        "'DUPLICATE_FILE:%')"
                     )
                     params = ()
                 rows = conn.execute(sql, params).fetchall()
@@ -5337,12 +5381,12 @@ class BackgroundProcessor:
                             getattr(rebuild_handle, "table_name", "?"),
                         )
 
-            # Initialize counters
+            # Initialize counters (the RP-001/#702/#1112 ledgers above the
+            # outer try are the authoritative initializations)
             total_files = 0
             processed_files = 0
             failed_files = 0
             cancelled_files = 0
-            failed_details: list[str] = []
             # Issue #1010: the per-file iteration order, precomputed so a
             # watchdog cancellation can record the interrupted + remaining
             # scope as the settle's $.retry_file_ids without re-walking.
@@ -5351,15 +5395,6 @@ class BackgroundProcessor:
                 for _vault in sorted(vaults_files.keys())
                 for entry in vaults_files[_vault]
             ]
-            # Issue #702 (P02-SK2-04): the structured failure ledger the lease
-            # caller narrows the next retry attempt with, plus the first
-            # failing exception object so the persisted cap error carries a
-            # real (redacted, #562) reason instead of a literal None.
-            failed_ids: list[int] = []
-            # issue #1112: deterministic duplicate-hash failures tracked
-            # separately from transient failures so the job settlers exclude
-            # them from every retry scope.
-            duplicate_ids: list[int] = []
             first_failure: Optional[BaseException] = None
             commit_attempted = False
 
@@ -5580,6 +5615,9 @@ class BackgroundProcessor:
                     if failed_files > 0:
                         # ReindexOperatorGuidance (issue #702): operator
                         # constant — persists verbatim at the boundary.
+                        # issue #1131 RP-001: mark the abort so the outer
+                        # except composes this attempt's per-file ledger.
+                        staged_aborted = True
                         raise ReindexOperatorGuidance(
                             f"dimension rebuild aborted: {failed_files}/{total_files} "
                             f"file(s) failed to re-embed at dimension {probe_dim}"
@@ -5592,6 +5630,8 @@ class BackgroundProcessor:
                         # under the new — committing would build a
                         # mixed-generation table. Abort so the previous
                         # generation stays fully intact and intact-detectable.
+                        # issue #1131 RP-001: mark the abort (see above).
+                        staged_aborted = True
                         raise ReindexOperatorGuidance(
                             "embedding identity changed during reindex; the "
                             "staged rebuild was aborted so no mixed-generation "
@@ -5937,6 +5977,23 @@ class BackgroundProcessor:
             logger.exception("Error processing reindex job %s", job_id)
             # Issue #702 (P02-SK2-10): same contract as the inner return —
             # the exception object, redacted at the persist boundary.
+            # issue #1131 RP-001: a staged-rebuild abort that already
+            # discovered per-file outcomes must not discard them — compose
+            # the ledger (mirror of the normal composed shape, same
+            # ten-entry details bound) so the runner's arms surface the
+            # duplicates instead of the empty global shape. An identity-only
+            # abort with empty ledgers keeps the exact ("failed", {}, exc)
+            # shape the cap arm's error-only contract expects.
+            if staged_aborted and (duplicate_ids or failed_ids):
+                composed_abort = {
+                    "duplicate_file_ids": sorted(set(duplicate_ids)),
+                    "failed_ids": sorted(set(failed_ids)),
+                    "failed": len(
+                        {int(i) for i in failed_ids} | set(duplicate_ids)
+                    ),
+                    "details": list(failed_details[:10]),
+                }
+                return "failed", composed_abort, exc
             return "failed", {}, exc
 
     async def _process_task_wrapper(self, task: TaskItem) -> None:
@@ -6028,7 +6085,11 @@ class BackgroundProcessor:
                     file_hash=result.file_hash,
                     document_title=os.path.basename(result.file_path or ""),
                 )
-        logger.info(f"Successfully processed: {task.file_path}")
+        logger.info(
+            f"Successfully processed (file_id={task.file_id},"
+            f" path_len={len(task.file_path)})"
+        )
+        logger.debug(f"Successfully processed: {task.file_path}")
 
     async def _process_task(self, task: TaskItem) -> None:
         """
@@ -6048,13 +6109,23 @@ class BackgroundProcessor:
             # it into missing state. The queue's task_done() is still called
             # by _process_task_wrapper's finally block.
             logger.info(
+                "Skipping cancelled ingestion task (file_id=%s, path_len=%d)",
+                task.file_id,
+                len(task.file_path),
+            )
+            logger.debug(
                 "Skipping cancelled ingestion task for %s (file_id=%s)",
                 task.file_path,
                 task.file_id,
             )
             return
         logger.info(
-            f"Processing file: {task.file_path} (attempt {task.attempt}, file_id={task.file_id})"
+            f"Processing file (attempt {task.attempt},"
+            f" file_id={task.file_id}, path_len={len(task.file_path)})"
+        )
+        logger.debug(
+            f"Processing file: {task.file_path} (attempt {task.attempt},"
+            f" file_id={task.file_id})"
         )
 
         try:
@@ -6064,11 +6135,19 @@ class BackgroundProcessor:
             # land status='error'.
             await self._handle_cancellation(task, exc)
         except DocumentProcessingError as e:
-            logger.error(f"Processing error for {task.file_path}: {e}")
+            logger.error(
+                f"Processing error (path_len={len(task.file_path)},"
+                f" exc={type(e).__name__})"
+            )
+            logger.debug(f"Processing error for {task.file_path}: {e}")
             await self._handle_failure(task, e)
 
         except Exception as e:
-            logger.error(f"Unexpected error processing {task.file_path}: {e}")
+            logger.error(
+                f"Unexpected error processing"
+                f" (path_len={len(task.file_path)}, exc={type(e).__name__})"
+            )
+            logger.debug(f"Unexpected error processing {task.file_path}: {e}")
             await self._handle_failure(task, e)
 
     async def _handle_failure(self, task: TaskItem, error: BaseException | str) -> None:
@@ -6095,6 +6174,10 @@ class BackgroundProcessor:
         # Don't requeue if shutdown is in progress
         if self.shutdown_event.is_set():
             logger.warning(
+                f"Task failed during shutdown, not requeuing"
+                f" (path_len={len(task.file_path)})"
+            )
+            logger.debug(
                 f"Task failed for {task.file_path} during shutdown, not requeuing"
             )
             return
@@ -6118,12 +6201,18 @@ class BackgroundProcessor:
             in (INGEST_ERROR_DIMENSION_CHANGED, INGEST_ERROR_DUPLICATE_FILE)
         ):
             logger.warning(
-                "Task failed for %s with a deterministic refusal "
+                "Task failed with a deterministic refusal "
                 "(%s); settling permanently on attempt %d "
-                "without retry (issue #820, #1112)",
-                task.file_path,
+                "without retry (issue #820, #1112) "
+                "(path_len=%d)",
                 classify_ingest_error(error),
                 task.attempt,
+                len(task.file_path),
+            )
+            logger.debug(
+                "Task failed for %s with a deterministic refusal (%s)",
+                task.file_path,
+                classify_ingest_error(error),
             )
             self._mark_task_permanently_failed(task, error)
             return
@@ -6151,6 +6240,11 @@ class BackgroundProcessor:
                 delay = min(delay, max(60.0, lock_window))
                 delay = max(delay, lock_window)
             logger.warning(
+                f"Task failed, "
+                f"retrying in {delay}s (attempt {task.attempt + 1}/{self.max_retries},"
+                f" path_len={len(task.file_path)})"
+            )
+            logger.debug(
                 f"Task failed for {task.file_path}, "
                 f"retrying in {delay}s (attempt {task.attempt + 1}/{self.max_retries})"
             )
@@ -6201,10 +6295,15 @@ class BackgroundProcessor:
 
                         await asyncio.to_thread(_mark_sweep_eligible)
                     logger.warning(
-                        "Task retry for %s could not be scheduled (retry "
-                        "backlog full) during write-lock contention; file "
-                        "left pending/queued for the recovery sweep "
-                        "(issue #1011)",
+                        "Task retry for file_id=%s could not be scheduled "
+                        "(retry backlog full) during write-lock contention; "
+                        "file left pending/queued for the recovery sweep "
+                        "(issue #1011) (path_len=%d)",
+                        task.file_id,
+                        len(str(task.file_path)),
+                    )
+                    logger.debug(
+                        "Task retry could not be scheduled for %s",
                         task.file_path,
                     )
                 else:
@@ -6212,8 +6311,15 @@ class BackgroundProcessor:
                     # checks): escalate to the permanent-failure path
                     # instead of blocking.
                     logger.error(
-                        "Task retry for %s could not be scheduled (retry "
-                        "backlog full); treating as permanent failure: %s",
+                        "Task retry for file_id=%s could not be scheduled "
+                        "(retry backlog full); treating as permanent "
+                        "failure: %s (path_len=%d)",
+                        task.file_id,
+                        type(error).__name__,
+                        len(str(task.file_path)),
+                    )
+                    logger.debug(
+                        "Task retry permanently failed for %s: %s",
                         task.file_path,
                         error,
                     )
@@ -6267,8 +6373,12 @@ class BackgroundProcessor:
                     task.file_id,
                 )
         logger.error(
-            f"Task permanently failed for {task.file_path} "
-            f"at attempt {task.attempt}/{self.max_retries}: {error}"
+            f"Task permanently failed for file_id={task.file_id} "
+            f"at attempt {task.attempt}/{self.max_retries}: "
+            f"{type(error).__name__} (path_len={len(str(task.file_path))})"
+        )
+        logger.debug(
+            "Task permanently failed for %s: %s", task.file_path, error
         )
 
     @property

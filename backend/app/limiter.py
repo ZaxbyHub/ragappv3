@@ -4,6 +4,7 @@ import hmac
 import logging
 from typing import Any, Callable, Optional
 
+from limits.errors import ConfigurationError
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from starlette.requests import Request
@@ -180,16 +181,26 @@ def build_limiter(redis_url: str) -> WhitelistLimiter:
             "Rate limiter wired to Redis for shared counters: %s",
             redact_url(storage_uri),
         )
-    limiter_instance = WhitelistLimiter(
-        key_func=get_client_ip,
-        storage_uri=storage_uri,
-        # Only meaningful with a real (non-memory) backend. With memory://
-        # (CI / empty REDIS_URL) no fallback limiter is constructed.
-        in_memory_fallback_enabled=storage_uri != "memory://",
-        # Passed here for documentation; see the force assignment below for why
-        # this alone is not sufficient.
-        headers_enabled=False,
-    )
+    try:
+        limiter_instance = WhitelistLimiter(
+            key_func=get_client_ip,
+            storage_uri=storage_uri,
+            # Only meaningful with a real (non-memory) backend. With memory://
+            # (CI / empty REDIS_URL) no fallback limiter is constructed.
+            in_memory_fallback_enabled=storage_uri != "memory://",
+            # Passed here for documentation; see the force assignment below
+            # for why this alone is not sufficient.
+            headers_enabled=False,
+        )
+    except ConfigurationError as exc:
+        # `from None` severs the chained original ConfigurationError from any
+        # boot traceback: its message embeds the raw (credential-bearing)
+        # storage URI verbatim, while this RuntimeError carries only the
+        # redacted form.
+        raise RuntimeError(
+            "Invalid REDIS_URL for rate-limiter storage "
+            f"({redact_url(storage_uri)}): {type(exc).__name__}"
+        ) from None
     # The rate-limited route handlers in this codebase do NOT declare a
     # ``response: Response`` parameter, so slowapi's ``_inject_headers``
     # post-response path would raise "parameter `response` must be an instance

@@ -2466,7 +2466,13 @@ def migrate_add_org_slug_column(sqlite_path: str) -> None:
                     "UPDATE organizations SET slug = ? WHERE id = ?", (candidate, org_id)
                 )
                 logger.warning(
-                    "Deduplicated organization slug: org %d slug %r -> %r",
+                    "Deduplicated organization slug: org %d (slug_len=%d -> %d)",
+                    org_id,
+                    len(dup_slug),
+                    len(candidate),
+                )
+                logger.debug(
+                    "Deduplicated organization slug detail: org %d slug %r -> %r",
                     org_id,
                     dup_slug,
                     candidate,
@@ -2522,40 +2528,55 @@ def migrate_vault_paths(sqlite_path: str) -> None:
 
         id_dir_keys = {str(vaults_dir / str(vid)).lower() for vid, _ in vaults}
         name_claims: dict[str, int] = {}
-        for _, name in vaults:
-            key = str(vaults_dir / _sanitize(name)).lower()
+        for _, vault_name in vaults:
+            key = str(vaults_dir / _sanitize(vault_name)).lower()
             name_claims[key] = name_claims.get(key, 0) + 1
 
         had_failure = False
-        for vault_id, name in vaults:
-            safe_name = _sanitize(name)
+        for vault_id, vault_name in vaults:
+            safe_name = _sanitize(vault_name)
             old_path = vaults_dir / safe_name
             new_path = vaults_dir / str(vault_id)
             old_key = str(old_path).lower()
 
             if old_key == str(new_path).lower():
                 logger.warning(
-                    "Vault %d name %r sanitizes to its own id-keyed directory;"
-                    " skipping legacy path migration",
+                    "Vault %d name sanitizes to its own id-keyed directory"
+                    " (name_len=%d); skipping legacy path migration",
                     vault_id,
-                    name,
+                    len(vault_name),
+                )
+                logger.debug(
+                    "Vault %d skipped-migration name: %r", vault_id, vault_name
                 )
                 continue
             if old_key in id_dir_keys:
                 logger.warning(
+                    "Vault %d name resolves to another vault's id-keyed"
+                    " directory (name_len=%d, path_len=%d); skipping legacy"
+                    " path migration",
+                    vault_id,
+                    len(vault_name),
+                    len(str(old_path)),
+                )
+                logger.debug(
                     "Vault %d name %r resolves to another vault's id-keyed"
                     " directory %s; skipping legacy path migration",
                     vault_id,
-                    name,
+                    vault_name,
                     old_path,
                 )
                 continue
             if name_claims.get(old_key, 0) > 1:
                 logger.warning(
-                    "Vault %d name %r resolves to a legacy directory claimed by"
-                    " multiple vaults; skipping legacy path migration",
+                    "Vault %d name resolves to a legacy directory claimed by"
+                    " multiple vaults (name_len=%d); skipping legacy path"
+                    " migration",
                     vault_id,
-                    name,
+                    len(vault_name),
+                )
+                logger.debug(
+                    "Vault %d multi-claim name: %r", vault_id, vault_name
                 )
                 continue
 
@@ -2569,17 +2590,35 @@ def migrate_vault_paths(sqlite_path: str) -> None:
                 elif old_path.exists() and not new_path.exists():
                     # Rename old to new
                     old_path.rename(new_path)
-                    logger.info(f"Migrated vault directory: {safe_name} → {vault_id}")
+                    logger.info(
+                        f"Migrated vault directory (id {vault_id},"
+                        f" safe_name_len={len(safe_name)})"
+                    )
+                    logger.debug(
+                        f"Migrated vault directory: {safe_name} → {vault_id}"
+                    )
                 elif old_path.exists() and new_path.exists():
                     # Both exist - merge contents
                     shutil.copytree(old_path, new_path, dirs_exist_ok=True)
                     shutil.rmtree(old_path)
                     logger.info(
-                        f"Merged vault directory contents: {safe_name} → {vault_id}"
+                        f"Merged vault directory contents (id {vault_id},"
+                        f" safe_name_len={len(safe_name)})"
+                    )
+                    logger.debug(
+                        f"Merged vault directory contents:"
+                        f" {safe_name} → {vault_id}"
                     )
             except (OSError, shutil.Error) as e:
                 had_failure = True
-                logger.warning(f"Failed to migrate vault '{name}' (ID {vault_id}): {e}")
+                logger.warning(
+                    f"Failed to migrate vault (ID {vault_id},"
+                    f" name_len={len(vault_name)}): {type(e).__name__}"
+                )
+                logger.debug(
+                    f"Failed to migrate vault '{vault_name}'"
+                    f" (ID {vault_id}): {e}"
+                )
                 # Continue with other vaults, don't raise
 
         if not had_failure:

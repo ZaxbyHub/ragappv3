@@ -1747,9 +1747,13 @@ async def get_document_raw(
     ]
     if not any(_path_is_within(file_path, root) for root in allowed_roots):
         logger.warning(
-            "Refusing to serve document %s outside configured document roots: %s",
+            "Refusing to serve document %s outside configured document roots"
+            " (path_len=%d)",
             file_id,
-            file_path,
+            len(str(file_path)),
+        )
+        logger.debug(
+            "Refused document serve path (id=%s): %s", file_id, file_path
         )
         raise HTTPException(status_code=404, detail="Document file not found")
 
@@ -2498,7 +2502,12 @@ def _best_effort_unlink(path: Path) -> None:
     try:
         path.unlink(missing_ok=True)
     except OSError as exc:
-        logger.warning("Failed to unlink uploaded file %s: %s", path, exc)
+        logger.warning(
+            "Failed to unlink uploaded file (path_len=%d, exc=%s)",
+            len(str(path)),
+            type(exc).__name__,
+        )
+        logger.debug("Failed to unlink uploaded file %s: %s", path, exc)
 
 
 async def _compensate_failed_registration(
@@ -2635,6 +2644,17 @@ def _log_upload_rejection(
         vault_id,
         _user_id_str(user),
     )
+
+
+def _debug_upload_detail(reason: str, value: object) -> None:
+    """DEBUG-only companion to the bounded upload logging (issue #982).
+
+    Default-level upload lines carry only length-bounded forms of
+    user-derived values (filenames, paths); the full value is observable
+    here, at DEBUG, in the same module. Lives at module level so
+    ``_do_upload`` keeps its pinned logger-call count (#1041 AC2).
+    """
+    logger.debug("Upload detail (%s): %r", reason, value)
 
 
 async def _do_upload(
@@ -2901,12 +2921,15 @@ async def _do_upload(
                     )
                 except DuplicateFileError as e:
                     # DuplicateFileError's text carries the duplicate's stored
-                    # server path — keep it in the log, not the wire (#562).
+                    # server path — keep it out of the default-level log and
+                    # the wire (#562, #982). Only the exception type at
+                    # WARNING; the full text at DEBUG.
                     file_path.unlink(missing_ok=True)
                     logger.warning(
-                        "Upload rejected as duplicate: %s (file cleaned up)",
-                        e,
+                        "Upload rejected as duplicate (%s) (file cleaned up)",
+                        type(e).__name__,
                     )
+                    _debug_upload_detail("duplicate rejection", e)
                     raise HTTPException(
                         status_code=409,
                         detail=(
@@ -2964,7 +2987,10 @@ async def _do_upload(
             await _compensate_failed_registration(
                 db_pool, file_path, file_id, row_created_by_request
             )
-            logger.exception("Document processing error for file: %s", file_name)
+            logger.exception(
+                "Document processing error for file (name_len=%d)", len(file_name)
+            )
+            _debug_upload_detail("processing error filename", file_name)
             if "maintenance mode" in str(e).lower():
                 raise HTTPException(status_code=503, detail="Processing error")
             raise HTTPException(status_code=500, detail="Processing error")
@@ -2974,13 +3000,17 @@ async def _do_upload(
             await _compensate_failed_registration(
                 db_pool, file_path, file_id, row_created_by_request
             )
-            logger.exception("Unexpected error registering file: %s", file_name)
+            logger.exception(
+                "Unexpected error registering file (name_len=%d)", len(file_name)
+            )
+            _debug_upload_detail("registration error filename", file_name)
             raise HTTPException(status_code=500, detail="Server error")
     except HTTPException:
         # Validation / size-limit errors already cleaned up partial files inline.
         raise
     except Exception:
-        logger.exception("Error uploading file: %s", file_name)
+        logger.exception("Error uploading file (name_len=%d)", len(file_name))
+        _debug_upload_detail("upload error filename", file_name)
         if temp_file_path is not None:
             # Remove both the temp sibling and the reserved placeholder /
             # placed bytes — matching the pre-#786 single-path cleanup, where
@@ -3288,13 +3318,20 @@ def _unlink_document_file(stored_path: str, vault_id: int) -> None:
     ]
     if not any(_path_is_within(file_path, root) for root in roots):
         logger.warning(
-            "Refusing to unlink document outside configured roots: %s", file_path
+            "Refusing to unlink document outside configured roots (path_len=%d)",
+            len(str(file_path)),
         )
+        logger.debug("Refused document unlink path: %s", file_path)
         return
     try:
         file_path.unlink(missing_ok=True)
     except OSError as exc:
-        logger.warning("Failed to unlink document file %s: %s", file_path, exc)
+        logger.warning(
+            "Failed to unlink document file (path_len=%d, exc=%s)",
+            len(str(file_path)),
+            type(exc).__name__,
+        )
+        logger.debug("Failed to unlink document file %s: %s", file_path, exc)
 
 
 def _record_pending_vector_delete(
@@ -3441,7 +3478,10 @@ async def _delete_file_record(
         )
 
         await asyncio.to_thread(conn.commit)
-        logger.info("Deleted document '%s' (id: %d)", file_name, file_id)
+        logger.info(
+            "Deleted document (id: %d, name_len=%d)", file_id, len(file_name)
+        )
+        logger.debug("Deleted document name (id: %d): %r", file_id, file_name)
 
         # GC the original file from disk after the row is committed.
         if stored_path:
