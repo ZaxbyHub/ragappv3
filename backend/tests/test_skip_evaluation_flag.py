@@ -32,6 +32,9 @@ def _make_engine_for_retrieval():
     )
     engine.vector_store.get_fts_exceptions.return_value = 0
     engine.reranking_service = None
+    engine.llm_client = MagicMock()
+    engine._thinking_client_override = None
+    engine._instant_client_override = None
     engine._retrieval_evaluators = {}
     return engine
 
@@ -100,7 +103,7 @@ class TestExecuteRetrievalSkipEvaluationFlag:
                 skip_evaluation=False,
             )
 
-        evaluator_cls.assert_called_once_with(client)
+        evaluator_cls.assert_called_once_with(engine.aux_llm_client)
         fake_evaluator.evaluate.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -124,7 +127,7 @@ class TestExecuteRetrievalSkipEvaluationFlag:
                 mode=ChatMode.THINKING,
             )
 
-        evaluator_cls.assert_called_once_with(client)
+        evaluator_cls.assert_called_once_with(engine.aux_llm_client)
         fake_evaluator.evaluate.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -198,6 +201,9 @@ class TestOrchestrateSubQueryRetrievalSkipEvaluation:
         engine.vector_store = MagicMock()
         engine.vector_store.get_fts_exceptions.return_value = 0
         engine.reranking_service = None
+        engine.llm_client = MagicMock()
+        engine._thinking_client_override = None
+        engine._instant_client_override = None
         engine._retrieval_evaluators = {}
         engine.embedding_service = MagicMock()
         engine.embedding_service.embed_single = AsyncMock(
