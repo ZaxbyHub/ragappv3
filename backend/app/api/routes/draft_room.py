@@ -198,6 +198,15 @@ _DRAFTING_PRIORITIES = ("manuscript", "vault", "balanced")
 _PROMOTE_SOURCE_TYPES = ("input", "revision")
 _MAX_PROMOTE_TAG_IDS = 50
 
+#: Issue #1135 claim 2: the maximum page value for which
+#: ``(page - 1) * per_page`` cannot overflow the SQLite signed-64-bit bind
+#: for EVERY ``per_page <= 100`` — beyond it the oversized offset escapes
+#: Query validation and dies at the bind as an unhandled 500, so every
+#: paginated list route bounds ``page`` here and answers 422 instead.
+#: Intentional API tightening: formerly-valid huge-page requests that
+#: returned empty 200 lists are now refused.
+MAX_LIST_PAGE: int = ((2**63 - 1) // 100) + 1
+
 # ── compile-surface constants (SPEC sections 8.1, 8.2, 12.5) ────────────────
 
 #: Stages a *user* may name as a compile/retry start point. Derived from the
@@ -3064,7 +3073,7 @@ async def create_draft(
 async def list_drafts(
     vault_id: Optional[int] = Query(None),
     status: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_LIST_PAGE),
     per_page: int = Query(50, ge=1, le=100),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
@@ -3648,7 +3657,7 @@ async def list_draft_jobs(
     draft_id: int,
     job_type: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_LIST_PAGE),
     per_page: int = Query(50, ge=1, le=100),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
@@ -3699,7 +3708,7 @@ async def list_draft_job_stages(
     draft_id: int,
     job_id: int,
     include_content: bool = Query(False),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_LIST_PAGE),
     per_page: int = Query(50, ge=1, le=100),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
@@ -4177,7 +4186,7 @@ async def draft_room_events_stream(
 )
 async def list_draft_revisions(
     draft_id: int,
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_LIST_PAGE),
     per_page: int = Query(50, ge=1, le=100),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
@@ -4552,16 +4561,41 @@ async def _run_promotion(
         return await coro
     except DraftPromotionDuplicateError as exc:
         if exc.cleanup_incomplete:
+            # Issue #916: a failed compensation is a server-side fault (an
+            # orphan may exist) even though the response is a client 4xx, so
+            # the error channel carries one record with draft_id + class
+            # name only — never the exception message (the #789 leak class).
+            logger.error(
+                "draft_room: promotion cleanup incomplete draft_id=%s error=%s",
+                draft_id,
+                type(exc).__name__,
+            )
             await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
         raise DraftRoomHTTPError(
             409, str(exc), "duplicate_document", _duplicate_context(exc)
         ) from exc
     except DraftPromotionTooLargeError as exc:
         if exc.cleanup_incomplete:
+            # Issue #916 (same shape as the duplicate branch above).
+            logger.error(
+                "draft_room: promotion cleanup incomplete draft_id=%s error=%s",
+                draft_id,
+                type(exc).__name__,
+            )
             await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
         raise DraftRoomHTTPError(413, str(exc), "promotion_too_large") from exc
     except DraftPromotionPathConflictError as exc:
         if exc.cleanup_incomplete:
+            # Issue #916 (same shape as the duplicate branch above). This
+            # ERROR coexists with the #1119 WARNING below by design: the
+            # warning discloses the raw destination path of the
+            # client-triggerable conflict; the ERROR reports the failed
+            # cleanup — distinct facts, distinct channels.
+            logger.error(
+                "draft_room: promotion cleanup incomplete draft_id=%s error=%s",
+                draft_id,
+                type(exc).__name__,
+            )
             await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
         # issue #1119: the client-visible 409 detail is a fixed string — it
         # must not echo the server filesystem destination path that
@@ -4911,7 +4945,7 @@ async def promote_draft_source(
 async def list_draft_evidence(
     draft_id: int,
     job_id: Optional[int] = Query(None),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_LIST_PAGE),
     per_page: int = Query(50, ge=1, le=100),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
@@ -4967,7 +5001,7 @@ async def list_draft_claims(
     draft_id: int,
     revision_id: Optional[int] = Query(None),
     status: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_LIST_PAGE),
     per_page: int = Query(50, ge=1, le=100),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
@@ -5042,7 +5076,7 @@ async def list_draft_findings(
     revision_id: Optional[int] = Query(None),
     status: Optional[str] = Query(None),
     severity: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_LIST_PAGE),
     per_page: int = Query(50, ge=1, le=100),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
@@ -5252,7 +5286,11 @@ async def dispose_draft_finding(
                     "rule_id": finding.rule_id,
                     "rule_version": finding.rule_version,
                     "severity": finding.severity,
-                    "span_text_sha256": finding.span_text_sha256,
+                    # SPEC 6.3 / 17.1 item 24 (issue #1135 claim 1): the
+                    # non-cascaded security audit log must stay content-free.
+                    # The span hash stays in draft_findings (waiver-text
+                    # pinning reads it there); it must NOT ride the audit
+                    # row, which survives draft deletion.
                     "revision_id": new_revision.id
                     if new_revision
                     else finding.revision_id,
