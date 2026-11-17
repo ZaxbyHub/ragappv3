@@ -74,7 +74,7 @@ describe("chat stream LOW03 retirement notification", () => {
     vi.stubGlobal("fetch", fetchMock);
     resetCsrfToken();
     setJwtAccessToken(null);
-    document.cookie = "X-CSRF-Token=; Max-Age=0; Path=/";
+    document.cookie = "meridian-csrf-token=; Max-Age=0; Path=/";
     publishAuthPrincipal(null);
     publishAuthPrincipal({ id: 8101, role: "user" });
   });
@@ -89,7 +89,7 @@ describe("chat stream LOW03 retirement notification", () => {
     vi.useRealTimers();
     resetCsrfToken();
     setJwtAccessToken(null);
-    document.cookie = "X-CSRF-Token=; Max-Age=0; Path=/";
+    document.cookie = "meridian-csrf-token=; Max-Age=0; Path=/";
     publishAuthPrincipal(null);
     fetchMock.mockReset();
     vi.unstubAllGlobals();

@@ -71,12 +71,12 @@ function jsonResponse(data: unknown): Response {
 }
 
 beforeEach(() => {
-  document.cookie = "X-CSRF-Token=csrf-test; path=/";
+  document.cookie = "meridian-csrf-token=csrf-test; path=/";
   reserveReplacementAuthOwner();
 });
 
 afterEach(() => {
-  document.cookie = "X-CSRF-Token=; path=/; max-age=0";
+  document.cookie = "meridian-csrf-token=; path=/; max-age=0";
   apiClient.defaults.adapter = originalAdapter;
   resetCsrfToken();
   setJwtAccessToken(null);
@@ -160,7 +160,7 @@ it("keeps a stale queued revoke from dispatching, while a replacement owner wait
 
 it("rechecks principal scope after held CSRF acquisition before the adapter, then admits the new principal", async () => {
   resetCsrfToken();
-  document.cookie = "X-CSRF-Token=; path=/; max-age=0";
+  document.cookie = "meridian-csrf-token=; path=/; max-age=0";
   const csrfBody = deferred<{ csrf_token: string }>();
   const csrfStarted = deferred<void>();
   vi.stubGlobal("fetch", vi.fn(() => Promise.resolve({
@@ -272,7 +272,7 @@ it("refreshes a 401 inside the password FIFO slot, then releases the queued muta
   vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
     const url = String(input);
     if (url.endsWith("/csrf-token")) {
-      document.cookie = "X-CSRF-Token=csrf-refresh; path=/";
+      document.cookie = "meridian-csrf-token=csrf-refresh; path=/";
       return Promise.resolve(jsonResponse({ csrf_token: "csrf-refresh" }));
     }
     if (url.endsWith("/auth/refresh")) {

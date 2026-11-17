@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import { toast } from "sonner";
-import apiClient from "@/lib/api";
+import apiClient, { withMethodOverride } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -258,10 +258,10 @@ function VaultMembersPanelState({
     const token = beginMutation();
     if (!token) return;
     try {
-      await apiClient.patch(
+      await apiClient.post(
         `/vaults/${vaultId}/members/${userId}`,
         { permission: newPermission },
-        { signal: token.controller.signal }
+        withMethodOverride({ signal: token.controller.signal })
       );
       if (!isCurrentMutation(token)) return;
       toast.success("Permission updated");

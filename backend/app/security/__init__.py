@@ -19,7 +19,14 @@ from app.config import settings
 from app.utils.paths import csrf_cookie_path
 
 logger = logging.getLogger("security")
-CSRF_COOKIE_NAME = "X-CSRF-Token"
+# T4c: Meridian-specific cookie name. The previous generic name
+# ("X-CSRF-Token") can collide with another application's cookie on a
+# shared host (a `Path=/` duplicate then rides along on every request and
+# breaks the strict double-submit comparison in csrf_protect). A
+# deployment-specific name removes the collision class entirely; the old
+# cookie is simply ignored (users are never locked out — the next token
+# issuance sets the new one). The request HEADER name is unchanged.
+CSRF_COOKIE_NAME = "meridian-csrf-token"
 
 
 def constant_time_equals(left: object, right: object) -> bool:

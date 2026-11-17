@@ -82,6 +82,7 @@ import {
   compileDraft,
   createDraftRevision,
   deleteDraft,
+  draftCompileFailureMessage,
   draftRoomKeys,
   getDraftRevision,
   getDraftStages,
@@ -674,9 +675,16 @@ export const DraftWorkspace = forwardRef<
     startStage?: DraftCompileStartStage;
     idempotencyKey: string;
   } | null>(null);
+  // Last compile failure, rendered inside the confirmation dialog (T3c): the
+  // portal in front of this deployment replaces upstream error bodies with
+  // its own HTML page, so a toast alone can leave the user with nothing
+  // actionable. draftCompileFailureMessage maps the machine-readable code
+  // (read from the body or the X-Meridian-Error-Code header) to user copy.
+  const [compileError, setCompileError] = useState<string | null>(null);
   const compileHeadingRef = useRef<HTMLHeadingElement>(null);
 
   function openCompileDialog(startStage?: DraftCompileStartStage) {
+    setCompileError(null);
     setCompileDialog({ startStage, idempotencyKey: generateIdempotencyKey() });
   }
 
@@ -695,7 +703,11 @@ export const DraftWorkspace = forwardRef<
     },
     onError: (err) => {
       invalidateCapabilitiesOnWorkerError(err);
+      // Both surfaces: the toast carries the server's detail verbatim (the
+      // user-facing failure reason), the inline alert carries the stable
+      // code-mapped message next to the compile button.
       toast.error(parseDraftRoomError(err).detail);
+      setCompileError(draftCompileFailureMessage(err));
     },
   });
 
@@ -1514,6 +1526,15 @@ export const DraftWorkspace = forwardRef<
           <p className="text-sm text-muted-foreground">
             This result requires human review before it can be marked Ready.
           </p>
+          {compileError && (
+            <p
+              role="alert"
+              className="text-sm text-destructive"
+              data-testid="compile-error"
+            >
+              {compileError}
+            </p>
+          )}
           <DialogFooter>
             <Button
               type="button"
