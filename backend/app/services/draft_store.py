@@ -1168,6 +1168,16 @@ class DraftStore:
         self._begin_immediate()
         try:
             draft = self._locked_draft(draft_id, owner_id, lock_version)
+            # Issue #1135 claim 3a: re-archiving must be an idempotent
+            # refusal. The transition map already forbids archived→archived,
+            # but ``_check_transition``'s ``target == current`` early-return
+            # bypasses the map for the self-transition and would let the
+            # unconditional UPDATE below bump ``lock_version`` and write a
+            # second ``draft_archived`` event — so refuse BEFORE it.
+            if draft.status == "archived":
+                raise InvalidTransitionError(
+                    "archived draft cannot be archived again"
+                )
             _check_transition(
                 "draft", draft.status, "archived",
                 _DRAFT_TRANSITIONS, _DRAFT_RECOVERY_TRANSITIONS,
@@ -4353,6 +4363,50 @@ class DraftStore:
                 reset,
             )
         return reset
+
+    def recover_stranded_compile_drafts(self) -> int:
+        """Settle crash-stranded drafts whose failed compile never settled them.
+
+        Issue #1135 claim 3b: ``DraftJobProcessor._fail_compile_job_sync``
+        settles the JOB terminal in one transaction and the draft in a
+        second; a crash between the two commits leaves the draft on
+        ``queued``/``running`` with no active job, and nothing else repairs
+        it (every other settler keys off active jobs). This sweep — called
+        from startup recovery — selects drafts whose LATEST compile job is
+        terminal ``failed`` AND that have no compile job in a non-terminal
+        state, and settles each to ``failed`` through the same locked-settle
+        helper the orphan sweeps use. Latest-job-aware by construction: an
+        older ``failed`` job followed by a newer ``cancelled``/``completed``
+        job never selects (the latest terminal outcome owns the draft), and
+        a live ``pending``/``running`` sibling never selects either.
+        Idempotent: settled drafts leave the selection set.
+
+        Returns:
+            The number of drafts settled to ``failed``.
+        """
+        self._begin_immediate()
+        try:
+            rows = self._db.execute(
+                "SELECT d.id FROM drafts d "
+                "WHERE d.status IN ('queued', 'running') "
+                "AND (SELECT j.status FROM draft_jobs j "
+                "     WHERE j.draft_id = d.id AND j.job_type = 'compile' "
+                "     ORDER BY j.id DESC LIMIT 1) = 'failed' "
+                "AND NOT EXISTS ("
+                "    SELECT 1 FROM draft_jobs a "
+                "    WHERE a.draft_id = d.id AND a.job_type = 'compile' "
+                "    AND a.status IN ('pending', 'running'))",
+                (),
+            ).fetchall()
+            for row in rows:
+                self._settle_draft_after_lost_compile_locked(
+                    int(row[0]), "failed"
+                )
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+        return len(rows)
 
 
 def build_input_relpath(

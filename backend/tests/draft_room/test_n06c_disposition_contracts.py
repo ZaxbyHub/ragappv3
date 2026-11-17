@@ -339,5 +339,120 @@ class TestSpec12PostAuthorizationException(unittest.TestCase):
         )
 
 
+class TestDispositionAuditMetadataIsContentFree(CompileRouteTestBase):
+    """#1135 AC1: the disposition audit event must be content-free.
+
+    ``security_audit_log`` has no draft-deletion cascade, so a disposition
+    audit row survives the draft's deletion; its metadata must then carry
+    only content-free keys. RED at base (the payload persists
+    ``span_text_sha256`` — an unsalted SHA-256 of manuscript span text),
+    GREEN after the fix drops every document-content-derived key while the
+    content-free keys stay."""
+
+    longMessage = False
+    CONTENT = "# Heading\n\nThis needs a fix here and stays fine elsewhere."
+
+    def setUp(self):
+        super().setUp()
+        self.draft_id, self.job_id, self.revision_id = self._seed_ready_eligible_draft(
+            content_md=self.CONTENT
+        )
+        self.span_start = self.CONTENT.index("a fix")
+        self.span_end = self.span_start + len("a fix")
+
+    def _insert_finding(self):
+        conn, store = self._store()
+        try:
+            return store.insert_finding(
+                draft_id=self.draft_id, stage="standards", rule_id="rule-x",
+                rule_version="1", category="style", severity="warning",
+                message="needs a fix", revision_id=self.revision_id,
+                job_id=self.job_id, waivable=True, suggestion="a correction",
+                span_start=self.span_start, span_end=self.span_end,
+            )
+        finally:
+            self._release(conn)
+
+    def _dismiss(self, finding_id):
+        return self.client.post(
+            f"/api/draft-room/drafts/{self.draft_id}/findings/{finding_id}/disposition",
+            json={"action": "dismiss", "base_revision_id": self.revision_id,
+                  "lock_version": self._lock_version(self.draft_id)},
+            headers=self._owner_headers(),
+        )
+
+    def _waive(self, finding_id):
+        return self.client.post(
+            f"/api/draft-room/drafts/{self.draft_id}/findings/{finding_id}/disposition",
+            json={"action": "waive", "base_revision_id": self.revision_id,
+                  "lock_version": self._lock_version(self.draft_id),
+                  "note": "reviewed and accepted (feedback FB-09 pin)"},
+            headers=self._owner_headers(),
+        )
+
+    def test_waive_audit_metadata_has_no_span_text_sha256(self):
+        """Feedback FB-09: the shared content-free audit dict serves waive
+        as well as dismiss; pin the second action too."""
+        finding_id = self._insert_finding()
+        resp = self._waive(finding_id)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        rows = self._audit_metadata("draft_finding_waive")
+        self.assertEqual(len(rows), 1, f"expected one waive audit row, got {rows}")
+        self.assertNotIn(
+            "span_text_sha256",
+            rows[0],
+            "audit_span_fingerprint: the waive disposition audit must be "
+            f"content-free too; got {rows[0]}",
+        )
+
+    def test_dismiss_audit_metadata_has_no_span_text_sha256(self):
+        finding_id = self._insert_finding()
+        resp = self._dismiss(finding_id)
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+        rows = self._audit_metadata("draft_finding_dismiss")
+        self.assertEqual(
+            len(rows), 1, f"expected exactly one dismiss audit row, got {rows}"
+        )
+        metadata = rows[0]
+        for key in (
+            "draft_id", "finding_id", "action", "rule_id", "rule_version", "severity",
+        ):
+            self.assertIn(
+                key,
+                metadata,
+                f"audit_span_fingerprint: the content-free key {key!r} must "
+                f"stay in the disposition audit metadata; got {metadata}",
+            )
+        self.assertNotIn(
+            "span_text_sha256",
+            metadata,
+            "audit_span_fingerprint: the disposition audit event survives "
+            "draft deletion and must carry no document-content-derived "
+            f"values; span_text_sha256 is present: {metadata}",
+        )
+        # Feedback FB-09: removing the hash from the AUDIT row must not
+        # remove it from draft_findings — waiver-text pinning still reads it
+        # there, and that table cascades with the draft.
+        conn, store = self._store()
+        try:
+            finding = store.get_finding(
+                draft_id=self.draft_id, owner_id=self.OWNER_ID, finding_id=finding_id
+            )
+            stored_hash = (
+                finding.get("span_text_sha256")
+                if isinstance(finding, dict)
+                else getattr(finding, "span_text_sha256", None)
+            )
+        finally:
+            self._release(conn)
+        self.assertTrue(
+            stored_hash,
+            "audit_span_fingerprint: the span hash must remain in "
+            "draft_findings (the cascaded, authoritative store) after the "
+            "disposition audit row drops it",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
