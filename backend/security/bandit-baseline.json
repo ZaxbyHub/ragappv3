@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 98894,
+      "loc": 99323,
       "nosec": 0,
       "skipped_tests": 72
     },
@@ -114,7 +114,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3085,
+      "loc": 3097,
       "nosec": 0,
       "skipped_tests": 7
     },
@@ -140,7 +140,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 4231,
+      "loc": 4246,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -154,6 +154,19 @@
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
       "loc": 154,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "backend/app/api/routes/errors.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 28,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -439,7 +452,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 198,
+      "loc": 232,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -466,6 +479,19 @@
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
       "loc": 63,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "backend/app/middleware/portal_resilience.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 286,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -959,7 +985,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 988,
+      "loc": 997,
       "nosec": 0,
       "skipped_tests": 1
     },
@@ -1050,7 +1076,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3848,
+      "loc": 3893,
       "nosec": 0,
       "skipped_tests": 25
     },
@@ -3384,7 +3410,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "82     settings.users_enabled\n83     and settings.jwt_secret_key == \"change-me-to-a-random-64-char-string\"\n84 ):\n",
+      "code": "88     settings.users_enabled\n89     and settings.jwt_secret_key == \"change-me-to-a-random-64-char-string\"\n90 ):\n",
       "col_offset": 35,
       "end_col_offset": 73,
       "filename": "backend/app/main.py",
@@ -3395,9 +3421,9 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'change-me-to-a-random-64-char-string'",
-      "line_number": 83,
+      "line_number": 89,
       "line_range": [
-        83
+        89
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",

@@ -8,7 +8,7 @@ import { publishAuthPrincipal } from "@/lib/api/auth-lifecycle";
 import { useAuthStore } from "@/stores/useAuthStore";
 
 const mocks = vi.hoisted(() => ({
-  authPatch: vi.fn(),
+  authProfileWrite: vi.fn(),
   listOrganizations: vi.fn(),
   listAccessibleVaults: vi.fn(),
   listSessions: vi.fn(),
@@ -22,7 +22,7 @@ vi.mock("axios", async (importOriginal) => {
   const originalCreate = originalAxios.create.bind(originalAxios);
   const create = vi.fn((...args: Parameters<typeof actual.default.create>) => {
     const client = originalCreate(...args);
-    vi.spyOn(client, "patch").mockImplementation(mocks.authPatch);
+    vi.spyOn(client, "post").mockImplementation(mocks.authProfileWrite);
     return client;
   });
   const mockedDefault = Object.assign(
@@ -111,7 +111,7 @@ describe("ProfilePage with the real ProtectedRoute", () => {
   ])("keeps the $outcome toast when ProtectedRoute unmounts the page", async ({ outcome, toast }) => {
     let resolveUpdate!: (response: { data: typeof user }) => void;
     let rejectUpdate!: (error: Error) => void;
-    mocks.authPatch.mockReturnValue(new Promise<{ data: typeof user }>((resolve, reject) => {
+    mocks.authProfileWrite.mockReturnValue(new Promise<{ data: typeof user }>((resolve, reject) => {
       resolveUpdate = resolve;
       rejectUpdate = reject;
     }));
@@ -119,7 +119,7 @@ describe("ProfilePage with the real ProtectedRoute", () => {
     renderProtectedProfile();
     fireEvent.change(screen.getByLabelText("Full name"), { target: { value: "Changed Name" } });
     fireEvent.click(screen.getByRole("button", { name: "Save Changes" }));
-    await waitFor(() => expect(mocks.authPatch).toHaveBeenCalledOnce());
+    await waitFor(() => expect(mocks.authProfileWrite).toHaveBeenCalledOnce());
 
     await waitFor(() => expect(screen.getByRole("status")).toBeInTheDocument());
     expect(screen.queryByLabelText("Full name")).not.toBeInTheDocument();

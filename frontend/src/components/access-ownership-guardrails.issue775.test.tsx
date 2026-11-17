@@ -14,7 +14,7 @@ const fixture = vi.hoisted(() => ({
   client: {
     get: vi.fn(),
     post: vi.fn(),
-    patch: vi.fn(),
+    post: vi.fn(),
     delete: vi.fn(),
   },
 }));
@@ -315,7 +315,7 @@ describe("access panel read ownership and outcome controls", () => {
     expect(screen.getByRole("button", { name: panel === "group" ? /^Grant$/i : /^Add$/i })).toBeDisabled();
     fireEvent.submit(draft.closest("form")!);
     expect(fixture.client.post).not.toHaveBeenCalled();
-    expect(fixture.client.patch).not.toHaveBeenCalled();
+    expect(fixture.client.post).not.toHaveBeenCalled();
     expect(fixture.client.delete).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: /retry/i }));
@@ -449,7 +449,7 @@ describe("access panel read ownership and outcome controls", () => {
       .mockResolvedValueOnce({ data: { members: [memberRow()], total: 1 } })
       .mockReturnValueOnce(newerRead.promise)
       .mockResolvedValueOnce({ data: { members: [memberRow()], total: 1 } });
-    fixture.client.patch.mockResolvedValue({});
+    fixture.client.post.mockResolvedValue({});
     render(<VaultMembersPanel vaultId={770} />);
     await act(async () => initialRead.reject(new Error("initial member read failed")));
     await waitFor(() => expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument());
@@ -469,14 +469,14 @@ describe("access panel read ownership and outcome controls", () => {
       patchA!({ currentTarget: { value: "write" }, target: { value: "write" } } as unknown as React.ChangeEvent<HTMLSelectElement>);
       await Promise.resolve();
     });
-    expect(fixture.client.patch).not.toHaveBeenCalled();
+    expect(fixture.client.post).not.toHaveBeenCalled();
     await act(async () => newerRead.reject(new Error("new member read failed")));
     await waitFor(() => expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument());
     await act(async () => {
       patchA!({ currentTarget: { value: "write" }, target: { value: "write" } } as unknown as React.ChangeEvent<HTMLSelectElement>);
       await Promise.resolve();
     });
-    expect(fixture.client.patch).not.toHaveBeenCalled();
+    expect(fixture.client.post).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: /retry/i }));
     // #771: table-scoped (below-sm card list duplicates the text)
@@ -485,7 +485,7 @@ describe("access panel read ownership and outcome controls", () => {
     expect(patchCurrent).toBeTypeOf("function");
     // #771: table-scoped (below-sm card list duplicates the text)
     fireEvent.change(inTable().getByRole("combobox", { name: "Change permission for alice" }), { target: { value: "write" } });
-    await waitFor(() => expect(fixture.client.patch).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(fixture.client.post).toHaveBeenCalledTimes(1));
   });
 
 });

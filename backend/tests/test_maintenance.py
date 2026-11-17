@@ -10,6 +10,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from app.models.database import SQLiteConnectionPool, init_db, run_migrations
+from app.security import CSRF_COOKIE_NAME
 from app.services.maintenance import MaintenanceService
 
 
@@ -430,7 +431,7 @@ class TestMaintenanceAgainstRealApp(unittest.TestCase):
         response = self.client.get("/api/csrf-token")
         self.assertEqual(response.status_code, 200)
         token = response.json()["csrf_token"]
-        cookie = self.client.cookies.get("X-CSRF-Token")
+        cookie = self.client.cookies.get(CSRF_COOKIE_NAME)
         self.assertIsNotNone(cookie)
         return cookie, token
 
@@ -439,7 +440,7 @@ class TestMaintenanceAgainstRealApp(unittest.TestCase):
         registered = self.client.post(
             "/api/auth/register",
             json={"username": "mnt-window-user", "password": "Password123"},
-            cookies={"X-CSRF-Token": cookie},
+            cookies={CSRF_COOKIE_NAME: cookie},
             headers={"X-CSRF-Token": token},
         )
         self.assertEqual(
@@ -452,7 +453,7 @@ class TestMaintenanceAgainstRealApp(unittest.TestCase):
         login = self.client.post(
             "/api/auth/login",
             json={"username": "mnt-window-user", "password": "Password123"},
-            cookies={"X-CSRF-Token": cookie},
+            cookies={CSRF_COOKIE_NAME: cookie},
             headers={"X-CSRF-Token": token},
         )
         self.assertEqual(login.status_code, 200, f"login failed: {login.text}")
@@ -461,7 +462,7 @@ class TestMaintenanceAgainstRealApp(unittest.TestCase):
         cookie, token = self._csrf_pair()
         refresh = self.client.post(
             "/api/auth/refresh",
-            cookies={"X-CSRF-Token": cookie},
+            cookies={CSRF_COOKIE_NAME: cookie},
             headers={"X-CSRF-Token": token},
         )
         self.assertEqual(refresh.status_code, 200, f"refresh failed: {refresh.text}")
@@ -471,7 +472,7 @@ class TestMaintenanceAgainstRealApp(unittest.TestCase):
         register_blocked = self.client.post(
             "/api/auth/register",
             json={"username": "mnt-second-user", "password": "Password123"},
-            cookies={"X-CSRF-Token": cookie},
+            cookies={CSRF_COOKIE_NAME: cookie},
             headers={"X-CSRF-Token": token},
         )
         self.assertEqual(register_blocked.status_code, 503)

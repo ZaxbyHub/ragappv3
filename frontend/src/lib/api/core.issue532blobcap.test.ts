@@ -28,7 +28,7 @@ describe("blob error decode size cap (PRR-021 / PR #532)", () => {
     // core.ts's CSRF request interceptor runs before the adapter for POSTs.
     // Seed the cookie jar so ensureCsrfToken() resolves without a network
     // fetch; stub fetch as a belt-and-braces fallback.
-    document.cookie = "X-CSRF-Token=test-csrf-token; path=/";
+    document.cookie = "meridian-csrf-token=test-csrf-token; path=/";
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({

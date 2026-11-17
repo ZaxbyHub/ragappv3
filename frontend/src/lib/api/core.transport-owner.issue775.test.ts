@@ -47,11 +47,11 @@ function unauthorized(config: InternalAxiosRequestConfig, detail: string): Axios
 }
 
 beforeEach(() => {
-  document.cookie = "X-CSRF-Token=; path=/; max-age=0";
+  document.cookie = "meridian-csrf-token=; path=/; max-age=0";
 });
 
 afterEach(() => {
-  document.cookie = "X-CSRF-Token=; path=/; max-age=0";
+  document.cookie = "meridian-csrf-token=; path=/; max-age=0";
   apiClient.defaults.adapter = originalAdapter;
   resetCsrfToken();
   setJwtAccessToken(null);
@@ -159,7 +159,7 @@ it("keeps a replacement session isolated while a small Blob CSRF 403 is decoded"
 
     reserveReplacementAuthOwner();
     setJwtAccessToken("session-B-token");
-    document.cookie = "X-CSRF-Token=csrf-B; path=/";
+    document.cookie = "meridian-csrf-token=csrf-B; path=/";
     await expect(ensureCsrfToken()).resolves.toBe("csrf-B");
     expect(getCsrfToken()).toBe("csrf-B");
     releaseBlobText('{"detail":"csrf"}');

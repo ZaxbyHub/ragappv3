@@ -70,7 +70,7 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.models.database import SQLiteConnectionPool, init_db, run_migrations
-from app.security import CSRFManager
+from app.security import CSRF_COOKIE_NAME, CSRFManager
 
 
 class TestCSRFIntegrationInProcess(unittest.TestCase):
@@ -131,7 +131,7 @@ class TestCSRFIntegrationInProcess(unittest.TestCase):
         response = self.client.get("/api/csrf-token")
         self.assertEqual(response.status_code, 200)
         token = response.json()["csrf_token"]
-        cookie = response.cookies.get("X-CSRF-Token")
+        cookie = response.cookies.get(CSRF_COOKIE_NAME)
         self.assertIsNotNone(cookie, "CSRF cookie should be set")
         self.assertIsNotNone(token, "CSRF token should be returned")
         return cookie, token
@@ -150,7 +150,7 @@ class TestCSRFIntegrationInProcess(unittest.TestCase):
             "csrf_token should be URL-safe base64",
         )
 
-        cookie = response.cookies.get("X-CSRF-Token")
+        cookie = response.cookies.get(CSRF_COOKIE_NAME)
         self.assertIsNotNone(cookie, "Response should set X-CSRF-Token cookie")
         self.assertGreater(len(cookie), 10, "Cookie value should be non-empty")
         self.assertEqual(
@@ -192,8 +192,8 @@ class TestCSRFIntegrationInProcess(unittest.TestCase):
         self.assertNotEqual(
             token1, token2, "Each /csrf-token call should generate a new token"
         )
-        cookie1 = response1.cookies.get("X-CSRF-Token")
-        cookie2 = response2.cookies.get("X-CSRF-Token")
+        cookie1 = response1.cookies.get(CSRF_COOKIE_NAME)
+        cookie2 = response2.cookies.get(CSRF_COOKIE_NAME)
         self.assertNotEqual(
             cookie1, cookie2, "Each /csrf-token call should set a fresh cookie"
         )
@@ -211,12 +211,12 @@ class TestCSRFIntegrationInProcess(unittest.TestCase):
 
         # The GET above put the cookie into the client jar; drop it so the
         # explicit request-level pair below is the only value transmitted.
-        self.client.cookies.pop("X-CSRF-Token", None)
+        self.client.cookies.pop(CSRF_COOKIE_NAME, None)
 
         response1 = self.client.post(
             "/api/auth/register",
             json={"username": "reuse_first", "password": "Password123"},
-            cookies={"X-CSRF-Token": cookie},
+            cookies={CSRF_COOKIE_NAME: cookie},
             headers={"X-CSRF-Token": token},
         )
         self.assertEqual(
@@ -228,12 +228,12 @@ class TestCSRFIntegrationInProcess(unittest.TestCase):
         # Register rotates the CSRF cookie into the client jar; if left there
         # it would transmit the NEW value ahead of our explicit pair and the
         # strict first-transmitted comparison would 403 (not a token problem).
-        self.client.cookies.pop("X-CSRF-Token", None)
+        self.client.cookies.pop(CSRF_COOKIE_NAME, None)
 
         response2 = self.client.post(
             "/api/auth/register",
             json={"username": "reuse_second", "password": "Password123"},
-            cookies={"X-CSRF-Token": cookie},
+            cookies={CSRF_COOKIE_NAME: cookie},
             headers={"X-CSRF-Token": token},
         )
         self.assertEqual(

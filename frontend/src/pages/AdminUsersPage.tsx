@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, useSyncExternalStore } from "
 import { toast } from "sonner";
 import { AdminGuard } from "@/components/auth/RoleGuard";
 import { useAuthStore } from "@/stores/useAuthStore";
-import apiClient from "@/lib/api";
+import apiClient, { withMethodOverride } from "@/lib/api";
 import { useTestMode } from "@/fixtures/TestModeContext";
 import { mockAdminUsers } from "@/fixtures/users";
 import { useDebounce } from "@/hooks/useDebounce";
@@ -316,10 +316,10 @@ function AdminUsersPageContent({ authOwner, principalGeneration }: { authOwner: 
     }
   };
   const handleRoleChange = (id: number, role: UserRole) => runRowMutation(id,
-    () => apiClient.patch(`/users/${id}/role`, { role }), user => ({ ...user, role }),
+    () => apiClient.post(`/users/${id}/role`, { role }, withMethodOverride()), user => ({ ...user, role }),
     "Role updated successfully", "Failed to update role");
   const handleActiveToggle = (id: number, is_active: boolean) => runRowMutation(id,
-    () => apiClient.patch(`/users/${id}/active`, { is_active }), user => ({ ...user, is_active }),
+    () => apiClient.post(`/users/${id}/active`, { is_active }, withMethodOverride()), user => ({ ...user, is_active }),
     `User ${is_active ? "activated" : "deactivated"} successfully`, "Failed to update user status");
 
   const openDialog = (kind: DialogKind, user: User | null = null) => {
@@ -370,11 +370,11 @@ function AdminUsersPageContent({ authOwner, principalGeneration }: { authOwner: 
     () => apiClient.delete(`/users/${user.id}`), previous => previous.filter(value => value.id !== user.id),
     "User deleted successfully", "Failed to delete user");
   const handleSaveEdit = (user: User, fullName: string, role: UserRole) => runDialogMutation("edit", user.id,
-    () => apiClient.patch(`/users/${user.id}`, { full_name: fullName, role }),
+    () => apiClient.post(`/users/${user.id}`, { full_name: fullName, role }, withMethodOverride()),
     previous => previous.map(value => value.id === user.id ? { ...value, full_name: fullName, role } : value),
     "User updated successfully", "Failed to update user");
   const handleResetPassword = (user: User, newPassword: string) => runDialogMutation("password", user.id,
-    () => apiClient.patch(`/users/${user.id}/password`, { new_password: newPassword }), null,
+    () => apiClient.post(`/users/${user.id}/password`, { new_password: newPassword }, withMethodOverride()), null,
     "Password reset successfully", "Failed to reset password");
   const handleCreateUser = (username: string, fullName: string, password: string, role: UserRole) =>
     runDialogMutation("create", null, () => apiClient.post("/users/", { username, password, full_name: fullName, role }),

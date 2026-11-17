@@ -779,8 +779,18 @@ export const useAuthStore = create<AuthState>()(
           if (!isCurrentInitScope(scope)) return;
           set({ isLoading: true });
           if (!isCurrentInitScope(scope) || latestProfileMutation !== attempt) return;
-          const response = await authClient.patch<User>("/auth/me", payload, {
-            headers: { Authorization: `Bearer ${token}` },
+          // POST + X-HTTP-Method-Override: the portal rejects PATCH on the
+          // wire; the backend rewrites the method before routing. authClient
+          // is a separate instance from apiClient, so the header is set
+          // inline here (attachCsrfInterceptor still covers this instance).
+          const response = await authClient.post<User>("/auth/me", payload, {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              // Inlined (not the core.ts constant): this module is mocked
+              // whole in tests, and a missing constant would silently send
+              // an "undefined" header instead of the override.
+              "X-HTTP-Method-Override": "PATCH",
+            },
             signal: request.signal,
           });
           if (isCurrentInitScope(scope) && latestProfileMutation === attempt) {

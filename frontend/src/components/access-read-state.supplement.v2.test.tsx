@@ -14,7 +14,7 @@ const fixture = vi.hoisted(() => ({
   client: {
     get: vi.fn(),
     post: vi.fn(),
-    patch: vi.fn(),
+    post: vi.fn(),
     delete: vi.fn(),
   },
 }));
@@ -396,7 +396,7 @@ describe("access panel read ownership and outcome controls", () => {
   it("preserves member permission mutation payload, disabled busy readback, and latest permission", async () => {
     const patch = deferred<unknown>();
     fixture.client.get.mockResolvedValueOnce({ data: { members: [memberRow()], total: 1 } });
-    fixture.client.patch.mockReturnValueOnce(patch.promise);
+    fixture.client.post.mockReturnValueOnce(patch.promise);
 
     render(<VaultMembersPanel vaultId={505} />);
     // #771: table-scoped (below-sm card list duplicates the text)
@@ -405,7 +405,7 @@ describe("access panel read ownership and outcome controls", () => {
     const permission = inTable().getByRole("combobox", { name: "Change permission for alice" });
     fireEvent.change(permission, { target: { value: "admin" } });
     expect(permission).toBeDisabled();
-    const patchCall = fixture.client.patch.mock.calls.at(-1)!;
+    const patchCall = fixture.client.post.mock.calls.at(-1)!;
     expect(patchCall[0]).toBe("/vaults/505/members/17");
     expect(patchCall[1]).toEqual({ permission: "admin" });
     if (patchCall[2]) expect(patchCall[2].signal).toBeInstanceOf(AbortSignal);
