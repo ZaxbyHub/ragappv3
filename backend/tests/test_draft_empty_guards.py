@@ -48,3 +48,38 @@ def test_rewrite_without_manuscript_rejected():
         dr._assert_rewrite_has_manuscript(1, Cur())  # type: ignore[arg-type]
     assert exc.value.status_code == 422
     assert getattr(exc.value, "code", None) == "rewrite_requires_manuscript"
+
+
+# ── the four stage methods themselves refuse an empty candidate ────────────
+# These drive the real methods on a bare instance (no stubbed guard): the
+# assertion must be a live first statement of each stage, with the correct
+# stage name in the message. Built with __new__ precisely because the guard
+# must fire before anything else the stage touches.
+
+
+def _call_stage(method, kwargs):
+    import asyncio
+
+    from app.services import draft_pipeline as dp
+
+    obj = dp._CompileRun.__new__(dp._CompileRun)
+    object.__setattr__(obj, "_candidate", "")
+    coro = getattr(obj, method)(**kwargs)
+    return asyncio.run(coro)
+
+
+@pytest.mark.parametrize(
+    "method,kwargs,stage",
+    [
+        ("_run_copy", {"reason": "test"}, "copy"),
+        ("_run_standards", {"reason": "test"}, "standards"),
+        ("_stage_fact", {}, "fact"),
+        ("_stage_assemble", {}, "assemble"),
+    ],
+)
+def test_stage_methods_refuse_empty_candidate(method, kwargs, stage):
+    with pytest.raises(CompileFailure) as exc:
+        _call_stage(method, kwargs)
+    assert exc.value.code == "candidate_empty"
+    assert not exc.value.retryable
+    assert f"the {stage} stage" in str(exc.value)

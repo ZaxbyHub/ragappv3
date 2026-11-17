@@ -469,7 +469,7 @@ class TestCSRFRaceConditions(unittest.TestCase):
         # constructor, so _check_redis_available() short-circuits and no
         # call can block on a Redis ping retry. (Constructing with a real
         # URL and poking the privates only works when the constructor ping
-        # FAILS: on a dev box with Redis on localhost:6379 the ping
+        # FAILS: when a real Redis is reachable on the guarded port the ping
         # succeeds, the fallback is never built, and every call 503s.)
         self.csrf_manager = CSRFManager(redis_url="", ttl=900)
 

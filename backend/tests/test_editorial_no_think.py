@@ -1,7 +1,8 @@
 """Editorial no-think control (F2 / issue #712).
 
 create_editorial_client() must send ``chat_template_kwargs={"enable_thinking":
-False}`` by default (the live editorial model, served as "custom-editorial-27b", has
+False}`` by default (a server whose chat template already disables
+# reasoning will just ignore it, but one that does not has
 a reasoning-on template default with xhigh effort and will burn a small
 budget on reasoning and return empty content), and must send no control when
 ``DRAFT_EDITORIAL_ENABLE_THINKING=true`` opts out.

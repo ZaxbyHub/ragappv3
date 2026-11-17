@@ -2367,13 +2367,12 @@ class _CompileRun:
 
     async def _stage_fact(self) -> None:
         """Run Fact against an IMMUTABLE candidate (SPEC §11.8).
-        _assert_nonempty_candidate(self._candidate, "fact")
 
         The candidate is a local ``str``; it is re-hashed after the desk runs
         and any difference is a hard failure rather than a silent acceptance.
         """
+        _assert_nonempty_candidate(self._candidate, "fact")
         ctx = self._ctx
-        _assert_nonempty_candidate(self._candidate, "assemble")
         candidate = self._candidate
         candidate_sha = sha256_text(candidate)
         input_sha = _stage_input_hash(
@@ -2783,6 +2782,7 @@ class _CompileRun:
 
     async def _stage_assemble(self) -> None:
         """Byte-preserving final assembly into ``needs_review`` (SPEC §11.9)."""
+        _assert_nonempty_candidate(self._candidate, "assemble")
         if PROVISIONAL_ASSEMBLY_ENABLED:  # pragma: no cover - permanently False
             raise CompileFailure(CODE_ASSEMBLE_WITHOUT_FACT, retryable=False)
         if self._fact_report is None or self._fact_candidate_sha256 is None:

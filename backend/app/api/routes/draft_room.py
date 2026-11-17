@@ -2071,8 +2071,8 @@ def _assert_provider_policy(*, sensitive: bool) -> None:
 # PERMITTED, not that it answers. A compile spends ~10 minutes on Research,
 # Outline and Draft before the first editorial (Copy) call; if a provider is
 # down, the job must fail at enqueue with a code the dialog can show instead
-# of burning the pipeline first (observed 2026-11-15: a full run failed at
-# Copy on a provider whose serve had been dead for days).
+# of burning the pipeline first (a compile can spend ~10 minutes in Research,
+# Outline and Draft before the first editorial call reveals the outage).
 _PREFLIGHT_PROBE_TIMEOUT_SECONDS = 4.0
 
 
