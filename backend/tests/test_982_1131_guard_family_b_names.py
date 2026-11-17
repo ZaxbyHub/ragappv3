@@ -1138,3 +1138,97 @@ def test_limiter_boot_traceback_severed_from_credential_chain():
         assert excinfo.value.__cause__ is None or marker not in str(
             excinfo.value.__cause__
         )
+
+@pytest.mark.asyncio
+async def test_curator_sites_bounded_marker_probe(caplog):
+    """Final-critic r2 B4: the three curator sibling fixes are pinned by an
+    executed marker probe (the AST census only walks logger calls — raise
+    messages and returned error dicts are invisible to it; reverting all
+    three fixes to the resp.text[:200] form kept every suite green).
+
+    Sites: wiki_curator_client outage raise (>=300 outage status), its
+    non-outage re-raise (4xx outside the breaker), and the settings
+    wizard-probe error dict.
+    """
+    import logging as _logging
+    import unittest.mock as _mock
+
+    import httpx
+
+    from app.api.routes.settings import _CuratorTestBody, test_curator_connection
+    from app.services import wiki_curator_client as wcc
+
+    marker = "C15MARKER-curator-sibling-982"
+    body = f'{{"message": "{marker}"}}'
+
+    def _resp(status):
+        return httpx.Response(
+            status, text=body, request=httpx.Request("POST", "http://curator.invalid/p")
+        )
+
+    client = wcc.CuratorClient(
+        "http://curator.invalid", "test-model", timeout=1.0
+    )
+    post_mock = _mock.AsyncMock(return_value=_resp(503))
+    with caplog.at_level(_logging.DEBUG, logger="app.services.wiki_curator_client"),             _mock.patch.object(
+                wcc, "assert_curator_url_safe", lambda *a, **k: None
+            ),             _mock.patch.object(httpx.AsyncClient, "post", post_mock):
+        with pytest.raises(httpx.HTTPStatusError) as outage:
+            await client.propose([{"role": "user", "content": "x"}])
+    assert marker not in str(outage.value), (
+        "982C4-guard: the curator outage raise leaks the provider body "
+        f"(final-critic r2 B4): {outage.value}"
+    )
+    assert "body_len=" in str(outage.value)
+
+    post_mock = _mock.AsyncMock(return_value=_resp(401))
+    with caplog.at_level(_logging.DEBUG, logger="app.services.wiki_curator_client"),             _mock.patch.object(
+                wcc, "assert_curator_url_safe", lambda *a, **k: None
+            ),             _mock.patch.object(httpx.AsyncClient, "post", post_mock):
+        with pytest.raises(httpx.HTTPStatusError) as non_outage:
+            await client.propose([{"role": "user", "content": "x"}])
+    assert marker not in str(non_outage.value)
+    assert "body_len=" in str(non_outage.value)
+
+    default_texts = [r.message for r in caplog.records if r.levelno >= _logging.INFO]
+    assert not any(marker in t for t in default_texts), (
+        "982C4-guard: a default-level curator line carries the provider body"
+    )
+    debug_texts = [r.message for r in caplog.records if r.levelno == _logging.DEBUG]
+    assert any(marker in t for t in debug_texts), (
+        "the full provider body must be available at DEBUG"
+    )
+
+    # settings wizard-probe error dict (admin-gated route coroutine called
+    # directly with sentinel dependencies — the auth gates are not under
+    # test; the error-dict shape is)
+    caplog.clear()
+    post_mock = _mock.AsyncMock(return_value=_resp(401))
+    import app.api.routes.settings as _settings_mod
+    import app.services.curator_ssrf as _ssrf
+
+    with caplog.at_level(_logging.DEBUG, logger="app.api.routes.settings"), \
+            _mock.patch.object(
+                _ssrf, "assert_curator_url_safe", lambda *a, **k: None
+            ), \
+            _mock.patch.object(
+                _settings_mod, "assert_url_safe", lambda *a, **k: None
+            ), \
+            _mock.patch.object(httpx.AsyncClient, "post", post_mock):
+        result = await test_curator_connection(
+            body=_CuratorTestBody(
+                url="http://curator.invalid", model="test-model"
+            ),
+            _role=object(),
+            _csrf_token="test",
+        )
+    rendered = str(result)
+    assert marker not in rendered, (
+        "982C4-guard: the settings wizard-probe error dict leaks the "
+        f"provider body (final-critic r2 B4): {rendered[:300]}"
+    )
+    assert "body_len=" in rendered
+    default_texts = [r.message for r in caplog.records if r.levelno >= _logging.INFO]
+    assert not any(marker in t for t in default_texts)
+    debug_texts = [r.message for r in caplog.records if r.levelno == _logging.DEBUG]
+    assert any(marker in t for t in debug_texts)
