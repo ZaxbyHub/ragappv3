@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
 from typing import Iterable
@@ -175,8 +176,24 @@ def _extract_code(body: bytes) -> str | None:
 REQUEST_ID_HEADER = "x-meridian-request-id"
 _REQUEST_ID_HEADER_RAW = REQUEST_ID_HEADER.encode("latin-1")
 _ERROR_RECORD_TTL_SECONDS = 300
+# Hard cap on stored records. Each entry is bounded (detail truncated to
+# _ERROR_DETAIL_MAX, id length bounded), so the store stays under ~0.5 MB;
+# 512 exceeds any plausible number of distinct failed mutating requests
+# within one 300 s TTL window for a single worker.
+_ERROR_RECORD_MAX = 512
+# Request-id bounds and charset, identical to the lookup endpoint's
+# Query(min_length=8, max_length=128); rejected at record time too so an
+# attacker cannot store under ids the endpoint can never serve.
+_ERROR_RID_MIN = 8
+_ERROR_RID_MAX = 128
+_ERROR_RID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
+# Stored detail is diagnostic text, not data; 512 chars is plenty for a
+# code + one-line reason and keeps entries a fixed maximum size.
+_ERROR_DETAIL_MAX = 512
 
-_error_records: dict[str, tuple[float, dict]] = {}
+# Keyed by (request_id, token_hash): two callers may reuse the same
+# request id (client-generated) without overwriting each other's record.
+_error_records: dict[tuple[str, str], tuple[float, dict]] = {}
 _error_records_lock = threading.Lock()
 
 
@@ -199,19 +216,42 @@ def record_error(
     status: int,
     path: str,
 ) -> None:
-    """Record a non-2xx outcome against the caller's request id (short TTL)."""
+    """Record a non-2xx outcome against the caller's request id (short TTL).
+
+    Bounded and defensive by construction: ids outside the lookup endpoint's
+    length/charset bounds are refused (so garbage cannot be stored under keys
+    the endpoint can never serve), the detail is truncated, entries are keyed
+    by (request_id, token_hash) so callers cannot overwrite each other, and
+    the store never exceeds _ERROR_RECORD_MAX entries: expiry is swept lazily
+    (only once the store is full), and whatever remains is evicted
+    oldest-first by insertion order.
+    """
     if not request_id or not token_hash:
         return
+    if not (_ERROR_RID_MIN <= len(request_id) <= _ERROR_RID_MAX):
+        return
+    if not _ERROR_RID_PATTERN.match(request_id):
+        return
+    detail_s = detail if isinstance(detail, str) else str(detail)
+    if len(detail_s) > _ERROR_DETAIL_MAX:
+        detail_s = detail_s[:_ERROR_DETAIL_MAX]
     now = time.monotonic()
+    key = (request_id, token_hash)
     with _error_records_lock:
-        expired = [k for k, (exp, _) in _error_records.items() if exp <= now]
-        for k in expired:
-            _error_records.pop(k, None)
-        _error_records[request_id] = (
+        if len(_error_records) >= _ERROR_RECORD_MAX:
+            # Lazy bounded sweep: only when full, purge expired entries...
+            for k in [
+                k for k, (exp, _) in _error_records.items() if exp <= now
+            ]:
+                _error_records.pop(k, None)
+            # ...then evict oldest-first until the cap holds.
+            while len(_error_records) >= _ERROR_RECORD_MAX:
+                _error_records.pop(next(iter(_error_records)))
+        _error_records[key] = (
             now + _ERROR_RECORD_TTL_SECONDS,
             {
                 "code": code,
-                "detail": detail if isinstance(detail, str) else str(detail),
+                "detail": detail_s,
                 "status": status,
                 "path": path,
                 "token_hash": token_hash,
@@ -223,12 +263,12 @@ def lookup_error(request_id: str, token_hash: str | None) -> dict | None:
     """The recorded error for ``request_id`` if it belongs to this caller."""
     now = time.monotonic()
     with _error_records_lock:
-        entry = _error_records.get(request_id)
+        entry = _error_records.get((request_id, token_hash)) if token_hash else None
         if entry is None:
             return None
         expires_at, record = entry
         if expires_at <= now:
-            _error_records.pop(request_id, None)
+            _error_records.pop((request_id, token_hash), None)
             return None
         if not token_hash or record.get("token_hash") != token_hash:
             return None

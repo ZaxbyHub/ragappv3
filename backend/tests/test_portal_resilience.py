@@ -127,8 +127,8 @@ def test_error_code_header_absent_for_non_json_and_success():
 def test_error_lookup_scoped_to_caller_token():
     from app.middleware.portal_resilience import lookup_error, record_error
 
-    record_error("req-1", "hash-a", "invalid_input", "bad input", 422, "/api/x")
-    got = lookup_error("req-1", "hash-a")
+    record_error("req-00001", "hash-a", "invalid_input", "bad input", 422, "/api/x")
+    got = lookup_error("req-00001", "hash-a")
     assert got == {
         "code": "invalid_input",
         "detail": "bad input",
@@ -136,8 +136,8 @@ def test_error_lookup_scoped_to_caller_token():
         "path": "/api/x",
     }
     # Another caller's token never reads the record.
-    assert lookup_error("req-1", "hash-b") is None
-    assert lookup_error("req-1", None) is None
+    assert lookup_error("req-00001", "hash-b") is None
+    assert lookup_error("req-00001", None) is None
     assert lookup_error("req-unknown", "hash-a") is None
 
 
@@ -146,13 +146,13 @@ def test_error_lookup_expires():
 
     from app.middleware import portal_resilience as pr
 
-    pr.record_error("req-exp", "hash-a", "c", "d", 500, "/api/x")
+    pr.record_error("req-exp-01", "hash-a", "c", "d", 500, "/api/x")
     with pr._error_records_lock:
-        pr._error_records["req-exp"] = (
+        pr._error_records[("req-exp-01", "hash-a")] = (
             _time.monotonic() - 1,
-            pr._error_records["req-exp"][1],
+            pr._error_records[("req-exp-01", "hash-a")][1],
         )
-    assert pr.lookup_error("req-exp", "hash-a") is None
+    assert pr.lookup_error("req-exp-01", "hash-a") is None
 
 
 def test_error_lookup_endpoint_end_to_end():
@@ -211,7 +211,7 @@ def test_403_handler_logs_denial_reason(caplog):
         method = "PUT"
         class url:
             path = "/api/kms/entries/243"
-        headers = {"x-request-id": "req-1"}
+        headers = {"x-request-id": "req-00001"}
 
     async def _run(exc):
         with caplog.at_level(logging.WARNING, logger="app.main"):
@@ -234,3 +234,69 @@ def test_403_handler_logs_denial_reason(caplog):
     assert "No write access to this vault" in records[0].getMessage()
     assert "category=csrf" in records[1].getMessage()
     assert "CSRF token missing or mismatch" in records[1].getMessage()
+
+
+# ── bounded, caller-isolated record store ──────────────────────────────────
+
+def _reset_store(mw):
+    with mw._error_records_lock:
+        mw._error_records.clear()
+
+
+def test_record_store_cap_and_eviction_order():
+    import app.middleware.portal_resilience as mw
+
+    _reset_store(mw)
+    cap = mw._ERROR_RECORD_MAX
+    for i in range(cap + 10):
+        mw.record_error(
+            f"req-{i:08d}", f"hash-{i}", "code_x", f"d{i}", 422, "/p"
+        )
+    with mw._error_records_lock:
+        keys = list(mw._error_records.keys())
+    assert len(keys) == cap
+    # the 10 oldest (first inserted) were evicted; the newest survive
+    assert ("req-00000000", "hash-0") not in mw._error_records
+    assert ("req-00000009", "hash-9") not in mw._error_records
+    assert keys[0] == ("req-00000010", "hash-10")
+    assert keys[-1] == (f"req-{cap + 9:08d}", f"hash-{cap + 9}")
+    _reset_store(mw)
+
+
+def test_record_store_rejects_oversize_and_bad_charset_ids():
+    import app.middleware.portal_resilience as mw
+
+    _reset_store(mw)
+    mw.record_error("x" * 129, "h" * 8, "c", "d", 500, "/p")  # too long
+    mw.record_error("short", "h" * 8, "c", "d", 500, "/p")  # too short
+    mw.record_error("bad id with spaces", "h" * 8, "c", "d", 500, "/p")
+    mw.record_error("inject';drop", "h" * 8, "c", "d", 500, "/p")
+    mw.record_error("ok-req-id-1", "h" * 8, "c", "d", 500, "/p")  # valid
+    assert len(mw._error_records) == 1
+    assert mw.lookup_error("x" * 129, "h" * 8) is None
+    assert mw.lookup_error("ok-req-id-1", "h" * 8)["code"] == "c"
+    _reset_store(mw)
+
+
+def test_record_store_isolates_callers_on_same_request_id():
+    import app.middleware.portal_resilience as mw
+
+    _reset_store(mw)
+    mw.record_error("shared-rid-1", "hash-alice", "code_a", "alice", 422, "/p")
+    mw.record_error("shared-rid-1", "hash-bob", "code_b", "bob", 500, "/p")
+    # bob did not overwrite alice's record
+    assert mw.lookup_error("shared-rid-1", "hash-alice")["detail"] == "alice"
+    assert mw.lookup_error("shared-rid-1", "hash-bob")["detail"] == "bob"
+    # and a third caller sees nothing at all
+    assert mw.lookup_error("shared-rid-1", "hash-mallory") is None
+    _reset_store(mw)
+
+
+def test_record_store_truncates_detail():
+    import app.middleware.portal_resilience as mw
+
+    _reset_store(mw)
+    mw.record_error("trunc-rid-01", "h" * 8, "c", "x" * 5000, 500, "/p")
+    rec = mw.lookup_error("trunc-rid-01", "h" * 8)
+    assert len(rec["detail"]) == mw._ERROR_DETAIL_MAX
+    _reset_store(mw)
