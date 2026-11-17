@@ -15,9 +15,10 @@ unstructured import) and fails when a marker in that parametrize table stops
 being a defensible assertion:
 
 * fail-closed table integrity — every row must stay a literal
-  (fixture-name, non-empty marker sequence) pair and exactly one
-  markdown_notes.md row must exist, so a refactor that moves markers out of
-  the table fails the guard instead of silently escaping it;
+  (fixture-name, non-empty marker sequence) pair, all four real_docs fixture
+  formats must stay present, and exactly one markdown-format row must exist,
+  so a refactor that moves markers out of the table or drops a format row fails
+  the guard instead of silently escaping it;
 * empty or whitespace-only markers are rejected unconditionally — membership
   assertions on them pass vacuously;
 * the markdown row (the one format whose pinned pipeline reconstructs table
@@ -28,16 +29,20 @@ being a defensible assertion:
   survive extraction; this policy deliberately forgoes asserting such
   content for this fixture;
 * every other row may use a bare-glyph marker only when the exact string
-  appears in that fixture's DECOMPRESSED source text (ZIP member text for
-  Office formats — compressed container bytes are not source provenance;
-  decoded raw bytes for plain-text formats). This is what keeps the pptx
-  ``|`` marker legal: it is literal slide-text content, proven by its
-  presence in the slide XML text nodes.
+  appears in that fixture's DISPLAYED content text: for Office formats, the
+  OOXML ``t``/``v`` content nodes (text runs and numeric cell values) of a
+  fixed set of document parts — not raw ZIP/markup, so declarations, formulas,
+  attributes and metadata cannot certify a glyph; compressed container bytes
+  are never source provenance. Plain-text formats (markdown) use decoded raw
+  bytes; an unknown/binary format has no provenance rule and fails closed.
+  This is what keeps the pptx ``|`` marker legal: it is literal slide-text
+  content, present in a slide ``a:t`` text node.
 """
 
 from __future__ import annotations
 
 import ast
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
@@ -46,9 +51,23 @@ import pytest
 TESTS_DIR = Path(__file__).resolve().parent
 PARSED_TEST_FILE = TESTS_DIR / "test_real_docs_parsing.py"
 FIXTURE_DIR = TESTS_DIR / "fixtures" / "real_docs"
-MARKDOWN_FIXTURE = "markdown_notes.md"
 PROTECTED_TEST_NAME = "test_each_fixture_format_yields_chunks_with_markers"
 OFFICE_SUFFIXES = (".docx", ".xlsx", ".pptx")
+MARKDOWN_SUFFIXES = (".md", ".markdown")
+
+
+def _is_markdown_fixture(fixture_name: str) -> bool:
+    """A markdown-format fixture.
+
+    Markdown is the one format whose pinned pipeline (``partition_md`` ->
+    python-markdown ``tables`` -> HTML -> ``partition_html``) RECONSTRUCTS the
+    table representation and drops the source delimiter glyph, so every
+    markdown row gets the pipe-free-content rule instead of the bare-glyph
+    provenance rule. Keyed on the EXTENSION, not the single filename
+    ``markdown_notes.md``: a second markdown fixture must be guarded the same
+    way, or its delimiter-pipe marker escapes the guard (review finding F-001).
+    """
+    return fixture_name.lower().endswith(MARKDOWN_SUFFIXES)
 
 
 def _decorator_parametrize_calls(decorators: list[ast.expr]) -> list[ast.Call]:
@@ -176,28 +195,106 @@ def _marker_rows() -> list[tuple[str, tuple[str, ...]]]:
     return tables[0]
 
 
-def _fixture_source_text(fixture_name: str) -> str:
-    """Decompressed source text of a fixture.
+# Text-bearing Office document parts. Two layers keep a bare-glyph marker from
+# being certified by anything other than genuine document content (review
+# finding F-002):
+#   1. only these members are read — packaging/metadata parts
+#      (``[Content_Types].xml``, ``*_rels/*.rels``, theme, ``docProps/*``) are
+#      excluded outright;
+#   2. from each member only OOXML content nodes are taken — ``t`` (text runs)
+#      and ``v`` (stored numeric values), via ``_office_text_runs`` — never raw
+#      markup, so the XML declaration (``<?xml ... encoding="UTF-8"?>``),
+#      ``xmlns`` URIs, attributes and formula ``<f>`` bodies cannot falsely
+#      certify a glyph such as ``=``, ``:`` or ``+`` as source content.
+# The prefixes cover every part that can hold real text for these fixtures:
+# docx body/headers/footers/footnotes/endnotes/comments, xlsx shared strings /
+# worksheet cells / chart labels, pptx slide text / speaker notes.
+_OFFICE_TEXT_MEMBER_PREFIXES = (
+    "word/document.xml",  # docx body (exact)
+    "word/header",  # docx headers (prefix)
+    "word/footer",  # docx footers (prefix)
+    "word/footnotes.xml",  # docx footnotes (exact)
+    "word/endnotes.xml",  # docx endnotes (exact)
+    "word/comments.xml",  # docx comments (exact)
+    "xl/sharedstrings.xml",  # xlsx string table (exact)
+    "xl/worksheets/sheet",  # xlsx worksheet bodies (prefix)
+    "xl/charts/",  # xlsx chart text (prefix)
+    "ppt/slides/slide",  # pptx slide bodies (prefix)
+    "ppt/notesslides/notesslide",  # pptx speaker notes (prefix, lowercase)
+)
 
-    ZIP member text for Office formats (compressed container bytes are not
-    source provenance — deflate can hide text that is present and show bytes
-    that are not), decoded raw bytes otherwise.
+
+def _is_office_text_member(member: str) -> bool:
+    name = member.lower()
+    return any(
+        name == prefix or name.startswith(prefix)
+        for prefix in _OFFICE_TEXT_MEMBER_PREFIXES
+    )
+
+
+# OOXML local names that hold DISPLAYED content: ``t`` = text run / shared or
+# inline string (docx ``w:t``, pptx ``a:t``, xlsx string ``t``); ``v`` = a
+# numeric cell's stored/displayed value (xlsx ``<v>9.50</v>``, including signed
+# values like ``<v>-1</v>``). Deliberately EXCLUDED: ``f`` (worksheet formula
+# expression — ``<f>1+1</f>`` is syntax, its result is the separate ``v``),
+# plus attributes, XML declarations, metadata and field codes.
+_OFFICE_CONTENT_NODES = frozenset({"t", "v"})
+
+
+def _office_text_runs(root: ET.Element) -> list[str]:
+    """Displayed content nodes only — OOXML ``t`` (strings) and ``v`` (values).
+
+    Iterating every node's text (``root.itertext()``) would pick up non-content
+    nodes such as an xlsx worksheet formula (``<f>1+1</f>``), whose ``+`` is
+    syntax rather than displayed text — certifying it would recreate the F-002
+    fail-open one layer down. Restricting to ``t``/``v`` keeps genuine text runs
+    and stored numeric values while excluding formula/field nodes, attributes,
+    XML declarations and metadata.
+    """
+    runs: list[str] = []
+    for element in root.iter():
+        local = element.tag.rsplit("}", 1)[-1]
+        if local in _OFFICE_CONTENT_NODES and element.text:
+            runs.append(element.text)
+    return runs
+
+
+def _fixture_source_text(fixture_name: str) -> str:
+    """Decompressed DISPLAYED TEXT of a fixture.
+
+    Office formats: only displayed text-run nodes (``_office_text_runs``) of
+    text-bearing members are joined (see ``_OFFICE_TEXT_MEMBER_PREFIXES``). Raw
+    markup is never used — an XML declaration's ``encoding="UTF-8"``, an
+    ``xmlns`` URI, a worksheet formula, or an attribute would otherwise certify
+    a bare-glyph ``=``/``+``/``:`` marker as document content (F-002), and a
+    malformed member fails closed via ``ET.fromstring``. Plain-text formats use
+    decoded raw bytes; an unknown/binary format (e.g. PDF) has no source-text
+    rule and fails closed rather than certifying glyphs from raw container bytes
+    (F-002 extension — PDF dictionary syntax like ``/``/``<<`` is not content).
     """
     path = FIXTURE_DIR / fixture_name
     if fixture_name.lower().endswith(OFFICE_SUFFIXES):
+        parts: list[str] = []
         with zipfile.ZipFile(path) as archive:
-            return "\n".join(
-                archive.read(member).decode("utf-8", errors="replace")
-                for member in archive.namelist()
-            )
-    return path.read_bytes().decode("utf-8", errors="replace")
+            for member in archive.namelist():
+                if not _is_office_text_member(member):
+                    continue
+                root = ET.fromstring(archive.read(member))
+                parts.extend(_office_text_runs(root))
+        return "\n".join(parts)
+    if fixture_name.lower().endswith(MARKDOWN_SUFFIXES):
+        return path.read_bytes().decode("utf-8", errors="replace")
+    pytest.fail(
+        f"{fixture_name}: no source-text provenance rule for this format — "
+        "a bare-glyph marker cannot be certified (F-002 fails closed)"
+    )
 
 
 def test_markers_table_has_exactly_one_markdown_row():
     rows = _marker_rows()
-    md_rows = [name for name, _ in rows if name == MARKDOWN_FIXTURE]
+    md_rows = [name for name, _ in rows if _is_markdown_fixture(name)]
     assert len(md_rows) == 1, (
-        f"expected exactly one {MARKDOWN_FIXTURE!r} row, found {len(md_rows)} — "
+        f"expected exactly one markdown-format row, found {len(md_rows)} — "
         "the marker guard must see the markdown row to protect it"
     )
 
@@ -207,25 +304,48 @@ def test_no_marker_is_empty_or_whitespace_only():
         for marker in markers:
             assert marker.strip(), (
                 f"{fixture_name}: marker {marker!r} is empty or whitespace-only "
-                "— membership assertions on it pass vacuously"
+                "— membership assertions on them pass vacuously"
             )
+
+
+def test_table_pins_every_fixture_format():
+    """The protected test promises EACH fixture format; keep all four rows.
+
+    Without this, deleting the pptx (or any non-markdown) row leaves the other
+    guard tests green and silently shrinks the nightly's format coverage — the
+    bare-glyph provenance rule loses its only live subject. The protected test's
+    own name (``test_each_fixture_format_...``) promises this coverage (review
+    finding F-003).
+    """
+    names = {name.lower() for name, _ in _marker_rows()}
+    required = {
+        "sample_table.docx",
+        "sample_table.xlsx",
+        "sample_table.pptx",
+        "markdown_notes.md",
+    }
+    missing = required - names
+    assert not missing, (
+        f"markers table lost fixture format row(s) {sorted(missing)} — "
+        "the guard pins the four real_docs fixture formats"
+    )
 
 
 def test_markdown_row_markers_are_pipe_free_content_strings():
     """Conservative fixture-scoped policy (see module docstring)."""
     for fixture_name, markers in _marker_rows():
-        if fixture_name != MARKDOWN_FIXTURE:
+        if not _is_markdown_fixture(fixture_name):
             continue
         for marker in markers:
             assert "|" not in marker, (
-                f"{MARKDOWN_FIXTURE}: marker {marker!r} contains the pipe "
+                f"{fixture_name}: marker {marker!r} contains the pipe "
                 "glyph — this fixture's pipes are all table delimiters, which "
                 "the markdown pipeline's table reconstruction drops; "
                 "pipe-bearing markers for this row pin serialization format, "
                 "not extracted content (issue #1141)"
             )
             assert any(ch.isalnum() for ch in marker), (
-                f"{MARKDOWN_FIXTURE}: marker {marker!r} has no alphanumeric "
+                f"{fixture_name}: marker {marker!r} has no alphanumeric "
                 "character — markers for the markdown row must be extracted "
                 "CONTENT cell strings"
             )
@@ -233,12 +353,13 @@ def test_markdown_row_markers_are_pipe_free_content_strings():
 
 def test_other_row_bare_glyph_markers_must_be_source_content():
     for fixture_name, markers in _marker_rows():
-        if fixture_name == MARKDOWN_FIXTURE:
+        if _is_markdown_fixture(fixture_name):
             continue
+        bare = [m for m in markers if not any(ch.isalnum() for ch in m)]
+        if not bare:
+            continue  # alnum markers are self-evidently content; no lookup needed
         source_text = _fixture_source_text(fixture_name)
-        for marker in markers:
-            if any(ch.isalnum() for ch in marker):
-                continue
+        for marker in bare:
             assert marker in source_text, (
                 f"{fixture_name}: bare-glyph marker {marker!r} is absent from "
                 "the fixture's decompressed source text — it asserts parser "

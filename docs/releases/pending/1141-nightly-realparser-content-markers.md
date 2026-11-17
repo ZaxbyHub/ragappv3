@@ -20,14 +20,17 @@ extracts them verbatim), not parser-generated join glyphs.
 
 A new PR-gate guardrail, `backend/tests/test_real_docs_marker_philosophy.py`,
 fails when a marker in that parametrize table stops being a defensible
-assertion: fail-closed table integrity (non-literal rows and a missing
-markdown row are failures, not skips), unconditional rejection of empty or
-whitespace-only markers (vacuous membership passes), a markdown-row rule
-(alphanumeric content markers, no pipe glyph — a conservative fixture-scoped
-policy since that fixture's pipes are all table delimiters), and a
-source-provenance rule for other rows (bare-glyph markers are legal only when
-present verbatim in the fixture's decompressed source text — ZIP member text
-for Office formats, since compressed container bytes are not provenance).
+assertion: fail-closed table integrity (non-literal rows, a dropped fixture
+format, or a missing markdown row are failures, not skips), unconditional
+rejection of empty or whitespace-only markers (vacuous membership passes), a
+markdown-row rule keyed to the `.md`/`.markdown` extension (alphanumeric
+content markers, no pipe glyph — a conservative fixture-scoped policy since
+that fixture's pipes are all table delimiters), and a source-provenance rule
+for other rows (bare-glyph markers are legal only when present verbatim in the
+fixture's displayed content text: for Office formats the OOXML `t`/`v` content
+nodes of a fixed set of document parts — not raw ZIP/markup, so declarations,
+formulas, attributes and metadata cannot certify a glyph; plain-text formats
+use decoded raw bytes; unknown/binary formats fail closed).
 
 ## Why
 
