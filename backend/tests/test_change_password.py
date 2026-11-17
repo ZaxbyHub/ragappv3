@@ -114,7 +114,7 @@ class TestChangePassword(unittest.TestCase):
         # tests exercise the change-password *flow*, not CSRF enforcement (that is
         # covered in test_csrf_auth.py), so we also stub csrf_protect to a
         # pass-through.
-        self.csrf_manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        self.csrf_manager = CSRFManager(redis_url="", ttl=900)
         main_app.state.csrf_manager = self.csrf_manager
         main_app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
 
@@ -586,7 +586,7 @@ class TestChangePasswordRateLimit(unittest.TestCase):
         main_app.dependency_overrides[get_db] = get_test_db
         self.addCleanup(main_app.dependency_overrides.pop, get_db, None)
         self.csrf_manager = CSRFManager(
-            redis_url="redis://localhost:6379/0", ttl=900
+            redis_url="", ttl=900
         )
         main_app.state.csrf_manager = self.csrf_manager
         main_app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"

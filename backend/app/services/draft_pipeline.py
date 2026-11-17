@@ -391,6 +391,45 @@ def _assert_redirects_disabled(client: object) -> None:
         )
 
 
+
+_EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+def _assert_nonempty_candidate(candidate: str, stage: str) -> None:
+    """Item 0b: no desk or Assemble may run on an empty candidate.
+
+    A rewrite-mode outline with no manuscript input can produce zero
+    sections: every downstream stage then "succeeds" against
+    the empty string and Assemble shipped a 0-byte revision that Mark Ready
+    approved. Each guard fails the stage non-retryably; the code is stable
+    so the dialog can show it.
+    """
+    if not candidate or not candidate.strip():
+        raise CompileFailure(
+            "candidate_empty",
+            retryable=False,
+            message=f"the {stage} stage received an empty candidate; refusing to run",
+        )
+
+
+def _guard_outline_mode_and_sections(outline, ctx) -> None:
+    """Items 0b/1: an outline the pipeline cannot draft from must fail the
+    stage. See the call site for the project-20 incident."""
+    if outline.mode == "rewrite" and not ctx.manuscript_inputs:
+        raise CompileFailure(
+            CODE_MANUSCRIPT_REQUIRED,
+            retryable=False,
+            message="the outline classified this draft as rewrite mode, "
+            "but no manuscript-role input exists",
+        )
+    if not outline.sections:
+        raise CompileFailure(
+            "outline_empty",
+            retryable=False,
+            message="the outline produced zero sections",
+        )
+
+
 async def _default_complete(
     prompt: str,
     *,
@@ -1731,6 +1770,7 @@ class _CompileRun:
                 retryable=False,
                 message="outline critic never approved the plan",
             )
+        _guard_outline_mode_and_sections(outline, ctx)
         self._enforce_section_budget(outline)
         self._outline = outline
         await self._persist_stage("outline", input_sha, outline, prompt=definition)
@@ -1812,6 +1852,12 @@ class _CompileRun:
             sections.append(section)
             previous_markdown = section.markdown
 
+        if not sections or not ("\n".join(s.markdown or "" for s in sections)).strip():
+            raise CompileFailure(
+                "draft_empty",
+                retryable=False,
+                message="the draft stage produced no section text",
+            )
         artifact = DraftArtifact(sections=sections)
         # Concatenation order is the outline order; line endings are normalized
         # exactly once, here, before the first candidate hash (SPEC §11).
@@ -2020,6 +2066,7 @@ class _CompileRun:
 
     async def _run_copy(self, *, reason: str) -> _TextResult:
         """Copy desk (SPEC §11.6). Always runs BEFORE Standards."""
+        _assert_nonempty_candidate(self._candidate, "copy")
         ctx = self._ctx
         input_sha = _stage_input_hash(
             "copy", ctx, {"candidate": sha256_text(self._candidate), "reason": reason}
@@ -2079,6 +2126,7 @@ class _CompileRun:
 
     async def _run_standards(self, *, reason: str) -> _TextResult:
         """Standards desk (SPEC §11.7). Always runs AFTER Copy."""
+        _assert_nonempty_candidate(self._candidate, "standards")
         ctx = self._ctx
         input_sha = _stage_input_hash(
             "standards",
@@ -2319,11 +2367,13 @@ class _CompileRun:
 
     async def _stage_fact(self) -> None:
         """Run Fact against an IMMUTABLE candidate (SPEC §11.8).
+        _assert_nonempty_candidate(self._candidate, "fact")
 
         The candidate is a local ``str``; it is re-hashed after the desk runs
         and any difference is a hard failure rather than a silent acceptance.
         """
         ctx = self._ctx
+        _assert_nonempty_candidate(self._candidate, "assemble")
         candidate = self._candidate
         candidate_sha = sha256_text(candidate)
         input_sha = _stage_input_hash(

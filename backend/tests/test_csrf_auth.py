@@ -108,7 +108,7 @@ class TestCSRFProtection(unittest.TestCase):
         main_app.dependency_overrides[get_db] = get_test_db
 
         # Create a real CSRF manager with Redis fallback
-        self.csrf_manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        self.csrf_manager = CSRFManager(redis_url="", ttl=900)
 
         # Set the csrf_manager on app state
         main_app.state.csrf_manager = self.csrf_manager
@@ -147,7 +147,7 @@ class TestCSRFProtection(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         csrf_token = response.json()["csrf_token"]
         # Get the cookie from response
-        csrf_cookie = response.cookies.get("X-CSRF-Token")
+        csrf_cookie = response.cookies.get("meridian-csrf-token")
         self.assertIsNotNone(csrf_cookie, "CSRF cookie should be set")
         self.assertIsNotNone(csrf_token, "CSRF token should be returned")
         return csrf_cookie, csrf_token
@@ -168,7 +168,7 @@ class TestCSRFProtection(unittest.TestCase):
         reg_response = self.client.post(
             "/api/auth/register",
             json={"username": "logintest", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={"meridian-csrf-token": csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -191,7 +191,7 @@ class TestCSRFProtection(unittest.TestCase):
         reg_response = self.client.post(
             "/api/auth/register",
             json={"username": "refreshtest", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={"meridian-csrf-token": csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -207,7 +207,7 @@ class TestCSRFProtection(unittest.TestCase):
         login_response = self.client.post(
             "/api/auth/login",
             json={"username": "refreshtest", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={"meridian-csrf-token": csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -233,7 +233,7 @@ class TestCSRFProtection(unittest.TestCase):
         reg_response = self.client.post(
             "/api/auth/register",
             json={"username": "logouttest", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={"meridian-csrf-token": csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -249,7 +249,7 @@ class TestCSRFProtection(unittest.TestCase):
         login_response = self.client.post(
             "/api/auth/login",
             json={"username": "logouttest", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={"meridian-csrf-token": csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -275,7 +275,7 @@ class TestCSRFProtection(unittest.TestCase):
         reg_response = self.client.post(
             "/api/auth/register",
             json={"username": "updatetest", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={"meridian-csrf-token": csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -291,7 +291,7 @@ class TestCSRFProtection(unittest.TestCase):
         login_response = self.client.post(
             "/api/auth/login",
             json={"username": "updatetest", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={"meridian-csrf-token": csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -322,7 +322,7 @@ class TestCSRFProtection(unittest.TestCase):
         reg_response = self.client.post(
             "/api/auth/register",
             json={"username": "cpwcsrf", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={"meridian-csrf-token": csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -334,7 +334,7 @@ class TestCSRFProtection(unittest.TestCase):
         login_response = self.client.post(
             "/api/auth/login",
             json={"username": "cpwcsrf", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={"meridian-csrf-token": csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -378,7 +378,7 @@ class TestCSRFProtection(unittest.TestCase):
         reg_response = self.client.post(
             "/api/auth/register",
             json={"username": "setupuser", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={"meridian-csrf-token": csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -398,7 +398,7 @@ class TestCSRFProtection(unittest.TestCase):
         response = self.client.post(
             "/api/auth/register",
             json={"username": "validuser", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={"meridian-csrf-token": csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -452,7 +452,7 @@ class TestCSRFProtection(unittest.TestCase):
         # Header equals the first transmitted (app-scoped) value -> accepted
         response = self._post_with_raw_cookie(
             "/api/auth/register",
-            cookie_header=f"X-CSRF-Token={csrf_token1}; X-CSRF-Token={csrf_token2}",
+            cookie_header=f"meridian-csrf-token={csrf_token1}; meridian-csrf-token={csrf_token2}",
             csrf_header=csrf_token1,
             json_body={"username": "dupfirst", "password": "Password123"},
         )
@@ -463,7 +463,7 @@ class TestCSRFProtection(unittest.TestCase):
         # a value that is not the most-specific transmitted cookie.
         response = self._post_with_raw_cookie(
             "/api/auth/register",
-            cookie_header=f"X-CSRF-Token={csrf_token1}; X-CSRF-Token={csrf_token2}",
+            cookie_header=f"meridian-csrf-token={csrf_token1}; meridian-csrf-token={csrf_token2}",
             csrf_header=csrf_token2,
             json_body={"username": "dupshadow", "password": "Password123"},
         )
@@ -475,7 +475,7 @@ class TestCSRFProtection(unittest.TestCase):
         response = self.client.post(
             "/api/auth/register",
             json={"username": "invalidcsrf", "password": "Password123"},
-            cookies={"X-CSRF-Token": "invalid-cookie"},
+            cookies={"meridian-csrf-token": "invalid-cookie"},
             headers={"X-CSRF-Token": "invalid-header"},
         )
         self.assertEqual(response.status_code, 403)

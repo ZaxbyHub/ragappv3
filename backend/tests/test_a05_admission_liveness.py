@@ -354,7 +354,7 @@ class _FakeRedis:
 def _fake_backed_store(fake: _FakeRedis) -> RedisAdmissionStore:
     """Build a real RedisAdmissionStore (the constructor does NOT connect)
     and swap its client for the shared in-test fake."""
-    store = RedisAdmissionStore("redis://localhost:6379/0")
+    store = RedisAdmissionStore("redis://placeholder.invalid:6379/0")
     store._redis = fake
     return store
 

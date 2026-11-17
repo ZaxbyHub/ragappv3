@@ -89,6 +89,24 @@ from app.api.routes.draft_room import (  # noqa: E402
     retry_draft_job,
 )
 from app.config import settings  # noqa: E402
+
+
+async def _noop_preflight(*, sensitive: bool) -> None:
+    return None
+
+
+import pytest
+
+_orig_preflight_providers = draft_room_mod._preflight_providers
+
+
+@pytest.fixture(autouse=True)
+def _noop_preflight_for_this_module():
+    # Stub only while one of this module's own tests runs; a module-level
+    # assignment would leak the noop into every later suite in the process.
+    draft_room_mod._preflight_providers = _noop_preflight
+    yield
+    draft_room_mod._preflight_providers = _orig_preflight_providers
 from app.models.database import (  # noqa: E402
     SQLiteConnectionPool,
     _pool_cache,

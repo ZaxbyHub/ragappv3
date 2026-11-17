@@ -38,8 +38,10 @@ except ImportError:
 import anyio
 from fastapi.testclient import TestClient
 
+import app.api.routes.draft_room as draft_room
 import app.services.draft_promotion as draft_promotion_module
 from app.api.deps import get_background_processor, get_db, get_vector_store
+from app.api.routes.draft_room import _preflight_providers as _dr_preflight
 from app.config import settings
 from app.main import app
 from app.security import CSRFManager, csrf_protect
@@ -151,6 +153,17 @@ class DraftRoomTestBase(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
         self.client.headers["user-agent"] = ""
+        # Section 2 (: the compile/retry preflight probes
+        # real providers and would 503 every valid request in a test with no
+        # provider. Stub it, recording the tier it was called with.
+        self._preflight_calls = []
+
+        async def _fake_preflight(*, sensitive: bool):
+            self._preflight_calls.append(bool(sensitive))
+
+        self._orig_preflight = draft_room._preflight_providers
+        draft_room._preflight_providers = _fake_preflight
+
         self._temp_dir = tempfile.mkdtemp()
 
         self._original_jwt_secret = settings.jwt_secret_key
@@ -192,7 +205,7 @@ class DraftRoomTestBase(unittest.TestCase):
         app.dependency_overrides[csrf_protect] = lambda: "test-csrf"
         app.state.db_pool = self._connection_pool
         app.state.csrf_manager = CSRFManager(
-            redis_url="redis://localhost:6379/0", ttl=900
+            redis_url="", ttl=900
         )
 
         self._mock_vector_store = MagicMock()
@@ -268,6 +281,8 @@ class DraftRoomTestBase(unittest.TestCase):
             del app.state.background_processor
 
     def tearDown(self):
+        draft_room._preflight_providers = self._orig_preflight
+
         from app.models.database import _pool_cache, _pool_cache_lock
 
         with _pool_cache_lock:
