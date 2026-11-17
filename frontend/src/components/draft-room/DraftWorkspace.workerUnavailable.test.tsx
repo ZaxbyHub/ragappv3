@@ -386,6 +386,8 @@ describe("DraftWorkspace worker_unavailable invalidation (C19)", () => {
     await waitFor(() => expect(mockCompileDraft).toHaveBeenCalledTimes(1));
     // The real parseDraftRoomError must surface the server's detail verbatim.
     await waitFor(() => expect(toast.error).toHaveBeenCalledWith("draft room worker is unavailable"));
+    // The inline alert is rendered too (code-mapped message).
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
     const refetched = await capabilitiesRefetched(baseline);
     expect(
       refetched,

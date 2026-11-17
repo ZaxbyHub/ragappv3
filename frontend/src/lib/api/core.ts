@@ -98,7 +98,7 @@ export function getJwtAccessToken(): string | null {
 // was renamed, so it cannot collide with another application's cookie on a
 // shared host. The pre-rename "X-CSRF-Token" cookie is ignored, not deleted:
 // deleting it could touch another application's cookie on a shared origin.
-const CSRF_COOKIE_NAME = "meridian-csrf-token";
+export const CSRF_COOKIE_NAME = "meridian-csrf-token";
 
 export function getCsrfCookie(): string | null {
   const read = () => {
@@ -797,6 +797,7 @@ apiClient.interceptors.response.use(
           looked?.detail ||
           (looked?.code ? `Request failed (${looked.code})` : "") ||
           (code ? `Request failed (${code})` : "") ||
+          error.response.statusText ||
           `Request failed with status ${error.response.status}`;
       }
     } else if (error.request) {
