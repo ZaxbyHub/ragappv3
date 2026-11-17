@@ -703,6 +703,10 @@ export const DraftWorkspace = forwardRef<
     },
     onError: (err) => {
       invalidateCapabilitiesOnWorkerError(err);
+      // Both surfaces: the toast carries the server's detail verbatim (the
+      // user-facing failure reason), the inline alert carries the stable
+      // code-mapped message next to the compile button.
+      toast.error(parseDraftRoomError(err).detail);
       setCompileError(draftCompileFailureMessage(err));
     },
   });

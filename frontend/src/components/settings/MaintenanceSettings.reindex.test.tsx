@@ -132,7 +132,8 @@ vi.mock("sonner", () => ({
   },
 }));
 
-import { apiClient } from "@/lib/api";
+import { apiClient, CSRF_COOKIE_NAME,
+} from "@/lib/api";
 import { MaintenanceSettings } from "./MaintenanceSettings";
 import SettingsPage from "@/pages/SettingsPage";
 
@@ -170,7 +171,7 @@ beforeEach(() => {
   // in the interceptor before reaching the adapter boundary this check
   // observes. The cookie satisfies ensureCsrfToken's cookie-first branch;
   // the POST itself still flows through the real apiClient + adapter.
-  document.cookie = "X-CSRF-Token=g04-test-csrf-token; path=/";
+  document.cookie = `${CSRF_COOKIE_NAME}=g04-test-csrf-token; path=/`;
    
   const defaults = apiClient.defaults as any;
   originalAdapter = defaults.adapter;
@@ -211,7 +212,7 @@ afterEach(() => {
    
   (apiClient.defaults as any).adapter = originalAdapter;
   document.cookie =
-    "X-CSRF-Token=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+    `${CSRF_COOKIE_NAME}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT`;
   cleanup();
 });
 
