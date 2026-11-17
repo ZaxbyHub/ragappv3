@@ -451,7 +451,7 @@ class RAGEngine:
 
         These are short, machine-shaped calls (one rewrite, one one-word
         verdict) that must return non-empty, parseable text. The thinking
-        lane's model pre-opens `` on EVERY generation in
+        lane's model pre-opens a think block on EVERY generation in
         its chat template - there is no template kwarg to disable it, and
         ``reasoning_effort="none"`` is not honored by this server - so at a
         small token budget the whole allowance is spent reasoning and the
