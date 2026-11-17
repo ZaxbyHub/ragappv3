@@ -10,7 +10,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 424,
+      "loc": 446,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 98844,
+      "loc": 98991,
       "nosec": 0,
       "skipped_tests": 72
     },
@@ -140,7 +140,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 4231,
+      "loc": 4246,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -387,7 +387,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1186,
+      "loc": 1195,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -530,7 +530,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 7091,
+      "loc": 7114,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -959,7 +959,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 988,
+      "loc": 997,
       "nosec": 0,
       "skipped_tests": 1
     },
@@ -1050,7 +1050,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3848,
+      "loc": 3893,
       "nosec": 0,
       "skipped_tests": 25
     },
@@ -1713,7 +1713,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3232,
+      "loc": 3256,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -4570,7 +4570,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "4121         # Create a deterministic seed from the text\n4122         seed_value = int(hashlib.md5(text.encode(\"utf-8\")).hexdigest(), 16) % (2**32)\n4123         random.seed(seed_value)\n",
+      "code": "4149         # Create a deterministic seed from the text\n4150         seed_value = int(hashlib.md5(text.encode(\"utf-8\")).hexdigest(), 16) % (2**32)\n4151         random.seed(seed_value)\n",
       "col_offset": 25,
       "end_col_offset": 58,
       "filename": "backend/app/services/vector_store.py",
@@ -4581,9 +4581,9 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 4122,
+      "line_number": 4150,
       "line_range": [
-        4122
+        4150
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",
