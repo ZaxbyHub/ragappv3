@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from app.api.deps import get_current_active_user, get_db, get_vector_store
 from app.main import app
 from app.models.database import init_db, run_migrations
+from types import SimpleNamespace
 
 
 @pytest.fixture()
@@ -27,7 +28,11 @@ def permission_client():
 
     vector_store = MagicMock()
     vector_store.db = MagicMock()
-    vector_store.db.table_names = AsyncMock(return_value=["chunks"])
+    vector_store.db.list_tables = AsyncMock(
+        return_value=SimpleNamespace(
+            tables=["chunks"], page_token=None
+        )
+    )
     vector_store.db.open_table = AsyncMock(return_value=MagicMock())
     vector_store.delete_by_file = AsyncMock(return_value=1)
 

@@ -346,7 +346,7 @@ docker compose exec knowledgevault sqlite3 /app/data/app.db ".tables"
 **Vector Store:**
 ```bash
 # Check LanceDB
-docker compose exec knowledgevault python -c "import lancedb; db = lancedb.connect('/app/data/lancedb'); print(db.table_names())"
+docker compose exec knowledgevault python -c "import lancedb; db = lancedb.connect('/app/data/lancedb'); print([t for t in db.list_tables().tables])"
 ```
 
 **LLM Connection:**
@@ -1473,7 +1473,7 @@ docker compose logs --tail 50
 docker compose exec knowledgevault python -c "
 import lancedb
 db = lancedb.connect('/app/data/lancedb')
-print('Tables:', db.table_names())
+print('Tables:', db.list_tables().tables)
 table = db.open_table('chunks')
 print('Rows:', len(table))
 "

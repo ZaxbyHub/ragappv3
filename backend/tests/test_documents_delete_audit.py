@@ -37,6 +37,7 @@ from app.api.deps import get_db, get_vector_store
 from app.config import settings
 from app.main import app
 from app.services.auth_service import compute_client_fingerprint, create_access_token
+from types import SimpleNamespace
 
 
 class DocumentsDeleteAuditTestBase(unittest.TestCase):
@@ -81,7 +82,11 @@ class DocumentsDeleteAuditTestBase(unittest.TestCase):
         # Mock vector store for tests
         self._mock_vector_store = MagicMock()
         self._mock_vector_store.db = MagicMock()
-        self._mock_vector_store.db.table_names = AsyncMock(return_value=["chunks"])
+        self._mock_vector_store.db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         self._mock_vector_store.db.open_table = AsyncMock(return_value=MagicMock())
         self._mock_vector_store.delete_by_file = AsyncMock(return_value=1)
 

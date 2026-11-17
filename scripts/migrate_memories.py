@@ -220,14 +220,13 @@ def _force_clear_maintenance(sqlite_path: str) -> bool:
         return False
 
 
-def migrate(rollback: bool, backup: Path | None, retention: int) -> None:
+def migrate(rollback: bool, backup: Path | None) -> None:
     """
     Run database migrations with maintenance mode and backups.
 
     Args:
         rollback: If True, restore from backup instead of migrating
         backup: Path to backup file for rollback
-        retention: Number of days to retain backups (not yet implemented)
     """
     # Ensure database directory exists
     Path(settings.sqlite_path).parent.mkdir(parents=True, exist_ok=True)
@@ -325,12 +324,6 @@ def main() -> None:
         help="Backup file to restore when rolling back"
     )
     parser.add_argument(
-        "--retention",
-        type=int,
-        default=30,
-        help="Retention days for backups"
-    )
-    parser.add_argument(
         "--init-only",
         action="store_true",
         help="Only initialize schema without running migrations"
@@ -344,7 +337,7 @@ def main() -> None:
         print(f"Database initialized at {settings.sqlite_path}")
         return
     
-    migrate(args.rollback, args.backup, args.retention)
+    migrate(args.rollback, args.backup)
 
 
 if __name__ == "__main__":

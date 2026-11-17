@@ -165,7 +165,12 @@ def _setup_app() -> tuple[str, SimpleConnectionPool, Path, Callable[[], None]]:
 
     mock_vector_store = MagicMock()
     mock_vector_store.db = MagicMock()
-    mock_vector_store.db.table_names = AsyncMock(return_value=["chunks"])
+    from types import SimpleNamespace
+    # list_tables() returns ListTablesResponse (.tables/.page_token); the
+    # deprecated table_names() call was removed from production (#754).
+    mock_vector_store.db.list_tables = AsyncMock(
+        return_value=SimpleNamespace(tables=["chunks"], page_token=None)
+    )
     mock_vector_store.db.open_table = AsyncMock(return_value=MagicMock())
     app.dependency_overrides[get_vector_store] = lambda: mock_vector_store
 

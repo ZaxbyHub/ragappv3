@@ -122,9 +122,35 @@ def _load_indexed_files(sqlite_path: Path) -> dict[str, IndexedFile]:
     }
 
 
+
+async def _list_table_names(db: object) -> list[str]:
+    """List all table names via the non-deprecated paginated API (issue #754).
+
+    ``table_names()`` is deprecated in the pinned lancedb; ``list_tables()``
+    returns ``ListTablesResponse`` with ``.tables`` and ``.page_token`` (None
+    or empty when exhausted). Stops on any falsy token; fails loudly on a
+    repeated token.
+    """
+    names: list[str] = []
+    token: str | None = None
+    seen: set[str] = set()
+    while True:
+        response = await db.list_tables(page_token=token)
+        names.extend(response.tables)
+        token = response.page_token
+        if not token:
+            return names
+        if token in seen:
+            raise RuntimeError(
+                "lancedb list_tables returned a repeated page token; "
+                "refusing to loop forever"
+            )
+        seen.add(token)
+
+
 async def _open_chunks_table(lancedb_path: Path) -> Any | None:
     db = await lancedb.connect_async(str(lancedb_path))
-    table_names = await db.table_names()
+    table_names = await _list_table_names(db)
     if "chunks" not in table_names:
         return None
     return await db.open_table("chunks")

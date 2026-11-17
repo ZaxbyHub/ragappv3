@@ -28,8 +28,11 @@ import unittest
 from pathlib import Path
 
 from app.config import settings
+from types import SimpleNamespace
+
 from app.services.vector_store import (
     CHUNKS_STAGING_TABLE,
+    _list_table_names,
     VectorStore,
     VectorStoreConnectionError,
 )
@@ -191,6 +194,12 @@ class FakeDB:
         # When nonzero, create_table(data=...) silently stores that many
         # fewer rows - exercises the staging row-parity guard (PRR-013).
         self.create_data_row_loss = 0
+
+    async def list_tables(self, page_token=None):
+
+        return SimpleNamespace(
+            tables=list(await self.table_names()), page_token=None
+        )
 
     async def table_names(self):
         return list(self._tables.keys())
@@ -389,7 +398,7 @@ class TestVector001bStagingCreateFailsBeforeDrop(unittest.IsolatedAsyncioTestCas
         with self.assertRaises(Exception):
             await store.migrate_add_parent_window()
 
-        names = await fake_db.table_names()
+        names = await _list_table_names(fake_db)
         self.assertIn("chunks", names)
         self.assertEqual(await _table_ids(fake_db, "chunks"), original_ids)
         self.assertNotIn("chunks", fake_db.calls["drop_table"])
@@ -424,7 +433,7 @@ class TestFinalCreateFailureAndStagingRecovery(unittest.IsolatedAsyncioTestCase)
             f"critical log must name the recoverable table: {logs.output}",
         )
 
-        names = set(await fake_db.table_names())
+        names = set(await _list_table_names(fake_db))
         self.assertIn(CHUNKS_STAGING_TABLE, names)
         self.assertNotIn("chunks", names)
         self.assertEqual(
@@ -437,7 +446,7 @@ class TestFinalCreateFailureAndStagingRecovery(unittest.IsolatedAsyncioTestCase)
         ret = await store.migrate_add_parent_window()
         self.assertEqual(ret, 0)
 
-        names = set(await fake_db.table_names())
+        names = set(await _list_table_names(fake_db))
         self.assertIn("chunks", names)
         self.assertNotIn(CHUNKS_STAGING_TABLE, names)
         self.assertEqual(await _table_ids(fake_db, "chunks"), original_ids)
@@ -479,7 +488,7 @@ class TestSwapSuccessPublishesGeneration(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(migrated, len(original_ids))
 
-        names = set(await fake_db.table_names())
+        names = set(await _list_table_names(fake_db))
         self.assertIn("chunks", names)
         self.assertNotIn(CHUNKS_STAGING_TABLE, names)
         self.assertEqual(await _table_ids(fake_db, "chunks"), original_ids)
@@ -534,7 +543,7 @@ class TestStaleStagingReconciliation(unittest.IsolatedAsyncioTestCase):
             restore()
 
         self.assertEqual(migrated, 1)
-        names = set(await fake_db.table_names())
+        names = set(await _list_table_names(fake_db))
         self.assertIn("chunks", names)
         self.assertNotIn(CHUNKS_STAGING_TABLE, names)
         # The stale staging table is dropped by reconciliation, and the swap
@@ -576,7 +585,7 @@ class TestStaleStagingReconciliation(unittest.IsolatedAsyncioTestCase):
         # so after reconciliation restored all 3 rows it completed the swap:
         # 3 rows migrated onto the restored table.
         self.assertEqual(migrated, 3)
-        names = set(await fake_db.table_names())
+        names = set(await _list_table_names(fake_db))
         self.assertIn("chunks", names)
         self.assertNotIn(CHUNKS_STAGING_TABLE, names)
         self.assertEqual(
@@ -644,7 +653,7 @@ class TestStagingParityAndPublishFailure(unittest.IsolatedAsyncioTestCase):
             restore()
 
         self.assertEqual(migrated, len(original_ids))
-        names = set(await fake_db.table_names())
+        names = set(await _list_table_names(fake_db))
         self.assertIn("chunks", names)
         self.assertNotIn(CHUNKS_STAGING_TABLE, names)
         self.assertEqual(await _table_ids(fake_db, "chunks"), original_ids)

@@ -38,6 +38,7 @@ acceptance checks (``tests/test_b02_bare_call_dim_rebuild.py``).
 from __future__ import annotations
 
 import asyncio
+from app.services.vector_store import _list_table_names
 import logging
 import os
 import sys
@@ -557,7 +558,7 @@ async def _scenario() -> tuple[str, str, str, str]:
             )
         except Exception:  # noqa: BLE001
             aborted_searchable = False
-        table_names4 = await store4.db.table_names()
+        table_names4 = await _list_table_names(store4.db)
         if (
             aborted_dim != OLD_DIM
             or aborted_count != baseline4

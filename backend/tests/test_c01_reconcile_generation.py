@@ -33,6 +33,7 @@ import os
 import sys
 import warnings
 from pathlib import Path
+from app.services.vector_store import _list_table_names
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -119,7 +120,7 @@ async def _drive(tmp: Path, canonical_rows, staging_rows, staging_dim=DIM):  # n
                 )
         except BaseException as exc:  # noqa: BLE001
             raised = exc
-        names = set(await store.db.table_names())
+        names = set(await _list_table_names(store.db))
         canonical_ids = await _table_ids(store, "chunks")
         staging_ids = (
             await _table_ids(store, CHUNKS_STAGING_TABLE)

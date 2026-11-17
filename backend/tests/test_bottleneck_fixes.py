@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
+from types import SimpleNamespace
 
 
 class AsyncMock(MagicMock):
@@ -142,7 +143,11 @@ class TestLifespanStartup:
 
         vs = VectorStore()
         vs.db = AsyncMock()
-        vs.db.table_names = AsyncMock(return_value=["chunks"])
+        vs.db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         vs.table = AsyncMock()
         vs.table.schema = AsyncMock(return_value=MagicMock(
             field=MagicMock(return_value=MagicMock(type=MagicMock(list_size=1024)))
@@ -162,7 +167,11 @@ class TestLifespanStartup:
 
         vs = VectorStore()
         vs.db = AsyncMock()
-        vs.db.table_names = AsyncMock(return_value=["chunks"])
+        vs.db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         vs.table = AsyncMock()
         vs.table.schema = AsyncMock(return_value=MagicMock(
             field=MagicMock(return_value=MagicMock(type=MagicMock(list_size=1024)))
@@ -181,7 +190,11 @@ class TestLifespanStartup:
 
         vs = VectorStore()
         vs.db = AsyncMock()
-        vs.db.table_names = AsyncMock(return_value=[])
+        vs.db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
         vs.table = None
 
         with patch.object(vs, '_generate_probe_embedding', return_value=[0.0] * 1024):
@@ -277,7 +290,11 @@ class TestValidateSchemaAsync:
 
         vs = VectorStore()
         vs.db = AsyncMock()
-        vs.db.table_names = AsyncMock(return_value=["chunks"])
+        vs.db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         vs.table = AsyncMock()
         vs.table.schema = AsyncMock(return_value=MagicMock(
             field=MagicMock(return_value=MagicMock(type=MagicMock(list_size=512)))  # Stored dim

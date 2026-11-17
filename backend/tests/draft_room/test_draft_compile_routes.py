@@ -38,6 +38,7 @@ import asyncio
 import json
 import os
 import shutil
+from types import SimpleNamespace
 import sqlite3
 import sys
 import tempfile
@@ -229,7 +230,11 @@ class CompileRouteTestBase(unittest.TestCase):
 
         self._mock_vector_store = MagicMock()
         self._mock_vector_store.db = MagicMock()
-        self._mock_vector_store.db.table_names = AsyncMock(return_value=["chunks"])
+        self._mock_vector_store.db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         self._mock_vector_store.db.open_table = AsyncMock(return_value=MagicMock())
         self._mock_vector_store.delete_by_file = AsyncMock(return_value=1)
         app.dependency_overrides[get_vector_store] = lambda: self._mock_vector_store

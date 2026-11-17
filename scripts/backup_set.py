@@ -445,6 +445,32 @@ def create_backup_set(
     return output_dir / MANIFEST_NAME
 
 
+
+def _list_table_names(db: object) -> list[str]:
+    """List all table names via the non-deprecated paginated API (issue #754).
+
+    ``table_names()`` is deprecated in the pinned lancedb; ``list_tables()``
+    returns ``ListTablesResponse`` with ``.tables`` and ``.page_token`` (None
+    or empty when exhausted). Stops on any falsy token; fails loudly on a
+    repeated token.
+    """
+    names: list[str] = []
+    token: str | None = None
+    seen: set[str] = set()
+    while True:
+        response = db.list_tables(page_token=token)
+        names.extend(response.tables)
+        token = response.page_token
+        if not token:
+            return names
+        if token in seen:
+            raise RuntimeError(
+                "lancedb list_tables returned a repeated page token; "
+                "refusing to loop forever"
+            )
+        seen.add(token)
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(levelname)s %(name)s %(message)s"
@@ -505,7 +531,7 @@ def main() -> None:
             import lancedb
 
             db = lancedb.connect(str(lancedb_dir))
-            for name in db.table_names():
+            for name in _list_table_names(db):
                 tables[name] = db.open_table(name)
         except Exception as exc:  # noqa: BLE001 — tagging is best effort from CLI
             print(f"warning: could not open lancedb tables for tagging: {exc}")

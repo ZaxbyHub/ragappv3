@@ -179,6 +179,13 @@ class _FakeDB:
     def __init__(self):
         self._tables: dict[str, _FakeTable] = {}
 
+    async def list_tables(self, page_token=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            tables=list(await self.table_names()), page_token=None
+        )
+
     async def table_names(self):
         return list(self._tables.keys())
 

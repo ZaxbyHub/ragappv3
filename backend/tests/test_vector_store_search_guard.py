@@ -33,6 +33,7 @@ import pytest
 
 from app.config import settings
 from app.services.vector_store import VectorStore, _lance_escape
+from types import SimpleNamespace
 
 # ---------------------------------------------------------------------------
 # Unit tests: _lance_escape (dense arm fallback, delete_by_vault)
@@ -922,7 +923,11 @@ class TestSearchNoneGuard(unittest.IsolatedAsyncioTestCase):
         store.table = None
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
         store.db = mock_db
 
         with patch("app.services.vector_store.settings") as mock_settings:
@@ -942,7 +947,11 @@ class TestSearchNoneGuard(unittest.IsolatedAsyncioTestCase):
         store.table = None
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
         store.db = mock_db
 
         with patch("app.services.vector_store.settings") as mock_settings:
@@ -1022,7 +1031,11 @@ class TestDeleteByFileNoneGuard(unittest.IsolatedAsyncioTestCase):
         store.table = None
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         mock_db.open_table = AsyncMock(side_effect=RuntimeError("Table open failed"))
         store.db = mock_db
 
@@ -1036,7 +1049,11 @@ class TestDeleteByFileNoneGuard(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=self.db_path)
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
         store.db = mock_db
 
         result = await store.delete_by_file("test_file_id")
@@ -1066,7 +1083,11 @@ class TestDeleteByVaultNoneGuard(unittest.IsolatedAsyncioTestCase):
         store.table = None
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         mock_db.open_table = AsyncMock(side_effect=RuntimeError("Table open failed"))
         store.db = mock_db
 
@@ -1080,7 +1101,11 @@ class TestDeleteByVaultNoneGuard(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=self.db_path)
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
         store.db = mock_db
 
         result = await store.delete_by_vault("test_vault_id")

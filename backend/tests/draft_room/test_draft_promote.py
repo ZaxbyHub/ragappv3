@@ -37,6 +37,7 @@ except ImportError:
 
 import anyio
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
 
 import app.services.draft_promotion as draft_promotion_module
 from app.api.deps import get_background_processor, get_db, get_vector_store
@@ -197,7 +198,11 @@ class DraftRoomTestBase(unittest.TestCase):
 
         self._mock_vector_store = MagicMock()
         self._mock_vector_store.db = MagicMock()
-        self._mock_vector_store.db.table_names = AsyncMock(return_value=["chunks"])
+        self._mock_vector_store.db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         self._mock_vector_store.db.open_table = AsyncMock(return_value=MagicMock())
         self._mock_vector_store.delete_by_file = AsyncMock(return_value=1)
         app.dependency_overrides[get_vector_store] = lambda: self._mock_vector_store

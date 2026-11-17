@@ -31,6 +31,7 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
 
 # Ensure test env so imported modules don't bail on missing env vars
 os.environ.setdefault("ADMIN_SECRET_TOKEN", "test-admin-key-for-tests")
@@ -173,7 +174,11 @@ class TestSearchReadPath(unittest.IsolatedAsyncioTestCase):
         mock_table = MagicMock(name="chunks_table")
         mock_table.count_rows = AsyncMock(return_value=500)
         mock_db = MagicMock(name="lancedb_async_connection")
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         mock_db.open_table = AsyncMock(return_value=mock_table)
         store.db = mock_db
         store.table = mock_table

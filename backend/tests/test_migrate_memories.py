@@ -45,7 +45,7 @@ def test_migrate_constructs_maintenance_service_with_pool_and_cleans_up(
     monkeypatch.setattr(migrate_memories, "run_migrations", lambda _path: None)
     monkeypatch.chdir(scratch_dir)
 
-    migrate_memories.migrate(rollback=False, backup=None, retention=30)
+    migrate_memories.migrate(rollback=False, backup=None)
 
     assert _maintenance_enabled(db_path) is False
     db_path.unlink()
@@ -59,7 +59,7 @@ def test_migrate_rollback_disables_maintenance_and_cleans_pool(scratch_dir, monk
     monkeypatch.setattr(migrate_memories.settings, "data_dir", scratch_dir)
     monkeypatch.setattr(migrate_memories, "decrypt_backup", lambda _backup: db_path)
 
-    migrate_memories.migrate(rollback=True, backup=backup_path, retention=30)
+    migrate_memories.migrate(rollback=True, backup=backup_path)
 
     # Verify rollback produced a clean state — maintenance disabled, DB not corrupted
     assert _maintenance_enabled(db_path) is False, "Maintenance should be disabled after rollback"
@@ -80,7 +80,7 @@ def test_migrate_exception_disables_maintenance(scratch_dir, monkeypatch):
     monkeypatch.setattr(migrate_memories, "run_migrations", fail_migration)
 
     with pytest.raises(RuntimeError, match="migration failed"):
-        migrate_memories.migrate(rollback=False, backup=None, retention=30)
+        migrate_memories.migrate(rollback=False, backup=None)
 
     assert _maintenance_enabled(db_path) is False, "Maintenance should be disabled after exception"
     db_path.unlink()

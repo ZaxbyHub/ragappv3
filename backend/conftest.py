@@ -5,6 +5,7 @@ import types
 from pathlib import Path
 
 import pytest
+from types import SimpleNamespace
 
 # Add backend directory to path so tests can import app modules
 sys.path.insert(0, str(Path(__file__).parent))
@@ -112,6 +113,13 @@ if _real_lancedb is None:
         def __init__(self, uri):
             self.uri = uri
             self._tables = {}
+
+        async def list_tables(self, page_token=None):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(
+                tables=list(await self.table_names()), page_token=None
+            )
 
         async def table_names(self):
             return list(self._tables.keys())

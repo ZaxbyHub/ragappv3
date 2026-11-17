@@ -319,7 +319,7 @@ def _release_unreferenced_tags(*, set_dirs) -> None:
     import lancedb
 
     db = lancedb.connect(str(lancedb_dir))
-    for table_name in db.table_names():
+    for table_name in _list_table_names(db):
         table = db.open_table(table_name)
         for tag in [n for n in _tag_names(table) if n.startswith(TAG_PREFIX)]:
             if (table_name, tag) in referenced:
@@ -338,6 +338,32 @@ def _release_unreferenced_tags(*, set_dirs) -> None:
                     table_name,
                     exc,
                 )
+
+
+
+def _list_table_names(db: object) -> list[str]:
+    """List all table names via the non-deprecated paginated API (issue #754).
+
+    ``table_names()`` is deprecated in the pinned lancedb; ``list_tables()``
+    returns ``ListTablesResponse`` with ``.tables`` and ``.page_token`` (None
+    or empty when exhausted). Stops on any falsy token; fails loudly on a
+    repeated token.
+    """
+    names: list[str] = []
+    token: str | None = None
+    seen: set[str] = set()
+    while True:
+        response = db.list_tables(page_token=token)
+        names.extend(response.tables)
+        token = response.page_token
+        if not token:
+            return names
+        if token in seen:
+            raise RuntimeError(
+                "lancedb list_tables returned a repeated page token; "
+                "refusing to loop forever"
+            )
+        seen.add(token)
 
 
 def main() -> None:

@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 """Acceptance / regression tests for issue #516 (DRAFT-020, DRAFT-022,
 DRAFT-023, DRAFT-024).
 
@@ -218,7 +219,11 @@ class Issue516AcceptanceBase(unittest.TestCase):
 
         self._mock_vector_store = MagicMock()
         self._mock_vector_store.db = MagicMock()
-        self._mock_vector_store.db.table_names = AsyncMock(return_value=["chunks"])
+        self._mock_vector_store.db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         self._mock_vector_store.db.open_table = AsyncMock(return_value=MagicMock())
         self._mock_vector_store.delete_by_file = AsyncMock(return_value=1)
         app.dependency_overrides[get_vector_store] = lambda: self._mock_vector_store

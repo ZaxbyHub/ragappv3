@@ -38,6 +38,7 @@ from _db_pool import SimpleConnectionPool
 from fastapi.testclient import TestClient
 
 from app.api.deps import get_db, get_vector_store
+from types import SimpleNamespace
 from app.config import settings
 from app.main import app
 from app.models.database import (
@@ -158,7 +159,11 @@ class DocumentsDeleteVectorPendingTestBase(unittest.TestCase):
         # Mock vector store whose chunk delete FAILS.
         self._mock_vector_store = MagicMock()
         self._mock_vector_store.db = MagicMock()
-        self._mock_vector_store.db.table_names = AsyncMock(return_value=["chunks"])
+        self._mock_vector_store.db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         self._mock_vector_store.db.open_table = AsyncMock(return_value=MagicMock())
         self._mock_vector_store.delete_by_file = AsyncMock(
             side_effect=RuntimeError("lancedb unavailable")

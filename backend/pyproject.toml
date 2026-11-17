@@ -52,6 +52,12 @@ markers = [
 # tests/conftest.py instead.
 filterwarnings = [
     "error::RuntimeWarning",
+    # Pinned host-library deprecations fail CI instead of surfacing silently on
+    # a version bump (issue #754 AC3). Config-level only: lancedb raises with
+    # stacklevel=2 so the warning attributes to the CALLER module — the
+    # behavioral guards are the AST ban (test_i07_deprecated_runway C17) and
+    # the runtime warning capture (C18), which are attribution-proof.
+    "error::DeprecationWarning:lancedb",
 ]
 
 # Mutation testing (issue #565 / E06). The nightly-quality-gates workflow

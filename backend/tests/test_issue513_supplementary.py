@@ -38,6 +38,8 @@ import contextlib
 import hashlib
 import math
 import sqlite3
+from app.services.vector_store import _list_table_names
+from types import SimpleNamespace
 import sys
 from pathlib import Path
 
@@ -307,6 +309,13 @@ class _FakeDB:
     def __init__(self):
         self._tables: dict[str, _FakeTable] = {}
 
+    async def list_tables(self, page_token=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            tables=list(await self.table_names()), page_token=None
+        )
+
     async def table_names(self):
         return list(self._tables.keys())
 
@@ -547,7 +556,7 @@ class TestNearDuplicateRetrievalNeutrality:
         vs = VectorStore(db_path=tmp_path / "lancedb")
         vs.db = _FakeDB()
         await vs.init_table(4)
-        assert "chunks" in await vs.db.table_names()
+        assert "chunks" in await _list_table_names(vs.db)
 
         emb_a1 = [0.90, 0.10, 0.05, 0.05]
         emb_a2 = [0.85, 0.15, 0.05, 0.00]

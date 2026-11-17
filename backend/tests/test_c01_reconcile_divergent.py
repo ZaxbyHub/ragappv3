@@ -29,6 +29,7 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -167,6 +168,13 @@ class FakeDB:
     def __init__(self, tables=None):
         self._tables = dict(tables or {})
         self.calls = {"open_table": [], "drop_table": [], "create_table": []}
+
+    async def list_tables(self, page_token=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            tables=list(await self.table_names()), page_token=None
+        )
 
     async def table_names(self):
         return list(self._tables.keys())

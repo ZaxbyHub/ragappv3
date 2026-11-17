@@ -26,6 +26,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from app.services.vector_store import _list_table_names
 
 
 def _record(rec_id: str, file_id: int, text: str, dim: int) -> dict:
@@ -94,7 +95,7 @@ async def test_mismatch_raises_actionable_error_without_rebuild_table(
     assert "dimension 4" in message
     assert "reindex" in message.lower()
 
-    table_names = await store.db.table_names()
+    table_names = await _list_table_names(store.db)
     assert DIMENSION_REBUILD_TABLE not in table_names
 
 

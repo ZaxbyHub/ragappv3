@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.services.vector_store import VectorStore
+from types import SimpleNamespace
 
 
 def _make_fts_mock_builder(results, to_list_side_effect=None):
@@ -51,7 +52,11 @@ class TestFTSStatusTrackingSearch(unittest.IsolatedAsyncioTestCase):
         self.store = VectorStore.__new__(VectorStore)
         # Mock db so search() doesn't try to call connect()
         self.store.db = MagicMock()
-        self.store.db.table_names = AsyncMock(return_value=["chunks"])
+        self.store.db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         self.store.table = MagicMock()
         # _maybe_create_vector_index() calls list_indices() and count_rows()
         self.store.table.list_indices = AsyncMock(return_value=[])

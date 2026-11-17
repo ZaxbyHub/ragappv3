@@ -38,6 +38,7 @@ import tempfile
 import unittest
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from queue import Empty, Queue
 from unittest.mock import AsyncMock, MagicMock
 
@@ -212,7 +213,11 @@ class DraftRoomTestBase(unittest.TestCase):
 
         self._mock_vector_store = MagicMock()
         self._mock_vector_store.db = MagicMock()
-        self._mock_vector_store.db.table_names = AsyncMock(return_value=["chunks"])
+        self._mock_vector_store.db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         self._mock_vector_store.db.open_table = AsyncMock(return_value=MagicMock())
         self._mock_vector_store.delete_by_file = AsyncMock(return_value=1)
         app.dependency_overrides[get_vector_store] = lambda: self._mock_vector_store
