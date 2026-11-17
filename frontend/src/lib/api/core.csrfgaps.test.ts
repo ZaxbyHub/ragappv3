@@ -230,3 +230,47 @@ describe("core.ts CSRF resilience pins (FU-002)", () => {
     });
   });
 });
+
+describe("CSRF one-retry cap (config flag survives a real adapter loop)", () => {
+  it("a persistent 403 on a mutating request is retried exactly once and the second 403 is surfaced", async () => {
+    mockCookies = "meridian-csrf-token=stale-token";
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ csrf_token: "fresh-token" }),
+    });
+    vi.stubGlobal("fetch", mockFetch);
+    const { apiClient } = await import("./core");
+
+    // The adapter throws the REAL config object back (as axios does), so the
+    // interceptor's _csrfRetry flag must survive between the original call
+    // and its retry. A fresh config per throw would lose the flag and loop.
+    let calls = 0;
+    apiClient.defaults.adapter = (async (config: unknown) => {
+      calls += 1;
+      throw Object.assign(new Error("Request failed with status code 403"), {
+        isAxiosError: true,
+        config,
+        response: {
+          status: 403,
+          statusText: "Forbidden",
+          data: { detail: "CSRF token missing or mismatch" },
+          headers: {},
+        },
+      });
+    }) as never;
+
+    const caught = await apiClient
+      .post("/widgets")
+      .then(
+        () => null,
+        (error: unknown) => error
+      );
+
+    // Exactly one original call plus exactly one retry - never more.
+    expect(calls).toBe(2);
+    // The second 403 is surfaced to the caller instead of looping.
+    expect(caught).not.toBeNull();
+    expect(caught).toBeInstanceOf(Error);
+    expect(mockFetch).toHaveBeenCalled();
+  });
+});
