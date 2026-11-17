@@ -156,9 +156,18 @@ def test_sample_table_pdf_extracts_table_text(real_partition):
         # xlsx numeric cells are stored as numbers, not strings; the string
         # columns are the reliable markers.
         ("sample_table.xlsx", ("Widget", "Qty")),
-        # pptx renders each table row as one |-joined text run per slide.
+        # pptx renders each table row as one |-joined text run per slide
+        # (the pipes are literal fixture content in the slide text nodes —
+        # python-pptx extracts them verbatim, so "|" is a stable content
+        # marker here).
         ("sample_table.pptx", ("Widget", "Gadget", "|")),
-        ("markdown_notes.md", ("Engineering notes", "|")),
+        # markdown: the real partition_md pipeline (python-markdown tables
+        # extension -> HTML -> Table element with space-joined cells)
+        # RECONSTRUCTS the table representation and never emits the source
+        # delimiter glyph "|" — markers must be extracted CONTENT cell
+        # strings (issue #1141: the old "|" marker was unsatisfiable in this
+        # tier from its first live run). "9.50" pins numeric-cell text.
+        ("markdown_notes.md", ("Engineering notes", "Widget", "9.50")),
     ],
 )
 def test_each_fixture_format_yields_chunks_with_markers(real_partition, fixture_name, markers):

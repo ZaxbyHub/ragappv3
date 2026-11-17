@@ -319,6 +319,9 @@ class TestRAGEngineLiveReads:
         )
         engine.vector_store.get_fts_exceptions.return_value = 0
         engine.reranking_service = None
+        engine.llm_client = MagicMock()
+        engine._thinking_client_override = None
+        engine._instant_client_override = None
         engine._retrieval_evaluators = {}
 
         mock_settings.retrieval_evaluation_enabled = True
@@ -344,7 +347,7 @@ class TestRAGEngineLiveReads:
                 active_client=instant_client,
             )
 
-        evaluator_cls.assert_called_once_with(instant_client)
+        evaluator_cls.assert_called_once_with(engine.aux_llm_client)
         fake_evaluator.evaluate.assert_awaited_once()
 
 

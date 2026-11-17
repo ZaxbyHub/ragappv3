@@ -653,7 +653,7 @@ RetryJobRequest
 
 Never return `storage_relpath`, absolute paths, raw provider exceptions, provider credentials, or hidden reasoning.
 
-Every paginated response is `{items, total, page, per_page}` with `page>=1`, default `per_page=50`, and maximum `per_page=100`. Apply stable secondary ordering by ID so equal timestamps do not duplicate or skip rows.
+Every paginated response is `{items, total, page, per_page}` with `page>=1`, default `per_page=50`, and maximum `per_page=100`. The Draft Room list endpoints additionally enforce `page<=MAX_LIST_PAGE` where `MAX_LIST_PAGE = ((2**63 - 1) // 100) + 1`; a larger `page` is refused with the framework's standard `422` validation error (feedback FB-03). Apply stable secondary ordering by ID so equal timestamps do not duplicate or skip rows.
 
 ### 8.2 Endpoint contract
 
