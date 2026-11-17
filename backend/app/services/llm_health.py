@@ -151,7 +151,7 @@ class LLMHealthChecker:
 
         Deliberately NOT a completion: the editorial model idles between
         compiles and its host unloads it, and a first-token warm-up can take
-        many minutes (observed >15 min cold on 2026-11-15). A health poll
+        many minutes when the model was unloaded. A health poll
         must answer "is the server up", which GET /v1/models does even while
         a model is loading. Warming is the compile preflight's job
         (draft_room._preflight_providers), not the health check's.

@@ -9,15 +9,8 @@ db_pool + csrf_manager), which is the established pattern for driving
 these routes.
 """
 import sqlite3
-from pathlib import Path
 
 import pytest
-
-FIXTURE = (
-    Path(__file__).parent / "fixtures" / "synthetic_drafts" / "draft_20.json"
-)
-
-pytestmark = pytest.mark.skipif(not FIXTURE.exists(), reason="fixture not exported")
 
 EMPTY_SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
