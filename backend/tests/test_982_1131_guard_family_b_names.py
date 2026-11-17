@@ -1100,3 +1100,41 @@ async def test_g1_exclusion_four_select_variants(tmp_path, monkeypatch):
                 f"{name}: id={expected} (indexed/partial/plain-error) must be "
                 f"selected; processed={processed}"
             )
+
+
+def test_limiter_boot_traceback_severed_from_credential_chain():
+    """Final-critic B2 (plan D-1 promise): the limiter re-raise severs the
+    credential-bearing ConfigurationError chain (`from None`), so a boot
+    traceback can never print the URI. Removing `from None` re-links
+    ``__context__`` and this test goes RED. Also covers the sentinel-scheme
+    parse-error path (limits._storage_scheme) with its own credential.
+    """
+    import traceback
+
+    from limits.errors import ConfigurationError  # noqa: F401
+
+    from app.limiter import build_limiter
+
+    marker = "s3cret982c6tracebackmarker"
+    cases = [
+        f"bogus://{marker}@host:6379/0",
+        f"redis+sentinel://:{marker}@h1:badport,h2:6379/0",
+    ]
+    for uri in cases:
+        with pytest.raises(RuntimeError) as excinfo:
+            build_limiter(uri)
+        rendered = "".join(
+            traceback.format_exception(
+                type(excinfo.value),
+                excinfo.value,
+                excinfo.value.__traceback__,
+            )
+        )
+        assert marker not in rendered, (
+            f"982C6-guard: the boot traceback carries the credential for "
+            f"URI scheme case {uri.split('://')[0]}: {rendered[-300:]}"
+        )
+        assert marker not in str(excinfo.value)
+        assert excinfo.value.__cause__ is None or marker not in str(
+            excinfo.value.__cause__
+        )

@@ -102,9 +102,10 @@ this fix without rework either way.
 
 ## Test plan
 
-Frozen acceptance checks C1-C11 (anchor chain issues/982#issuecomment-
-6950883207 → 6954250840 → 6956429619; three CHECK_WRONG amendments, all
-plan-critic-sanctioned): C1-C6 DISCRIMINATING (marker probes, RED→GREEN),
+Anchor chain v1 issues/982#issuecomment-6950883207 → v2 6954250840 → v3
+6956429619 → v4 6957415458 (five CHECK_WRONG amendments, all
+plan-critic-sanctioned and ruled PRESERVE by the independent implementation
+reviewer; semantics digest 9a84a416 constant across all four receipts): C1-C6 DISCRIMINATING (marker probes, RED→GREEN),
 C7/C10 PRESERVING (existing redaction pins + the #1112 battery), C8/C9/C11
 NEW-SURFACE (fenced unwind, staged-abort compose, ABSORB exclusion — all
 GREEN). New guard suite: grown AST census (fails closed on drift; two

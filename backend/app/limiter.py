@@ -197,9 +197,14 @@ def build_limiter(redis_url: str) -> WhitelistLimiter:
         # boot traceback: its message embeds the raw (credential-bearing)
         # storage URI verbatim, while this RuntimeError carries only the
         # redacted form.
+        # Scheme-only diagnosis: redact_url covers the known redis://
+        # shapes, but an UNREGISTERED scheme (the very thing that lands
+        # here) can carry the credential in positions its patterns do not
+        # match (final-critic B2 probe: bogus://<secret>@host renders
+        # verbatim). No credential surface at all in the raised message.
         raise RuntimeError(
             "Invalid REDIS_URL for rate-limiter storage "
-            f"({redact_url(storage_uri)}): {type(exc).__name__}"
+            f"(scheme={storage_uri.split(':', 1)[0]!r}): {type(exc).__name__}"
         ) from None
     # The rate-limited route handlers in this codebase do NOT declare a
     # ``response: Response`` parameter, so slowapi's ``_inject_headers``
