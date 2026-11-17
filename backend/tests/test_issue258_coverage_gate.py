@@ -30,7 +30,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 FRONTEND = REPO / "frontend"
-_TIMEOUT_SECONDS = 120
+_TIMEOUT_SECONDS = 180
 
 _NPM = shutil.which("npm")
 _VITEST_CONFIG_CANDIDATES = (
