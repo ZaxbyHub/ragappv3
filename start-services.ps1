@@ -70,8 +70,22 @@ if (-not $SkipOllama) {
 }
 
 if (-not $SkipEmbedding) {
-    $embeddingExists = docker ps --format "{{.Names}}" 2>&1 | Select-String -SimpleMatch $EmbeddingContainerName
-    if (-not $embeddingExists) {
+    # Three-state model (issue #753): docker-compose.yml reuses this exact
+    # container name, so after a host restart or `docker compose stop` the
+    # container exists in EXITED state — a running-only probe misses it and
+    # `docker run --name` then fails on the name conflict. Probe ALL
+    # containers by exact name and carry the state.
+    $embeddingState = docker ps -a --filter "name=^$EmbeddingContainerName$" --format "{{.State}}" 2>&1 | Select-Object -First 1
+    if ($embeddingState -eq "running") {
+        Write-Output "$EmbeddingContainerName container already running"
+    } elseif ($embeddingState -in @("exited", "created", "paused", "restarting", "dead")) {
+        Write-Output "Starting existing stopped $EmbeddingContainerName container..."
+        docker start $EmbeddingContainerName
+        if ($LASTEXITCODE -ne 0) {
+            Write-Output "ERROR: docker start $EmbeddingContainerName failed (exit $LASTEXITCODE). Run 'docker start $EmbeddingContainerName' manually and inspect 'docker inspect $EmbeddingContainerName' for the cause."
+            exit $LASTEXITCODE
+        }
+    } else {
         Write-Output "Starting $EmbeddingContainerName embedding container..."
         New-Item -ItemType Directory -Force -Path $EmbeddingDataDir | Out-Null
         $dockerArgs = @(
@@ -91,9 +105,11 @@ if (-not $SkipEmbedding) {
         # EMBEDDING_BATCH_SIZE is 64 — without the flag, every ingestion batch
         # over 32 texts fails with a 422 on this launch path (issue #698).
         $dockerArgs += @($EmbeddingImage, "--model-id", $EmbeddingModel, "--port", "8080", "--max-batch-tokens", "16384", "--max-client-batch-size", "128")
-        docker @dockerArgs 2>&1 | Out-Null
-    } else {
-        Write-Output "$EmbeddingContainerName container already running"
+        docker @dockerArgs
+        if ($LASTEXITCODE -ne 0) {
+            Write-Output "ERROR: docker run for $EmbeddingContainerName failed (exit $LASTEXITCODE). A stopped container with this name existing is the usual cause - run 'docker ps -a --filter name=$EmbeddingContainerName' and 'docker start' it, or remove it first."
+            exit $LASTEXITCODE
+        }
     }
 }
 
@@ -131,7 +147,7 @@ Write-Output "  $FrontendPort  (Frontend):    $frontend"
 if ($ollama -eq "OK" -and $backend -eq "OK" -and $frontend -eq "OK") {
     Write-Output "ALL SERVICES RUNNING"
     if (-not $SkipEmbedding -and $embedding -ne "OK") {
-        Write-Output "NOTE: $EmbeddingContainerName may still be loading models."
+        Write-Output "NOTE: $EmbeddingContainerName was started this run and may still be loading models; its container start/exit code was checked above (issue #753)."
     }
 } else {
     Write-Output "WARNING: Some services failed to start"
