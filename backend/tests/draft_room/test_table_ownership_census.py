@@ -56,12 +56,23 @@ constant defined in one module and executed in another stays invisible
 module-local); ``job_lease.py`` writes ``draft_jobs`` through a
 constructor-supplied table attribute, unreachable to any static fold
 (declared co-owner in ``draft_store.py``'s map instead); directory
-symlinks under the scan root are not traversed (``rglob`` recursion
-follows no symlinks); a ``PermissionError`` on a directory aborts the walk
-(fail closed); a function-local assignment shadowing a module constant
-resolves to nothing (fail toward missing, never the wrong value); and the
-``)`` anchor admits a write that follows a parenthetical in prose
-(over-counting — the census fails loudly, never silently).
+symlinked DIRECTORIES under the scan root are not traversed (symlinked
+``.py`` files ARE scanned, matching base ``rglob`` behavior); a
+``PermissionError`` on a directory aborts the walk
+(fail closed); any name bound inside a function (parameter, assignment,
+``for``/``with`` target, walrus, import alias, nested def/class/lambda, or
+``except ... as``) shadows a module constant and
+resolves to nothing (fail toward missing, never the wrong value — feedback
+FB-04); the ``)`` anchor admits a write that follows a parenthetical in
+prose (over-counting — the census fails loudly, never silently); a dynamic
+(``\\x00``) placeholder inside a SQL comment or single-quoted literal can
+diverge from runtime tokenization, so a write revealed by the runtime value
+can be hidden from the fold; and an UNTERMINATED single quote blanks the
+remainder of a folded string (FB-11 — the guard is an accidental-regression
+detector, not a hostile-source analyzer). In a multi-generator comprehension
+each generator's iterable sees only targets bound by earlier generators,
+and its guards see its own target too (the exact PEP 289 prefix rule);
+this precision boundary is disclosed here.
 """
 
 from __future__ import annotations
@@ -99,9 +110,11 @@ CENSUS_TABLES = frozenset(
 )
 
 #: Co-owner site counts at base 3e00fbf6 (issue #790 audit provenance: ENH-13
-#: review, 8 + 7 + 11 = 26). Minimums, not equality: additive writes inside a
-#: declared owner are legitimate; the pins exist so a scanner regression that
-#: stops seeing writes fails loudly instead of passing vacuously.
+#: review, 8 + 7 + 11 = 26). EXACT pins, not minimums (feedback FB-05): the
+#: precision work moved no real site, so an additive write inside a declared
+#: owner must be reviewed and this map updated deliberately rather than
+#: passing silently. The pins exist so a scanner regression that stops seeing
+#: writes fails loudly instead of passing vacuously.
 _KNOWN_MINIMUMS = {
     "api/routes/draft_room.py": 8,
     "services/draft_job_processor.py": 7,
@@ -111,8 +124,9 @@ _KNOWN_MINIMUMS = {
 #: ``DraftStore`` is the DEFAULT owner of these tables (its module docstring
 #: says so), so its own write surface is pinned too. Without this the store
 #: could be gutted of every six-table write and the whole census would stay
-#: green — the outside-store total excludes the store by construction. 48 sites
-#: at base 3e00fbf6; the margin absorbs legitimate refactors.
+#: green — the outside-store total excludes the store by construction. 46 sites
+#: measured at the current head (48 at base 3e00fbf6); the margin absorbs
+#: legitimate refactors (feedback FB-05 corrected the stale 48 figure).
 _STORE_MINIMUM = 40
 
 #: SQLite write grammar. The verb/table separator is an ATOMIC group: without
@@ -386,25 +400,156 @@ def _module_constants(tree: ast.Module) -> dict[str, tuple[str, int]]:
 
 
 def _function_assigned_names(tree: ast.Module) -> dict[int, frozenset[str]]:
-    """Per-function sets of locally assigned names (shadow detection)."""
+    """Per-function sets of names bound in THAT function's own scope.
+
+    Feedback (Copilot r4593838474, Stage B FB-04): the original collector
+    saw only Assign/AnnAssign/AugAssign targets, so parameters, loop/with
+    targets, walrus, import aliases, destructuring,
+    ``except ... as`` and match-pattern captures that shadowed a module SQL
+    constant were resolved to the wrong value. All binding forms are now
+    collected, including walrus bindings in nested default expressions (which
+    Python evaluates in the enclosing scope) — but ONLY in the function's own
+    lexical scope: a comprehension target owns only the comprehension scope
+    (PEP 289); a nested function's parameter does not shadow its enclosing
+    function's name, so descending into nested bodies (as ``ast.walk(fn)`` did)
+    wrongly suppressed genuine outer-scope uses. Nested def/class/lambda NAMES
+    are bound in the enclosing scope; their parameters/body bindings are not.
+    """
+
+    def bound_target(node: ast.AST) -> set[str]:
+        names: set[str] = set()
+        if isinstance(node, (ast.Tuple, ast.List)):
+            for elt in node.elts:
+                names |= bound_target(elt)
+        elif isinstance(node, ast.Starred):
+            names |= bound_target(node.value)
+        elif isinstance(node, ast.Name):
+            names.add(node.id)
+        return names
+
+    def bound_pattern(pattern: ast.AST | None) -> set[str]:
+        """All capture names in a match pattern, including nested wrappers
+        (MatchClass / MatchOr / MatchSequence / MatchMapping / MatchAs)."""
+        names: set[str] = set()
+        if pattern is None:
+            return names
+        if isinstance(pattern, (ast.MatchAs, ast.MatchStar)) and pattern.name:
+            names.add(pattern.name)
+        elif isinstance(pattern, ast.MatchMapping) and pattern.rest:
+            names.add(pattern.rest)
+        for child in ast.iter_child_nodes(pattern):
+            names |= bound_pattern(child)
+        return names
+
+    def arg_names(args: ast.arguments) -> set[str]:
+        return {
+            arg.arg
+            for arg in (
+                *args.posonlyargs,
+                *args.args,
+                *args.kwonlyargs,
+                args.vararg,
+                args.kwarg,
+            )
+            if arg is not None
+        }
+
+    def own_scope(fn: ast.AST):
+        """Yield nodes in fn's body without descending into nested scopes."""
+        stack = list(ast.iter_child_nodes(fn))
+        while stack:
+            node = stack.pop()
+            yield node
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+            ):
+                continue
+            stack.extend(ast.iter_child_nodes(node))
+
+    def bindings_from(nodes) -> set[str]:
+        """Collect every binding form from nodes in one lexical scope."""
+        names: set[str] = set()
+        for node in nodes:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    names |= bound_target(target)
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                names |= bound_target(node.target)
+            elif isinstance(node, (ast.NamedExpr, ast.For, ast.AsyncFor)):
+                names |= bound_target(node.target)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        names |= bound_target(item.optional_vars)
+            elif isinstance(node, ast.comprehension):
+                # PEP 289: a comprehension target has its OWN scope in
+                # Python 3 — it does not shadow a name in the enclosing
+                # function. Registered separately (keyed by node id) so
+                # enter_scope can apply it INSIDE the comprehension only.
+                pass
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)  # only the name binds here
+                # Defaults, decorators, annotations and class bases are all
+                # evaluated in the ENCLOSING scope; a walrus in any of them
+                # binds there (Stage B FB-04).
+                exprs: list[ast.expr] = []
+                if isinstance(node, ast.ClassDef):
+                    exprs += [*node.bases, *(kw.value for kw in node.keywords)]
+                else:
+                    exprs += [
+                        *node.args.defaults,
+                        *(d for d in node.args.kw_defaults if d is not None),
+                    ]
+                    for arg in (
+                        *node.args.posonlyargs,
+                        *node.args.args,
+                        *node.args.kwonlyargs,
+                        node.args.vararg,
+                        node.args.kwarg,
+                    ):
+                        if arg is not None and arg.annotation is not None:
+                            exprs.append(arg.annotation)
+                    if node.returns is not None:
+                        exprs.append(node.returns)
+                exprs += [*node.decorator_list]
+                for expr in exprs:
+                    for sub in ast.walk(expr):
+                        if isinstance(sub, ast.NamedExpr):
+                            names |= bound_target(sub.target)
+            elif isinstance(node, ast.Lambda):
+                # Same enclosing-scope rule for lambda defaults.
+                for default in (
+                    *node.args.defaults,
+                    *(d for d in node.args.kw_defaults if d is not None),
+                ):
+                    for sub in ast.walk(default):
+                        if isinstance(sub, ast.NamedExpr):
+                            names |= bound_target(sub.target)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    names.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                names.add(node.name)
+            elif isinstance(node, ast.match_case):
+                names |= bound_pattern(node.pattern)
+        return names
+
     assigned: dict[int, frozenset[str]] = {}
-    for fn in ast.walk(tree):
-        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            names: set[str] = set()
-            for node in ast.walk(fn):
-                if isinstance(node, ast.Assign):
-                    for target in node.targets:
-                        if isinstance(target, ast.Name):
-                            names.add(target.id)
-                elif isinstance(node, ast.AnnAssign) and isinstance(
-                    node.target, ast.Name
-                ):
-                    names.add(node.target.id)
-                elif isinstance(node, ast.AugAssign) and isinstance(
-                    node.target, ast.Name
-                ):
-                    names.add(node.target.id)
-            assigned[id(fn)] = frozenset(names)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            assigned[id(node)] = frozenset(
+                arg_names(node.args) | bindings_from(own_scope(node))
+            )
+        elif isinstance(node, ast.Lambda):
+            # Lambda args PLUS bindings inside its body (a walrus in a lambda
+            # body shadows the module constant too — Stage B FB-04).
+            assigned[id(node)] = frozenset(
+                arg_names(node.args) | bindings_from(own_scope(node))
+            )
+        elif isinstance(node, ast.comprehension):
+            # Comprehension targets own ONLY the comprehension's scope
+            # (PEP 289); registered here so enter_scope applies them there.
+            assigned[id(node)] = frozenset(bound_target(node.target))
     return assigned
 
 
@@ -423,13 +568,48 @@ def scan_tree(root: Path) -> list[WriteSite]:
     constant defined in one module and executed in another is invisible
     (cross-module name resolution is out of scope); ``job_lease.py`` writes
     ``draft_jobs`` through a constructor-supplied table attribute the fold
-    cannot see; directory symlinks under the scan root are not traversed
-    (pathlib recursion follows no symlinks); a ``PermissionError`` on a
-    directory aborts the walk (fail closed); a function-local assignment
-    shadowing a module constant resolves to nothing (fail toward missing).
+    cannot see; symlinked directories under the scan root are not traversed
+    (symlinked ``.py`` files are still scanned); a ``PermissionError`` on a
+    directory aborts the walk (fail closed); any function-local binding
+    (parameter, assignment, for/with/walrus/comprehension/import/nested-def)
+    shadowing a module constant resolves to nothing (fail toward missing);
+    a dynamic placeholder inside a comment/literal may hide a write the
+    runtime value reveals, and an unterminated single quote blanks the rest
+    of a folded string (FB-11 — accidental-regression scope only).
     """
+    def iter_py_files(root: Path):
+        """Explicit walk: an unreadable directory raises, it is not skipped.
+
+        Python 3.11's ``Path.rglob`` *suppresses* directory PermissionError
+        (its recursive selector catches and returns), which would silently
+        omit a subtree that could hide a writer. Closeout FB-20: walk
+        explicitly so the documented fail-closed contract is real. Symlinked
+        directories remain untraversed (the disclosed limitation).
+        """
+        stack = [root]
+        while stack:
+            directory = stack.pop()
+            try:
+                entries = list(directory.iterdir())
+            except PermissionError as exc:
+                raise AssertionError(
+                    f"census cannot read directory {directory}: {exc}"
+                ) from exc
+            for entry in entries:
+                if entry.is_symlink():
+                    # Base Path.rglob("*.py") returned symlinked .py FILES;
+                    # preserve that. Only symlinked DIRECTORIES stay
+                    # untraversed (the disclosed limitation).
+                    if entry.suffix == ".py" and entry.is_file():
+                        yield entry
+                    continue
+                if entry.is_dir():
+                    stack.append(entry)
+                elif entry.is_file() and entry.suffix == ".py":
+                    yield entry
+
     sites: list[WriteSite] = []
-    for path in sorted(root.rglob("*.py")):
+    for path in sorted(iter_py_files(root)):
         try:
             source = path.read_text(encoding="utf-8-sig")
         except UnicodeDecodeError as exc:
@@ -452,15 +632,93 @@ def scan_tree(root: Path) -> list[WriteSite]:
         ) -> str | None:
             return _fold(node, consts, local, used)
 
+        def enter_scope(node: ast.AST, local: frozenset[str]) -> frozenset[str]:
+            """Extend, never replace, the enclosing scope's shadow set.
+
+            Stage B (FB-04): the previous ``local = func_assigned[...]``
+            discarded an outer function's bindings when entering a nested
+            function or lambda, so a closure read could resolve a module
+            constant the outer scope had shadowed. Union is the safe
+            direction (extra shadows only suppress a resolution).
+            """
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+            ):
+                return local | func_assigned.get(id(node), frozenset())
+            return local
+
+        def child_scopes(node: ast.AST, local: frozenset[str]):
+            """Yield (child, child_local) with PEP 289 comprehension scoping.
+
+            A comprehension target is in scope for the element/key/value and
+            the generator guards, but NOT for the leftmost iterable — Python
+            evaluates that in the enclosing scope. Closeout FB-04.
+            """
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+            ):
+                # Defaults, decorators, annotations and class bases execute
+                # in the ENCLOSING scope; only the body uses the new scope.
+                inner = enter_scope(node, local)
+                outer_exprs: set[ast.AST] = set(
+                    getattr(node, "decorator_list", [])
+                )
+                returns = getattr(node, "returns", None)
+                if isinstance(node, ast.ClassDef):
+                    outer_exprs |= set(node.bases)
+                    outer_exprs |= {kw.value for kw in node.keywords}
+                else:
+                    outer_exprs |= set(node.args.defaults)
+                    outer_exprs |= {
+                        d for d in node.args.kw_defaults if d is not None
+                    }
+                    if returns is not None:
+                        outer_exprs.add(returns)
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, ast.arguments):
+                        for sub in ast.iter_child_nodes(child):
+                            if isinstance(sub, ast.arg):
+                                for ann in ast.iter_child_nodes(sub):
+                                    yield ann, local  # annotation: enclosing scope
+                                continue
+                            yield sub, (local if sub in outer_exprs else inner)
+                    else:
+                        yield child, (local if child in outer_exprs else inner)
+                return
+            if not isinstance(
+                node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+            ):
+                for child in ast.iter_child_nodes(node):
+                    yield child, local
+                return
+            gens = node.generators
+            all_targets: frozenset[str] = frozenset()
+            for gen in gens:
+                all_targets |= func_assigned.get(id(gen), frozenset())
+            for field in ("elt", "key", "value"):
+                expr = getattr(node, field, None)
+                if expr is not None:
+                    yield expr, local | all_targets
+            for idx, gen in enumerate(gens):
+                previous: frozenset[str] = frozenset()
+                for earlier in gens[:idx]:
+                    previous |= func_assigned.get(id(earlier), frozenset())
+                own = func_assigned.get(id(gen), frozenset())
+                # Each generator's ITERABLE is evaluated before its own
+                # target binds — only earlier targets are in scope there.
+                yield gen.iter, local | previous
+                for condition in gen.ifs:
+                    yield condition, local | previous | own
+            return
+
         def walk_refs(node: ast.AST, local: frozenset[str]) -> None:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                local = func_assigned.get(id(node), frozenset())
+            effective = enter_scope(node, local)
             if isinstance(
                 node, (ast.Constant, ast.JoinedStr, ast.BinOp, ast.Call, ast.Name)
             ):
-                fold(node, local)
-            for child in ast.iter_child_nodes(node):
-                walk_refs(child, local)
+                fold(node, effective)
+            for child, child_local in child_scopes(node, local):
+                walk_refs(child, child_local)
 
         walk_refs(tree, frozenset())
         skip = skip_docstrings | {
@@ -470,17 +728,13 @@ def scan_tree(root: Path) -> list[WriteSite]:
         def visit(node: ast.AST, local: frozenset[str]) -> None:
             if id(node) in skip:
                 return
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                local = func_assigned.get(id(node), frozenset())
-                for child in ast.iter_child_nodes(node):
-                    visit(child, local)
-                return
+            effective = enter_scope(node, local)
             folded = None
             if isinstance(
                 node,
                 (ast.Constant, ast.JoinedStr, ast.BinOp, ast.Call, ast.Name),
             ):
-                folded = fold(node, local)
+                folded = fold(node, effective)
             if folded is not None:
                 stripped = _strip_sql_comments(folded)
                 matched = False
@@ -503,8 +757,8 @@ def scan_tree(root: Path) -> list[WriteSite]:
                         matched = True
                 if matched:
                     return  # outermost expression wins; inner parts not re-counted
-            for child in ast.iter_child_nodes(node):
-                visit(child, local)
+            for child, child_local in child_scopes(node, local):
+                visit(child, child_local)
 
         visit(tree, frozenset())
     return sites
@@ -1076,6 +1330,154 @@ class TestTableOwnershipCensus(unittest.TestCase):
             f"{sites}",
         )
 
+    def test_census_binding_shadowing_is_not_resolved(self):
+        """Feedback FB-04: every in-function binding form shadows a module
+        constant — not just assignments (Copilot r4593838474). Each shape
+        binds PREFIX to a non-write value locally; the fold must fail toward
+        missing (zero sites) rather than resolve the module's ``UPDATE ``
+        constant and report a false draft_jobs write."""
+        # Every shape routes the SQL through the SHADOWED name, not a literal
+        # that would be a real write regardless of name resolution.
+        shapes = {
+            "param": "def touch(PREFIX, conn):\n    conn.execute(PREFIX + 'draft_jobs SET status = 1')\n",
+            "for_target": "def touch(rows, conn):\n    for PREFIX in rows:\n        conn.execute(PREFIX + 'draft_jobs SET status = 1')\n",
+            "with_target": "def touch(cm, conn):\n    with cm as PREFIX:\n        conn.execute(PREFIX + 'draft_jobs SET status = 1')\n",
+            "walrus": "def touch(rows, conn):\n    if (PREFIX := rows):\n        conn.execute(PREFIX + 'draft_jobs SET status = 1')\n",
+            "comprehension": "def touch(rows, conn):\n    return [conn.execute(PREFIX + 'draft_jobs SET status = 1') for PREFIX in rows]\n",
+            "import_alias": "def touch(conn):\n    import sqlite3 as PREFIX\n    conn.execute(PREFIX + 'draft_jobs SET status = 1')\n",
+            "nested_def": "def touch(conn):\n    def PREFIX():\n        pass\n    conn.execute(PREFIX + 'draft_jobs SET status = 1')\n",
+            "tuple_unpack": "def touch(conn, rows):\n    PREFIX, other = rows\n    conn.execute(PREFIX + 'draft_jobs SET status = 1')\n",
+            "starred_unpack": "def touch(conn, rows):\n    first, *PREFIX = rows\n    conn.execute(PREFIX + 'draft_jobs SET status = 1')\n",
+            "closure_inherit": "def outer(conn):\n    PREFIX = 'DELETE FROM '\n    def inner():\n        conn.execute(PREFIX + 'draft_jobs SET status = 1')\n    return inner\n",
+            "lambda_arg": "def touch(conn):\n    fn = lambda PREFIX: conn.execute(PREFIX + 'draft_jobs SET status = 1')\n    return fn\n",
+            "match_capture": "def touch(conn, value):\n    match value:\n        case PREFIX:\n            conn.execute(PREFIX + 'draft_jobs SET status = 1')\n",
+            "lambda_walrus": "def touch(conn, rows):\n    fn = lambda: conn.execute((PREFIX := rows) + 'draft_jobs SET status = 1')\n    return fn\n",
+            "match_nested": "def touch(conn, value):\n    match value:\n        case SomeClass(inner=PREFIX):\n            conn.execute(PREFIX + 'draft_jobs SET status = 1')\n",
+            "default_walrus": "def touch(conn):\n    def inner(x=(PREFIX := 'SELECT ')):\n        pass\n    conn.execute(PREFIX + 'draft_jobs SET status = 1')\n",
+            "class_base_walrus": "def touch(conn):\n    class C((PREFIX := object())):\n        pass\n    conn.execute(PREFIX + 'draft_jobs SET status = 1')\n",
+            "decorator_walrus": "def touch(conn):\n    @((PREFIX := staticmethod))\n    def inner():\n        pass\n    conn.execute(PREFIX + 'draft_jobs SET status = 1')\n",
+            "annotation_walrus": "def touch(conn):\n    def inner(x: (PREFIX := int)):\n        pass\n    conn.execute(PREFIX + 'draft_jobs SET status = 1')\n",
+            "except_binding": "def touch(conn):\n    try:\n        conn.execute('SELECT 1')\n    except Exception as PREFIX:\n        conn.execute(PREFIX + 'draft_jobs SET status = 1')\n",
+        }
+        for label, body in shapes.items():
+            with self.subTest(shape=label), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / f"shadow_{label}.py"
+                path.write_text('PREFIX = "UPDATE "\n\n' + body, encoding="utf-8")
+                sites = scan_tree(Path(tmp))
+                self.assertEqual(
+                    sites,
+                    [],
+                    f"binding_shadowing[{label}]: a local {label} binding must "
+                    "shadow the module constant (fail toward missing); the "
+                    f"census reported {sites}",
+                )
+
+    def test_comprehension_target_does_not_shadow_enclosing_scope(self):
+        """Closeout FB-04: PEP 289 comprehension targets have their own
+        scope. A comprehension that binds PREFIX must NOT suppress a later
+        genuine write in the enclosing function that resolves the module
+        constant of the same name."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "comprehension_scope.py"
+            path.write_text(
+                'PREFIX = "UPDATE "\n\n'
+                "def touch(conn, rows):\n"
+                "    labels = [PREFIX for PREFIX in rows]\n"
+                "    conn.execute(PREFIX + 'draft_jobs SET status = 1')\n"
+                "    return labels\n",
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            [(s.rel_path, s.verb, s.table) for s in sites],
+            [("comprehension_scope.py", "UPDATE", "draft_jobs")],
+            "comprehension_scope: the enclosing function's PREFIX still "
+            f"resolves the module constant; got {sites}",
+        )
+
+    def test_later_generator_iterable_uses_previous_targets_only(self):
+        """Final FB-04: each comprehension generator's ITERABLE is evaluated
+        before its own target binds, so a module constant of the same name
+        there is still a real write."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "later_generator.py"
+            path.write_text(
+                'PREFIX = "UPDATE "\n\n'
+                "def touch(conn):\n"
+                "    return [1 for x in [] for PREFIX in "
+                "conn.execute(PREFIX + 'draft_jobs SET status = 1')]\n",
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            [(s.rel_path, s.verb, s.table) for s in sites],
+            [("later_generator.py", "UPDATE", "draft_jobs")],
+            "later_generator_iterable: the second iterable's PREFIX resolves "
+            f"the module constant; got {sites}",
+        )
+
+    def test_unreadable_directory_fails_closed(self):
+        """Closeout FB-20: an inaccessible directory must abort the census,
+        not silently drop a subtree that could hide a writer. Python 3.11's
+        Path.rglob suppresses PermissionError; the explicit walk does not."""
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                Path, "iterdir", side_effect=PermissionError("access denied")
+            ):
+                with self.assertRaises(AssertionError) as caught:
+                    scan_tree(Path(tmp))
+        self.assertIn(
+            "cannot read directory",
+            str(caught.exception),
+            "permission_failure: the census must name the unreadable "
+            f"directory; got {caught.exception}",
+        )
+
+    def test_comprehension_leftmost_iterable_uses_enclosing_scope(self):
+        """Closeout FB-04: PEP 289 evaluates a comprehension's LEFTMOST
+        iterable in the enclosing scope, so a module constant there is still
+        a real write even though the comprehension binds the same name."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "comprehension_iterable.py"
+            path.write_text(
+                'PREFIX = "UPDATE "\n\n'
+                "def touch(conn):\n"
+                "    return [1 for PREFIX in "
+                "conn.execute(PREFIX + 'draft_jobs SET status = 1')]\n",
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            [(s.rel_path, s.verb, s.table) for s in sites],
+            [("comprehension_iterable.py", "UPDATE", "draft_jobs")],
+            "comprehension_iterable: the leftmost iterable's PREFIX resolves "
+            f"the module constant; got {sites}",
+        )
+
+    def test_nested_default_uses_enclosing_scope_despite_param_shadow(self):
+        """Final FB-04: a nested function's parameter shadows the module
+        constant in its BODY, but its DEFAULT expression is evaluated in the
+        enclosing scope — a write there must still be counted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nested_default_scope.py"
+            path.write_text(
+                'PREFIX = "UPDATE "\n\n'
+                "def outer(conn):\n"
+                "    def inner(PREFIX=PREFIX + 'draft_jobs SET status = 1'):\n"
+                "        return PREFIX\n"
+                "    return inner\n",
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            [(s.rel_path, s.verb, s.table) for s in sites],
+            [("nested_default_scope.py", "UPDATE", "draft_jobs")],
+            "nested_default_scope: the default's PREFIX resolves in the "
+            f"enclosing scope; got {sites}",
+        )
+
     def test_census_docstring_names_the_disclosed_limitations(self):
         """Plan-critic round 2 (round-3 fix: module docstring included): the
         #926 disclosed-limitation class (items 5-7 plus permission-denied
@@ -1099,6 +1501,8 @@ class TestTableOwnershipCensus(unittest.TestCase):
             "symlink",
             "PermissionError",
             "shadow",
+            "placeholder",  # FB-11: dynamic-in-comment/literal divergence
+            "UNTERMINATED",  # FB-11: open single quote blanks the folded tail
         ):
             self.assertIn(
                 limitation,

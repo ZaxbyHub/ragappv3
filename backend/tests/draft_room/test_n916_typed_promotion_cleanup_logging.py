@@ -162,7 +162,10 @@ class TestGenericBranchKeepsExactlyItsOwnError(DraftPromoteTestBase):
 
     longMessage = False
 
-    def test_generic_branch_cleanup_incomplete_logs_exactly_one_error(self):
+    def test_generic_branch_cleanup_incomplete_logs_exactly_two_baseline_errors(self):
+        """Feedback FB-05: the old name said 'one' while the body pins the
+        generic branch's shipped TWO-record baseline (logger.exception + the
+        5xx response handler). Renamed so the name and the pin agree."""
         from app.services.draft_promotion import DraftPromotionError
 
         draft_id = self._create_draft().json()["id"]

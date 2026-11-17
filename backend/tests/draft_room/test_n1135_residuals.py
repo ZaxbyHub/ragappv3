@@ -67,6 +67,23 @@ class TestFindingsPageBeyondSqliteBind(CompileRouteTestBase):
             f"validation error, got {resp.status_code}: {resp.text}",
         )
 
+    def test_second_list_route_also_refuses_oversized_page_422(self):
+        """Feedback FB-10: the bound is a property of all seven routes, not
+        just /findings. Exercise a second paginated list route at an
+        oversized page so a regression limited to /findings cannot pass."""
+        draft_id, _job_id, _revision_id = self._seed_ready_eligible_draft()
+        resp = self.client.get(
+            f"/api/draft-room/drafts/{draft_id}/jobs?page={10**18}",
+            headers=self._owner_headers(),
+        )
+        self.assertEqual(
+            resp.status_code,
+            422,
+            "page_bound_second_route: /jobs must refuse page=10**18 with 422 "
+            f"(the bound applies to all seven list routes), got "
+            f"{resp.status_code}: {resp.text}",
+        )
+
     def test_page_bound_boundary_at_max_per_page(self):
         """Plan-critic round 2: pin the bound's exact edges at per_page=100.
 
@@ -118,6 +135,29 @@ class TestFindingsPageBeyondSqliteBind(CompileRouteTestBase):
             __file__).resolve().parents[2] / "app" / "api" / "routes" / "draft_room.py"
         tree = ast.parse(source.read_text(encoding="utf-8-sig"))
         unbounded = []
+        wrong_value = []
+        expected_bound = ((2**63 - 1) // 100) + 1
+        expected_expr = ast.parse("((2**63 - 1) // 100) + 1", mode="eval").body
+        def is_max_page_decl(n: ast.AST) -> bool:
+            if isinstance(n, ast.AnnAssign):
+                return (
+                    isinstance(n.target, ast.Name)
+                    and n.target.id == "MAX_LIST_PAGE"
+                    and n.value is not None
+                )
+            return isinstance(n, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "MAX_LIST_PAGE"
+                for t in n.targets
+            )
+
+        module_bound = next(
+            (n.value for n in tree.body if is_max_page_decl(n)), None
+        )
+        if module_bound is None or ast.dump(module_bound) != ast.dump(expected_expr):
+            wrong_value.append(
+                f"module MAX_LIST_PAGE expression is "
+                f"{ast.unparse(module_bound) if module_bound is not None else None!r}"
+            )
         bounded = 0
         for node in ast.walk(tree):
             if not isinstance(node, ast.AsyncFunctionDef):
@@ -134,17 +174,39 @@ class TestFindingsPageBeyondSqliteBind(CompileRouteTestBase):
                         and isinstance(call.func, ast.Name)
                         and call.func.id == "Query"
                     ):
-                        kw_names = [kw.arg for kw in call.keywords]
-                        if "le" in kw_names:
-                            bounded += 1
-                        else:
+                        le_values = [
+                            kw.value for kw in call.keywords if kw.arg == "le"
+                        ]
+                        if not le_values:
                             unbounded.append(f"{node.name}:page")
+                            continue
+                        # Feedback FB-10: presence alone is not enough — every
+                        # route must reference the module's MAX_LIST_PAGE
+                        # constant (whose expression is pinned above).
+                        le_node = le_values[0]
+                        if not (
+                            isinstance(le_node, ast.Name)
+                            and le_node.id == "MAX_LIST_PAGE"
+                        ):
+                            wrong_value.append(
+                                f"{node.name}:page le="
+                                f"{ast.unparse(le_node)!r} (expected MAX_LIST_PAGE "
+                                f"= {expected_bound})"
+                            )
+                        bounded += 1
         self.assertEqual(
             unbounded,
             [],
             "page_bound_coverage: every `page: int = Query(...)` parameter "
             f"in draft_room.py must carry an le= bound; unbounded: "
             f"{unbounded} (bounded: {bounded})",
+        )
+        self.assertEqual(
+            wrong_value,
+            [],
+            "page_bound_coverage: every le= bound must equal MAX_LIST_PAGE "
+            f"= ((2**63 - 1) // 100) + 1 = {expected_bound}; wrong: "
+            f"{wrong_value}",
         )
         self.assertGreaterEqual(
             bounded,
@@ -366,11 +428,14 @@ class TestCrashStrandSweep(DraftStoreTestBase):
             )
 
     def test_sweep_guards_active_and_non_failed_terminal_histories(self):
-        # Plan-critic round 2: the active-job guard must be DISCRIMINATING —
-        # seed an OLDER terminal failed job plus a NEWER pending job (a
-        # crash after a retry's re-enqueue). "Any historical failure + no
-        # active job" would settle these; the shipped sweep must not, because
-        # the newest compile job is live work.
+        # Plan-critic round 2, comment corrected by feedback FB-08: what
+        # makes these histories non-settleable is the LATEST-JOB subquery
+        # (ORDER BY id DESC LIMIT 1), not the NOT EXISTS active-job guard.
+        # Seed an OLDER terminal failed job plus a NEWER pending/cancelled/
+        # completed job: the newest outcome owns the draft, so a sweep that
+        # matched "any historical failure" would wrongly settle it. The
+        # NOT EXISTS guard is defence in depth (unreachable at production
+        # DDL — inserts default to pending and terminal states never change).
         active_mixed = self._make_draft(title="Failed then pending")
         self._seed_job(active_mixed, "failed")
         self._seed_job(active_mixed, "pending")
@@ -466,6 +531,23 @@ class TestCrashStrandSweep(DraftStoreTestBase):
             lock_after_first,
             "crash_strand_sweep: a second sweep must not bump lock_version "
             "(#1135 AC4)",
+        )
+
+    def test_second_sweep_reports_zero_settled(self):
+        """Feedback FB-08: pin the RETURN count, not only the row state.
+
+        The status-filter / live-job guards can be dropped without changing
+        any row in a production-reachable state; what still discriminates is
+        the settled-N count (and the startup log line it feeds).
+        """
+        stranded = self._make_draft(title="Count strand")
+        self._seed_stranded(stranded, "queued")
+        self.assertEqual(self.store.recover_stranded_compile_drafts(), 1)
+        self.assertEqual(
+            self.store.recover_stranded_compile_drafts(),
+            0,
+            "crash_strand_sweep: the second sweep must report zero settled "
+            "drafts (#1135 AC4; feedback FB-08)",
         )
 
 

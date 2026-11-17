@@ -381,6 +381,30 @@ class TestDispositionAuditMetadataIsContentFree(CompileRouteTestBase):
             headers=self._owner_headers(),
         )
 
+    def _waive(self, finding_id):
+        return self.client.post(
+            f"/api/draft-room/drafts/{self.draft_id}/findings/{finding_id}/disposition",
+            json={"action": "waive", "base_revision_id": self.revision_id,
+                  "lock_version": self._lock_version(self.draft_id),
+                  "note": "reviewed and accepted (feedback FB-09 pin)"},
+            headers=self._owner_headers(),
+        )
+
+    def test_waive_audit_metadata_has_no_span_text_sha256(self):
+        """Feedback FB-09: the shared content-free audit dict serves waive
+        as well as dismiss; pin the second action too."""
+        finding_id = self._insert_finding()
+        resp = self._waive(finding_id)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        rows = self._audit_metadata("draft_finding_waive")
+        self.assertEqual(len(rows), 1, f"expected one waive audit row, got {rows}")
+        self.assertNotIn(
+            "span_text_sha256",
+            rows[0],
+            "audit_span_fingerprint: the waive disposition audit must be "
+            f"content-free too; got {rows[0]}",
+        )
+
     def test_dismiss_audit_metadata_has_no_span_text_sha256(self):
         finding_id = self._insert_finding()
         resp = self._dismiss(finding_id)
@@ -406,6 +430,27 @@ class TestDispositionAuditMetadataIsContentFree(CompileRouteTestBase):
             "audit_span_fingerprint: the disposition audit event survives "
             "draft deletion and must carry no document-content-derived "
             f"values; span_text_sha256 is present: {metadata}",
+        )
+        # Feedback FB-09: removing the hash from the AUDIT row must not
+        # remove it from draft_findings — waiver-text pinning still reads it
+        # there, and that table cascades with the draft.
+        conn, store = self._store()
+        try:
+            finding = store.get_finding(
+                draft_id=self.draft_id, owner_id=self.OWNER_ID, finding_id=finding_id
+            )
+            stored_hash = (
+                finding.get("span_text_sha256")
+                if isinstance(finding, dict)
+                else getattr(finding, "span_text_sha256", None)
+            )
+        finally:
+            self._release(conn)
+        self.assertTrue(
+            stored_hash,
+            "audit_span_fingerprint: the span hash must remain in "
+            "draft_findings (the cascaded, authoritative store) after the "
+            "disposition audit row drops it",
         )
 
 

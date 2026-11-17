@@ -1,15 +1,18 @@
-# Draft Room residuals: audit content-free payload, pagination bound, crash-strand sweep, census precision, typed-branch cleanup logs
+# Draft Room residuals: finding-disposition audit payload, pagination bound, crash-strand sweep, census precision, typed-branch cleanup logs
 
 Issues: #1135, #926, #916
 Trace: `.agents/issue-traces/1135-926-916-draft-room-residuals` (issue-tracer v3)
 
 ## What changed
 
-- **Content-free audit payload (#1135 claim 1)**: the finding-disposition
-  audit event no longer writes `span_text_sha256` into the non-cascaded
-  `security_audit_log` (SPEC 6.3 / 17.1 item 24 — content-retention). The
-  span hash stays in `draft_findings`, where waiver-text pinning reads it;
-  only the audit payload loses the manuscript-prose fingerprint.
+- **Content-free finding-disposition audit payload (#1135 claim 1)**: the
+  finding-disposition audit event no longer writes `span_text_sha256` into
+  the non-cascaded `security_audit_log` (SPEC 6.3 / 17.1 item 24 —
+  content-retention). The span hash stays in `draft_findings`, where
+  waiver-text pinning reads it; only the finding-disposition audit payload
+  loses the manuscript-prose fingerprint. This claim is deliberately scoped:
+  other audit events still carry integrity codes (see Residual audit fields
+  below), which remain a maintainer decision.
 - **Pagination overflow bound (#1135 claim 2)**: all SEVEN paginated Draft
   Room list routes (findings + evidence/claims/revisions siblings) bound
   `page` with `le=MAX_LIST_PAGE = ((2**63 - 1) // 100) + 1` — the largest
@@ -18,7 +21,7 @@ Trace: `.agents/issue-traces/1135-926-916-draft-room-residuals` (issue-tracer v3
   unhandled 500. **API tightening**: formerly-valid huge-page requests that
   returned empty 200 lists are now refused; real page counts never approach
   the bound.
-- **Re-archive idempotent refusal (#1135 claim 3a)**: archiving an
+- **Re-archive refusal / API tightening (#1135 claim 3a)**: archiving an
   already-archived draft now raises the store's transition error (409
   `invalid_transition` over the route) instead of silently bumping
   `lock_version` and writing a second `draft_archived` event. The
@@ -74,3 +77,22 @@ Trace: `.agents/issue-traces/1135-926-916-draft-room-residuals` (issue-tracer v3
   draft_id=… error=…`) is the operator-visible signal that a promotion's
   compensating deletes failed and an orphan may exist; it pairs with the
   existing `draft_promotion_cleanup_failed` audit event.
+
+## Residual audit fields (maintainer decision — feedback FB-07)
+
+The finding-disposition audit is now content-free, but other events in the
+same append-only, non-cascaded `security_audit_log` still carry values worth
+an explicit maintainer call (all pre-existing, none introduced here):
+
+| Event | Field | Why it needs a decision |
+|---|---|---|
+| `draft_exported` | `content_sha256` | content-derived fingerprint; removal changes export correlation |
+| `draft_ready_marked` | `content_sha256` | same class, via `_sync_mark_ready` |
+| `draft_promoted` | `source_sha256`, `filename` | integrity code + title-derived filename |
+| `draft_job_retried`, `draft_compile_requested` | `compile_input_sha256` | composite of brief + input digests (not manuscript prose) |
+| `draft_promotion_cleanup_failed` | `detail: str(exc)` | raw exception text (PathConflict embeds a server path); the new ERROR log is class-name-only but this audit row is not |
+| `draft_promoted` error paths | `organization_error`, `draft_event_error` (`str(exc)`) | same raw-exception class |
+
+Each is a product/compatibility decision about the audit ledger, not a defect
+introduced by this PR; they are listed in the PR body's Considered table and
+are awaiting the maintainer's call.
