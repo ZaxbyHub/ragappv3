@@ -1954,7 +1954,7 @@ class RAGEngine:
                     and not skip_fused_evaluation
                 ):
                     try:
-                        evaluator_key = id(active_client)
+                        evaluator_key = id(self.aux_llm_client)
                         if evaluator_key not in self._retrieval_evaluators:
                             self._retrieval_evaluators[evaluator_key] = RetrievalEvaluator(
                                 self.aux_llm_client
@@ -3656,7 +3656,7 @@ class RAGEngine:
                     and not skip_evaluation
                 ):
                     try:
-                        evaluator_key = id(active_client)
+                        evaluator_key = id(self.aux_llm_client)
                         if evaluator_key not in self._retrieval_evaluators:
                             self._retrieval_evaluators[evaluator_key] = RetrievalEvaluator(
                                 self.aux_llm_client

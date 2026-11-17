@@ -1,4 +1,4 @@
-"""Aux-lane routing for the retrieval-quality services (branch: fix/portal-resilience).
+"""Aux-lane routing for the retrieval-quality services .
 
 Contract: QueryTransformer, QueryPlanner, and RetrievalEvaluator are bound to
 the engine's auxiliary client — the instant lane — because the thinking

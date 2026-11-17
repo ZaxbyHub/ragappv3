@@ -36,9 +36,6 @@ def _make_engine_for_retrieval():
     engine.llm_client = MagicMock()
     engine._thinking_client_override = None
     engine._instant_client_override = None
-    engine.llm_client = MagicMock()
-    engine._thinking_client_override = None
-    engine._instant_client_override = None
     engine._retrieval_evaluators = {}
     return engine
 
