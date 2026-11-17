@@ -413,8 +413,7 @@ def _assert_nonempty_candidate(candidate: str, stage: str) -> None:
 
 
 def _guard_outline_mode_and_sections(outline, ctx) -> None:
-    """Items 0b/1: an outline the pipeline cannot draft from must fail the
-    stage. See the call site for the project-20 incident."""
+    """An outline the pipeline cannot draft from must fail the stage."""
     if outline.mode == "rewrite" and not ctx.manuscript_inputs:
         raise CompileFailure(
             CODE_MANUSCRIPT_REQUIRED,
@@ -1738,6 +1737,9 @@ class _CompileRun:
         if reused is not None:
             outline_artifact = _load_checkpoint(OutlineArtifact, reused)
             if outline_artifact is not None:
+                # A checkpoint persisted before this guard existed can carry
+                # the same defects as a fresh bad outline; judge it too.
+                _guard_outline_mode_and_sections(outline_artifact, ctx)
                 self._outline = outline_artifact  # type: ignore[assignment]
                 self._enforce_section_budget(self._outline)
                 return
