@@ -38,13 +38,14 @@ acceptance checks (``tests/test_b02_bare_call_dim_rebuild.py``).
 from __future__ import annotations
 
 import asyncio
-from app.services.vector_store import _list_table_names
 import logging
 import os
 import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+
+from app.services.vector_store import _list_table_names
 
 # Repo root: this file lives at <repo>/backend/tests/issue513_checks/<name>.py
 ROOT = Path(__file__).resolve().parents[3]

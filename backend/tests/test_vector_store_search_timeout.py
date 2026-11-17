@@ -17,9 +17,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from types import SimpleNamespace
+
 from app.config import Settings, settings
 from app.services.vector_store import VectorStore, VectorStoreError
-from types import SimpleNamespace
 
 
 class TestSearchSemaphoreTimeoutDefaults(unittest.TestCase):

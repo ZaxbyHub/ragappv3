@@ -19,10 +19,10 @@ the engine's naming convention is not load-bearing. These tests pin the real
 
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.vector_store import VectorStore
-from types import SimpleNamespace
 
 
 def _existing_index(name: str, index_type: str, columns):

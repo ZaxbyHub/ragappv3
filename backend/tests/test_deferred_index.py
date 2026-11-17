@@ -17,13 +17,13 @@ This module tests:
 
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.vector_store import (
     VECTOR_INDEX_MIN_ROWS,
     VectorStore,
 )
-from types import SimpleNamespace
 
 
 class TestVectorIndexMinRowsConstant(unittest.TestCase):

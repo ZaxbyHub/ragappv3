@@ -36,9 +36,10 @@ except ImportError:
     import types
     sys.modules["pyarrow"] = types.ModuleType("pyarrow")
 
+from types import SimpleNamespace
+
 from _db_pool import SimpleConnectionPool
 from fastapi.testclient import TestClient
-from types import SimpleNamespace
 
 from app.api.deps import get_db, get_vector_store
 from app.config import settings

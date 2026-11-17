@@ -26,6 +26,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+
 from app.services.vector_store import _list_table_names
 
 

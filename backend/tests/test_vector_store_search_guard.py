@@ -26,6 +26,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -33,7 +34,6 @@ import pytest
 
 from app.config import settings
 from app.services.vector_store import VectorStore, _lance_escape
-from types import SimpleNamespace
 
 # ---------------------------------------------------------------------------
 # Unit tests: _lance_escape (dense arm fallback, delete_by_vault)

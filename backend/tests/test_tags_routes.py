@@ -23,6 +23,8 @@ except ImportError:
 
     sys.modules["lancedb"] = types.ModuleType("lancedb")
 
+from types import SimpleNamespace
+
 from _db_pool import SimpleConnectionPool
 from fastapi.testclient import TestClient
 
@@ -31,7 +33,6 @@ from app.config import settings
 from app.main import app
 from app.security import csrf_protect
 from app.services.auth_service import compute_client_fingerprint, create_access_token
-from types import SimpleNamespace
 
 
 class TagsTestBase(unittest.TestCase):

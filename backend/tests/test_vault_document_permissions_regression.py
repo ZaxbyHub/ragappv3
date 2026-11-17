@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -15,7 +16,6 @@ from fastapi.testclient import TestClient
 from app.api.deps import get_current_active_user, get_db, get_vector_store
 from app.main import app
 from app.models.database import init_db, run_migrations
-from types import SimpleNamespace
 
 
 @pytest.fixture()

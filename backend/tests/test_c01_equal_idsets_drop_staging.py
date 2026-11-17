@@ -32,6 +32,7 @@ import os
 import sys
 import warnings
 from pathlib import Path
+
 from app.services.vector_store import _list_table_names
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))

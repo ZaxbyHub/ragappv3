@@ -17,13 +17,13 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.config import Settings
 from app.services.vector_store import VectorStore
-from types import SimpleNamespace
 
 
 class TestVectorSearchConcurrencyDefault(unittest.TestCase):

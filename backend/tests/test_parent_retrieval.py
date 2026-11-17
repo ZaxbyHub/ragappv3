@@ -1,12 +1,12 @@
 """Tests for parent-document retrieval: schema migration, ingestion, dedup, and prompt expansion (Issue #12)."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.services.chunking import ProcessedChunk, compute_parent_windows
 from app.services.document_retrieval import RAGSource, _group_aware_dedup
-from types import SimpleNamespace
 
 # ---------------------------------------------------------------------------
 # compute_parent_windows tests

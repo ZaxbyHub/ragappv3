@@ -32,13 +32,14 @@ except ImportError:
 
     sys.modules["lancedb"] = types.ModuleType("lancedb")
 
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
 from app.api.deps import get_db, get_vector_store
 from app.config import settings
 from app.main import app
 from app.security import CSRFManager, csrf_protect
-from types import SimpleNamespace
 from app.services.auth_service import compute_client_fingerprint, create_access_token
 from app.services.draft_store import DraftStore
 

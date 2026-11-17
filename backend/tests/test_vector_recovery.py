@@ -26,15 +26,14 @@ import asyncio
 import sqlite3
 import unittest
 from pathlib import Path
-
-from app.config import settings
 from types import SimpleNamespace
 
+from app.config import settings
 from app.services.vector_store import (
     CHUNKS_STAGING_TABLE,
-    _list_table_names,
     VectorStore,
     VectorStoreConnectionError,
+    _list_table_names,
 )
 
 EMBED_DIM = 8

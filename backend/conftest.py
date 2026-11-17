@@ -5,7 +5,6 @@ import types
 from pathlib import Path
 
 import pytest
-from types import SimpleNamespace
 
 # Add backend directory to path so tests can import app modules
 sys.path.insert(0, str(Path(__file__).parent))

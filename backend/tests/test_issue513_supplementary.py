@@ -38,10 +38,11 @@ import contextlib
 import hashlib
 import math
 import sqlite3
-from app.services.vector_store import _list_table_names
-from types import SimpleNamespace
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+from app.services.vector_store import _list_table_names
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -310,7 +311,6 @@ class _FakeDB:
         self._tables: dict[str, _FakeTable] = {}
 
     async def list_tables(self, page_token=None):
-        from types import SimpleNamespace
 
         return SimpleNamespace(
             tables=list(await self.table_names()), page_token=None

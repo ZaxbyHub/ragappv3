@@ -8,10 +8,10 @@ Covers:
 """
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
-from types import SimpleNamespace
 
 
 class AsyncMock(MagicMock):

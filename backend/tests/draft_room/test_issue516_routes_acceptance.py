@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+
 """Acceptance / regression tests for issue #516 (DRAFT-020, DRAFT-022,
 DRAFT-023, DRAFT-024).
 

@@ -30,6 +30,8 @@ except ImportError:
     import types
     sys.modules["pyarrow"] = types.ModuleType("pyarrow")
 
+from types import SimpleNamespace
+
 from _db_pool import SimpleConnectionPool
 from fastapi.testclient import TestClient
 
@@ -37,7 +39,6 @@ from app.api.deps import get_db, get_vector_store
 from app.config import settings
 from app.main import app
 from app.services.auth_service import compute_client_fingerprint, create_access_token
-from types import SimpleNamespace
 
 
 class DocumentsDeleteAuditTestBase(unittest.TestCase):

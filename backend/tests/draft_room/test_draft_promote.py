@@ -35,9 +35,10 @@ except ImportError:
 
     sys.modules["lancedb"] = types.ModuleType("lancedb")
 
+from types import SimpleNamespace
+
 import anyio
 from fastapi.testclient import TestClient
-from types import SimpleNamespace
 
 import app.services.draft_promotion as draft_promotion_module
 from app.api.deps import get_background_processor, get_db, get_vector_store

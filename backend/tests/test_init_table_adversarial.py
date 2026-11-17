@@ -17,13 +17,13 @@ Attack surfaces tested:
 import asyncio
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.vector_store import (
     VectorStore,
     VectorStoreConnectionError,
 )
-from types import SimpleNamespace
 
 
 class TestAdversarialUnexpectedExceptionTypes(unittest.IsolatedAsyncioTestCase):

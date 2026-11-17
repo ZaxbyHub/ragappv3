@@ -38,7 +38,6 @@ import asyncio
 import json
 import os
 import shutil
-from types import SimpleNamespace
 import sqlite3
 import sys
 import tempfile
@@ -47,6 +46,7 @@ import unittest
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from queue import Empty, Queue
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))

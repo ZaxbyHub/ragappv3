@@ -30,8 +30,9 @@ def _hermetic_env() -> None:
 
 _hermetic_env()
 
-from app.config import settings  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
+
+from app.config import settings  # noqa: E402
 from app.services.vector_store import (  # noqa: E402
     CHUNKS_STAGING_TABLE,
     DimensionRebuildHandle,

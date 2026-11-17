@@ -22,9 +22,10 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from types import SimpleNamespace
+
 from app.config import settings  # noqa: E402
 from app.services.vector_store import VectorStore  # noqa: E402
-from types import SimpleNamespace
 
 EMBED_DIM = 8
 FTS_NEEDLE = "zephyrquokka"
@@ -180,7 +181,6 @@ class FakeDB:
         self.calls = {"open_table": [], "drop_table": [], "create_table": []}
 
     async def list_tables(self, page_token=None):
-        from types import SimpleNamespace
 
         return SimpleNamespace(
             tables=list(await self.table_names()), page_token=None

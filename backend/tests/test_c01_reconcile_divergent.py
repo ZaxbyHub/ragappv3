@@ -170,7 +170,6 @@ class FakeDB:
         self.calls = {"open_table": [], "drop_table": [], "create_table": []}
 
     async def list_tables(self, page_token=None):
-        from types import SimpleNamespace
 
         return SimpleNamespace(
             tables=list(await self.table_names()), page_token=None

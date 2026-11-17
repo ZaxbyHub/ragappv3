@@ -33,8 +33,8 @@ import tempfile
 import unittest
 from contextlib import asynccontextmanager, contextmanager
 from queue import Empty, Queue
-from unittest.mock import AsyncMock, MagicMock
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 

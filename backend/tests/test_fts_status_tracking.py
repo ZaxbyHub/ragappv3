@@ -9,12 +9,12 @@ Verifies:
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.services.vector_store import VectorStore
-from types import SimpleNamespace
 
 
 def _make_fts_mock_builder(results, to_list_side_effect=None):
