@@ -797,6 +797,7 @@ apiClient.interceptors.response.use(
           looked?.detail ||
           (looked?.code ? `Request failed (${looked.code})` : "") ||
           (code ? `Request failed (${code})` : "") ||
+          error.response.statusText ||
           `Request failed with status ${error.response.status}`;
       }
     } else if (error.request) {

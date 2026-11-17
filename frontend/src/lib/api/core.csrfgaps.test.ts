@@ -179,20 +179,16 @@ describe("core.ts CSRF resilience pins (FU-002)", () => {
       expect(mockFetch).toHaveBeenCalled();
     });
 
-    it("an over-cap Blob 403 body is never decoded and never retried", async () => {
+    it("an over-cap Blob error body is never decoded", async () => {
       mockCookies = "meridian-csrf-token=stale-token";
-      vi.stubGlobal(
-        "fetch",
-        vi.fn().mockResolvedValue({
-          ok: true,
-          json: () => Promise.resolve({ csrf_token: "fresh-token" }),
-        })
-      );
 
       // Deliberately VALID JSON above the cap: if the cap were missing, the
-      // decode would succeed and the CSRF detection would fire a retry.
+      // decode would succeed and replace the Blob with a parsed envelope.
+      // Status 400 (not 403) keeps the CSRF retry path out of the picture:
+      // the retry fires on ANY 403 for a mutating method by design, and this
+      // test pins the decode cap, not retry suppression.
       const oversized = JSON.stringify({
-        detail: "CSRF token missing or mismatch",
+        detail: "bad widget",
         padding: "x".repeat(65 * 1024),
       });
       const blobBody = new Blob([oversized], { type: "application/json" });
@@ -201,12 +197,12 @@ describe("core.ts CSRF resilience pins (FU-002)", () => {
       let calls = 0;
       apiClient.defaults.adapter = (async () => {
         calls += 1;
-        throw Object.assign(new Error("Request failed with status code 403"), {
+        throw Object.assign(new Error("Request failed with status code 400"), {
           isAxiosError: true,
           config: { method: "post", url: "/widgets", headers: {} },
           response: {
-            status: 403,
-            statusText: "Forbidden",
+            status: 400,
+            statusText: "Bad Request",
             data: blobBody,
             headers: {},
           },
@@ -220,9 +216,9 @@ describe("core.ts CSRF resilience pins (FU-002)", () => {
           (error: { response?: { data?: unknown } }) => error
         );
 
-      // No CSRF retry fired (detection never saw a decoded detail) and the
-      // error body survived as a Blob (axios may wrap the adapter error, so
-      // accept either layer).
+      // No retry fired (nothing retryable about a 400) and the error body
+      // survived as a Blob (axios may wrap the adapter error, so accept
+      // either layer).
       expect(calls).toBe(1);
       expect(caught).not.toBeNull();
       const err = caught as {
