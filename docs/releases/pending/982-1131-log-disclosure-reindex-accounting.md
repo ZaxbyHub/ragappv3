@@ -15,7 +15,11 @@ family (#982) and the two reindex duplicate-accounting edges disclosed at PR
   provider body into `LLMError` messages that 15+ default-level call sites
   format into logs. The full body is logged at DEBUG at each construction
   site. `model_checker.py`'s probe-error mapping gets the same treatment
-  (its result dict also feeds admin/monitor-gated HTTP responses).
+  (its result dict also feeds admin/monitor-gated HTTP responses), as do the
+  curator sibling sites (`wiki_curator_client.py`'s two raise shapes and the
+  `settings.py` wizard-probe error dict, which previously carried 200-char
+  provider-body excerpts into admin-channel messages — fixed in the
+  final-critic round rather than deferred).
 - **Family B (user-chosen names/paths):** every verified default-level log
   line carrying a user-derived filename, vault name, path, email
   sender/subject, or org slug across `documents.py`, `database.py`,
@@ -43,9 +47,14 @@ family (#982) and the two reindex duplicate-accounting edges disclosed at PR
 - **Family D (limiter URI):** a malformed `REDIS_URL` (unregistered scheme,
   unparsable sentinel/cluster URI) previously crashed boot with the
   `limits` `ConfigurationError` message embedding the full credential-bearing
-  URI. `build_limiter` now re-raises `RuntimeError` with the `redact_url`
-  form, `from None` (severing the credential-bearing `__context__` chain
-  from boot tracebacks). Boot still fails closed on bad config.
+  URI. `build_limiter` now re-raises `RuntimeError` carrying a SCHEME-ONLY
+  diagnosis (`scheme='bogus'`), `from None` (severing the
+  credential-bearing `__context__` chain from boot tracebacks) — the final
+  round's traceback guard test found that `redact_url` does not cover
+  unknown-scheme URI shapes (`bogus://<secret>@host` rendered verbatim), so
+  the raised message carries no URI text at all. Boot still fails closed on
+  bad config; a known pathological residual (a colon-less `REDIS_URL` whose
+  first token is the scheme) is noted as equal-to-base.
 
 ### #1131 — reindex duplicate accounting
 
