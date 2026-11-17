@@ -923,15 +923,36 @@ The chat interface provides a three-zone workspace layout:
 
 ### Backend Development
 
+There are two loops. Pick one — do not run both at once (both bind host port 9090).
+
+#### Container-only loop (full stack, including the app)
+
 ```bash
-# Run with hot-reload (includes frontend dev service)
-docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
+docker compose up -d
 
 # View logs
-docker compose logs -f backend
+docker compose logs -f knowledgevault
+```
 
-# Run tests
-docker compose exec backend pytest tests/
+#### Native-backend loop (live-reload backend, containerized dependencies)
+
+Start only the dependency services — not the app container, which would take
+host port 9090:
+
+```bash
+docker compose up -d redis harrier-embed reranker
+
+# Run the backend natively (see CONTRIBUTING.md for the venv setup)
+cd backend
+uvicorn app.main:app --host 0.0.0.0 --port 9090 --reload
+```
+
+Tests run natively from `backend/`, never inside the container: the runtime
+image excludes `backend/tests/` and installs no pytest.
+
+```bash
+cd backend
+python -m pytest tests/
 ```
 
 ### Frontend Development
