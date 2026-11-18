@@ -75,6 +75,7 @@ from typing import Annotated, Any, Callable, Generic, Optional, TypeVar
 from urllib.parse import quote
 
 import anyio
+import httpx
 from fastapi import (
     APIRouter,
     Depends,
@@ -1987,11 +1988,75 @@ def _provider_base_url_for_mode(logical_mode: str) -> str:
 
     Mirrors ``draft_pipeline._provider_base_url``: SPEC section 14.2 requires
     single-model deployments to work, so an unconfigured ``instant`` endpoint
-    degrades to the ``thinking`` one instead of failing.
+    degrades to the ``thinking`` one instead of failing. ``editorial`` uses
+    its own endpoint when set, else the ``thinking`` one.
     """
+    if logical_mode == "editorial":
+        return (settings.editorial_chat_url or settings.ollama_chat_url or "").strip()
     if logical_mode == "instant":
         return (settings.instant_chat_url or settings.ollama_chat_url or "").strip()
     return (settings.ollama_chat_url or "").strip()
+
+
+
+
+_EMPTY_REVISION_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+def _assert_revision_nonempty(row) -> None:
+    """Ready, Export and Promote must refuse an empty revision. A compile
+    once approved a zero-character revision whose hash was the SHA-256 of
+    the empty string.
+
+    Accepts a DraftRevisionRecord (attribute access) or a dict (key
+    access). Text that was not loaded fails closed (409 revision_empty):
+    callers must load content_md before calling this.
+    """
+    if row is None:
+        raise DraftRoomHTTPError(
+            409, "this revision has no text; it cannot be approved, exported, or promoted",
+            "revision_empty",
+        )
+    if isinstance(row, dict):
+        text = row.get("content_md")
+        digest = row.get("content_sha256")
+    else:
+        text = getattr(row, "content_md", None)
+        digest = getattr(row, "content_sha256", None)
+    if text is None:
+        # Content was not loaded, so the revision cannot be judged: fail
+        # closed. A summary row reaching this guard would otherwise wave
+        # through a whitespace-only revision whose hash is not the
+        # empty-string hash. Every route that calls this loads content
+        # (include_content=True, or the in-transaction SELECT of content_md).
+        raise DraftRoomHTTPError(
+            409, "this revision has no text; it cannot be approved, exported, or promoted",
+            "revision_empty",
+        )
+    empty = not text.strip() or digest == _EMPTY_REVISION_SHA256
+    if empty:
+        raise DraftRoomHTTPError(
+            409, "this revision has no text; it cannot be approved, exported, or promoted",
+            "revision_empty",
+        )
+
+
+def _assert_rewrite_has_manuscript(draft_id: int, db: sqlite3.Connection) -> None:
+    """Reject a rewrite-mode compile with no manuscript-role input at
+    enqueue: without a manuscript the whole pipeline runs on an empty
+    candidate."""
+    row = db.execute(
+        "SELECT COUNT(*) FROM draft_inputs WHERE draft_id=? AND role='manuscript'",
+        (draft_id,),
+    ).fetchone()
+    count = row[0] if row else 0
+    if not count:
+        raise DraftRoomHTTPError(
+            422,
+            "rewrite-mode compiles require a source with the manuscript role",
+            "rewrite_requires_manuscript",
+        )
+
 
 
 def _assert_provider_policy(*, sensitive: bool) -> None:
@@ -2002,7 +2067,7 @@ def _assert_provider_policy(*, sensitive: bool) -> None:
     the configured allowlist or the rejected endpoint (section 9.2: "Never
     return the allowlist or raw endpoint to non-admin clients").
     """
-    for logical_mode in ("thinking", "instant"):
+    for logical_mode in ("thinking", "instant", "editorial"):
         try:
             assert_provider_allowed(
                 _provider_base_url_for_mode(logical_mode), sensitive=sensitive
@@ -2013,6 +2078,44 @@ def _assert_provider_policy(*, sensitive: bool) -> None:
                 "the configured model provider is not permitted for this draft",
                 exc.code,
             ) from None
+
+
+# Reachability preflight: the allowlist gate above proves the origin is
+# PERMITTED, not that it answers. A compile spends ~10 minutes on Research,
+# Outline and Draft before the first editorial (Copy) call; if a provider is
+# down, the job must fail at enqueue with a code the dialog can show instead
+# of burning the pipeline first (a compile can spend ~10 minutes in Research,
+# Outline and Draft before the first editorial call reveals the outage).
+_PREFLIGHT_PROBE_TIMEOUT_SECONDS = 4.0
+
+
+async def _provider_reachable(base_url: str) -> bool:
+    """GET /v1/models with a short timeout. Responds even while a model is
+    loading (llama.cpp), so this is a liveness check, not a warm one."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=_PREFLIGHT_PROBE_TIMEOUT_SECONDS, follow_redirects=False
+        ) as probe:
+            resp = await probe.get(base_url.rstrip("/") + "/v1/models")
+        return resp.status_code < 500
+    except Exception:
+        return False
+
+
+async def _preflight_providers(sensitive: bool) -> None:
+    """Fail fast when a provider the compile will call is unreachable."""
+    _assert_provider_policy(sensitive=sensitive)
+    for logical_mode in ("thinking", "instant", "editorial"):
+        base_url = _provider_base_url_for_mode(logical_mode)
+        if not base_url:
+            continue
+        if not await _provider_reachable(base_url):
+            raise DraftRoomHTTPError(
+                503,
+                "the model provider for this draft is not reachable",
+                "provider_unreachable",
+            )
+
 
 
 # ── transactional compile/disposition/Ready helpers ──────────────────────────
@@ -2046,6 +2149,39 @@ def _stale_lock_conflict() -> DraftConflictError:
     err = DraftConflictError("draft was modified by another request; reload and retry")
     err.code = "stale_lock_version"
     return err
+
+
+def _sync_is_idempotent_replay(
+    conn: sqlite3.Connection,
+    *,
+    draft_id: int,
+    owner_id: int,
+    idempotency_key: Optional[str],
+    request_fingerprint: str,
+) -> bool:
+    """Read-only pre-check mirroring ``_sync_enqueue_compile``'s replay match.
+
+    True only when ``idempotency_key`` already names a job on this draft with
+    an identical request fingerprint, i.e. exactly the case the enqueue
+    returns unchanged. Routes use it to skip the live provider probe for a
+    genuine replay (the stored response must not depend on provider
+    liveness). A missing key or a different-fingerprint reuse returns False,
+    so the normal preflight and the enqueue's 409 conflict still apply.
+    """
+    if idempotency_key is None:
+        return False
+    existing = conn.execute(
+        "SELECT draft_id, input_json FROM draft_jobs "
+        "WHERE created_by = ? AND idempotency_key = ?",
+        (owner_id, idempotency_key),
+    ).fetchone()
+    if existing is None:
+        return False
+    stored = _json_or(existing[1], {})
+    return (
+        int(existing[0]) == draft_id
+        and stored.get("request_fingerprint") == request_fingerprint
+    )
 
 
 def _sync_enqueue_compile(
@@ -2629,6 +2765,14 @@ def _sync_mark_ready(
             raise _conflict(
                 "only the draft's current revision can be marked ready",
                 "not_current_revision",
+            )
+        # A zero-character revision (hash of the empty string) can never be
+        # marked Ready.
+        if not (content_md or "").strip() or content_sha256 == _EMPTY_REVISION_SHA256:
+            raise DraftRoomHTTPError(
+                409,
+                "this revision has no text; it cannot be approved, exported, or promoted",
+                "revision_empty",
             )
 
         # Rule 2: Fact ran and its successful candidate is byte-identical.
@@ -3741,7 +3885,8 @@ async def retry_draft_job(
         raise _conflict(
             "only a failed or cancelled job can be retried", "invalid_state"
         )
-    _assert_provider_policy(sensitive=draft.tier == "sensitive")
+    if (getattr(draft, "mode", "") or "") == "rewrite":
+        _assert_rewrite_has_manuscript(draft_id, db)
     # Evaluated in the route (not inside the thread unit) so the read is a
     # single fresh observation per request; the thread function enforces it
     # after replay/guards, before the first mutation (issue #911).
@@ -3789,6 +3934,19 @@ async def retry_draft_job(
         parent_job_id=job_id,
         input_snapshot=prepared["input_snapshot"],
     )
+    # Provider preflight runs before any job row exists, but a genuine
+    # Idempotency-Key replay returns the stored job and must not depend on a
+    # live provider probe.
+    if not await _run_store(
+        lambda: _sync_is_idempotent_replay(
+            db,
+            draft_id=draft_id,
+            owner_id=owner_id,
+            idempotency_key=idempotency_key,
+            request_fingerprint=fingerprint,
+        )
+    ):
+        await _preflight_providers(sensitive=draft.tier == "sensitive")
     # Bound by the drained unit below; pre-initialized purely so the unit's
     # `nonlocal` target exists (the unit either assigns it or raises).
     job: Optional[DraftJobRecord] = None
@@ -3877,7 +4035,8 @@ async def compile_draft(
     store = DraftStore(db)
     draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))
     await _require_vault_read(evaluate, user, draft.vault_id)
-    _assert_provider_policy(sensitive=draft.tier == "sensitive")
+    if (getattr(draft, "mode", "") or "") == "rewrite":
+        _assert_rewrite_has_manuscript(draft_id, db)
     # Evaluated in the route (not inside the thread unit) so the read is a
     # single fresh observation per request; the thread function enforces it
     # after replay/guards, before the first mutation (issue #911).
@@ -3912,6 +4071,19 @@ async def compile_draft(
         parent_job_id=None,
         input_snapshot=prepared["input_snapshot"],
     )
+    # Provider preflight runs before any job row exists, but a genuine
+    # Idempotency-Key replay returns the stored job and must not depend on a
+    # live provider probe.
+    if not await _run_store(
+        lambda: _sync_is_idempotent_replay(
+            db,
+            draft_id=draft_id,
+            owner_id=owner_id,
+            idempotency_key=idempotency_key,
+            request_fingerprint=fingerprint,
+        )
+    ):
+        await _preflight_providers(sensitive=draft.tier == "sensitive")
     # Bound by the drained unit below; pre-initialized purely so the unit's
     # `nonlocal` target exists (the unit either assigns it or raises).
     job: Optional[DraftJobRecord] = None
@@ -4059,7 +4231,10 @@ async def draft_room_events_stream(
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -4271,6 +4446,7 @@ async def export_draft_revision(
             include_content=True,
         )
     )
+    _assert_revision_nonempty(revision)
 
     fact_status = revision.fact_status
     fact_current = fact_status in _FACT_CURRENT_STATUSES
@@ -4684,6 +4860,8 @@ async def promote_draft_source(
                     include_content=True,
                 )
             )
+            # An empty revision can never be promoted.
+            _assert_revision_nonempty(revision_record)
             revision_fact_status = revision_record.fact_status
             was_ready_revision = bool(draft.ready_revision_id == revision_record.id)
             result = await _run_promotion(

@@ -212,6 +212,16 @@ class Settings(BaseSettings):
     """Same contract as ``thinking_request_timeout_seconds`` for the editorial
     desk stages (copy/standards/fact), defaulting to the pre-#652 hardcoded
     ``create_editorial_client`` constant."""
+
+    # No-think control for the editorial lane (issue #712): editorial desk
+    # stages need short, machine-shaped answers; a reasoning-on template
+    # default burns the whole token budget reasoning and returns empty
+    # content. False sends {"enable_thinking": False}; True sends no control
+    # and the provider default governs (same posture as the instant lane's
+    # instant_enable_thinking).
+    editorial_enable_thinking: bool = Field(
+        default=False, alias="DRAFT_EDITORIAL_ENABLE_THINKING"
+    )
     instant_request_timeout_seconds: float = 120.0
     """Same contract for the Instant client, defaulting to the pre-#652
     hardcoded ``create_instant_client`` constant."""

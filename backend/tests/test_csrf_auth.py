@@ -108,7 +108,7 @@ class TestCSRFProtection(unittest.TestCase):
         main_app.dependency_overrides[get_db] = get_test_db
 
         # Create a real CSRF manager with Redis fallback
-        self.csrf_manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        self.csrf_manager = CSRFManager(redis_url="", ttl=900)
 
         # Set the csrf_manager on app state
         main_app.state.csrf_manager = self.csrf_manager
@@ -434,7 +434,7 @@ class TestCSRFProtection(unittest.TestCase):
 
         response = self._post_with_raw_cookie(
             "/api/auth/register",
-            cookie_header=f"X-CSRF-Token={csrf_cookie1}",
+            cookie_header=f"{CSRF_COOKIE_NAME}={csrf_cookie1}",
             csrf_header=csrf_token2,
             json_body={"username": "mismatch", "password": "Password123"},
         )
@@ -463,7 +463,7 @@ class TestCSRFProtection(unittest.TestCase):
         # a value that is not the most-specific transmitted cookie.
         response = self._post_with_raw_cookie(
             "/api/auth/register",
-            cookie_header=f"X-CSRF-Token={csrf_token1}; X-CSRF-Token={csrf_token2}",
+            cookie_header=f"{CSRF_COOKIE_NAME}={csrf_token1}; {CSRF_COOKIE_NAME}={csrf_token2}",
             csrf_header=csrf_token2,
             json_body={"username": "dupshadow", "password": "Password123"},
         )
