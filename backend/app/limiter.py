@@ -2,6 +2,7 @@
 
 import hmac
 import logging
+import re
 from typing import Any, Callable, Optional
 
 from limits.errors import ConfigurationError
@@ -13,6 +14,11 @@ from app.config import settings
 from app.utils.secrets import redact_url
 
 logger = logging.getLogger("rate_limit")
+
+# A well-formed URI scheme token (RFC 3986 scheme charset, pragmatic
+# subset). Anything else means the value has no scheme separator, so the
+# split token is raw input and must not be echoed (review F-002).
+_SCHEME_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{0,31}")
 
 
 def get_client_ip(request: Request) -> str:
@@ -195,16 +201,23 @@ def build_limiter(redis_url: str) -> WhitelistLimiter:
     except ConfigurationError as exc:
         # `from None` severs the chained original ConfigurationError from any
         # boot traceback: its message embeds the raw (credential-bearing)
-        # storage URI verbatim, while this RuntimeError carries only the
-        # redacted form.
+        # storage URI verbatim.
         # Scheme-only diagnosis: redact_url covers the known redis://
         # shapes, but an UNREGISTERED scheme (the very thing that lands
         # here) can carry the credential in positions its patterns do not
         # match (final-critic B2 probe: bogus://<secret>@host renders
-        # verbatim). No credential surface at all in the raised message.
+        # verbatim). The raised message carries the scheme TOKEN only —
+        # and when even the token is not a well-formed scheme (a
+        # colon-less REDIS_URL makes split(':', 1)[0] the ENTIRE value,
+        # which is the secret itself — review F-002/A-1b), the literal
+        # 'unparseable' placeholder is emitted so no part of the raw
+        # value reaches the boot traceback.
+        _scheme = storage_uri.split(":", 1)[0]
+        if not _SCHEME_TOKEN_RE.fullmatch(_scheme or ""):
+            _scheme = "unparseable (colon-less or malformed REDIS_URL)"
         raise RuntimeError(
             "Invalid REDIS_URL for rate-limiter storage "
-            f"(scheme={storage_uri.split(':', 1)[0]!r}): {type(exc).__name__}"
+            f"(scheme={_scheme!r}): {type(exc).__name__}"
         ) from None
     # The rate-limited route handlers in this codebase do NOT declare a
     # ``response: Response`` parameter, so slowapi's ``_inject_headers``

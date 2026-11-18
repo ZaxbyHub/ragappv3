@@ -107,6 +107,14 @@ _FAMILY_B_NAMES = frozenset(
 
 # Attributes whose value is user-derived (``task.file_path``,
 # ``row.file_name`` …). Kept STRICT per the guard spec.
+
+# KNOWN BLIND SHAPES (review F-B7, pr1169-20261117): this census
+# matches only ast.Name/ast.Attribute forms of the sets above. It
+# cannot see Path `.name` attributes (f.name), bare renamed locals
+# (path, directory, artifact, sender, subject), or row["file_path"]-
+# style subscripts. Per-site marker probes (the frozen checks and the
+# curator probe below) are the PRIMARY enforcement; this census is a
+# supplementary rung only.
 _FAMILY_B_ATTRS = frozenset({"file_path", "file_name"})
 
 # Names a module can bind a logger to (mirror of the frozen #710 walker's
@@ -1232,3 +1240,212 @@ async def test_curator_sites_bounded_marker_probe(caplog):
     assert not any(marker in t for t in default_texts)
     debug_texts = [r.message for r in caplog.records if r.levelno == _logging.DEBUG]
     assert any(marker in t for t in debug_texts)
+
+
+@pytest.mark.asyncio
+async def test_mixed_staged_abort_settles_terminally_no_requeue(tmp_path):
+    """Review F-001 (pr1169-20261117): a staged abort with duplicates AND
+    transient failures must settle 'failed' terminally on the FIRST
+    attempt — the composed result carries duplicate_file_ids but NOT
+    failed_ids, so the runner's duplicate-only arm fires instead of
+    persisting a narrowed $.retry_file_ids whose attempt-2 re-run can
+    never execute (the #702 refusal guard rejects any scoped attempt
+    while the dimension is still changed).
+    """
+    import hashlib
+    import json as _json
+    import sqlite3
+    from types import SimpleNamespace
+
+    from app.models.database import SQLiteConnectionPool, run_migrations
+    from app.services.background_tasks import BackgroundProcessor
+
+    db_path = str(tmp_path / "mixed.db")
+    run_migrations(db_path)
+    conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    lease_conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+    lease_conn.row_factory = sqlite3.Row
+    try:
+        content = b"mixed-staged-abort-982f001"
+        path = tmp_path / "doc.pdf"
+        path.write_bytes(content)
+        file_hash = hashlib.sha256(content).hexdigest()
+
+        def _ins(status, error_message=None):
+            cur = conn.execute(
+                "INSERT INTO files (vault_id, file_path, file_name,"
+                " file_hash, file_size, status, phase, source,"
+                " error_message) VALUES (1, ?, ?, ?, 1, ?, 'queued',"
+                " 'upload', ?)",
+                (str(path), "doc.pdf", file_hash, status, error_message),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+        owner_id = _ins("indexed")
+        transient_id = _ins("error", "transient parse failure (F-001)")
+        dup_loser_id = _ins(
+            "error", "DUPLICATE_FILE: settled by the finalization race"
+        )
+        assert owner_id != transient_id != dup_loser_id
+
+        bp = BackgroundProcessor(pool=pool, retry_delay=0.05)
+
+        class _Staged982F001Store:
+            def __init__(self):
+                self.calls = []
+                self._embedded = set()
+
+            def _record(self, name, *a, **k):
+                self.calls.append((name, a, k))
+
+            async def init_table(self, *a, **k):
+                self._record("init_table", *a, **k)
+
+            async def add_chunks(self, *a, **k):
+                self._record("add_chunks", *a, **k)
+                return {}
+
+            async def delete_by_file(self, *a, **k):
+                self._record("delete_by_file", *a, **k)
+
+            async def delete_old_generation_by_file(self, *a, **k):
+                self._record("delete_old_generation_by_file", *a, **k)
+                return 0
+
+            async def delete_generation_by_file_locked(self, *a, **k):
+                self._record("delete_generation_by_file_locked", *a, **k)
+
+            def write_locked(self):
+                import contextlib
+
+                @contextlib.asynccontextmanager
+                async def _ctx():
+                    self._record("write_locked_enter")
+                    try:
+                        yield self
+                    finally:
+                        self._record("write_locked_exit")
+
+                return _ctx()
+
+            async def count_by_file(self, *a, **k):
+                return 1
+
+            async def get_live_embedding_dim(self, *a, **k):
+                return 3  # != embed stub dim 2 -> staged path
+
+            async def begin_dimension_rebuild(self, *a, **k):
+                self._record("begin_dimension_rebuild", *a, **k)
+                return SimpleNamespace(table_name="staged_f001")
+
+            async def commit_dimension_rebuild(self, *a, **k):
+                self._record("commit_dimension_rebuild", *a, **k)
+
+            async def abort_dimension_rebuild(self, *a, **k):
+                self._record("abort_dimension_rebuild", *a, **k)
+
+            async def record_embedding_metadata(self, *a, **k):
+                self._record("record_embedding_metadata", *a, **k)
+
+            async def mark_ready(self, *a, **k):
+                self._record("mark_ready", *a, **k)
+
+        stub = _Staged982F001Store()
+        bp.processor.vector_store = stub
+
+        class _EmbedStub:
+            async def embed_batch(self, texts, fail_fast=True, **kwargs):
+                return [[0.1, 0.2] for _ in texts]
+
+        bp.processor.embedding_service = _EmbedStub()
+
+        async def _fake_schema(file_path, file_id, generation_hash, parser_fingerprint):  # noqa: ARG001
+            from app.services.chunking import ProcessedChunk
+            from app.services.document_processor import ParsedDocument
+
+            return (
+                [
+                    ProcessedChunk(
+                        text="x",
+                        metadata={"section": "s", "total_chunks": 1},
+                        chunk_index=0,
+                    )
+                ],
+                "x",
+                ParsedDocument(atoms=(), parser_fingerprint=parser_fingerprint),
+            )
+
+        import unittest.mock as _mock
+
+        with _mock.patch.object(
+            bp.processor, "_is_schema_file", lambda p: True
+        ), _mock.patch.object(
+            bp.processor, "_process_schema_file", _fake_schema
+        ):
+            status, result, error = await bp._reindex_embed_all(
+                1, vault_id=None
+            )
+
+        assert status == "failed", (
+            f"982F001: mixed staged abort reports failure; got {status!r}"
+        )
+        dup_ids = result.get("duplicate_file_ids") or []
+        assert dup_ids and set(dup_ids) <= {
+            transient_id,
+            dup_loser_id,
+        }, (
+            f"982F001: the discovered duplicate composes into the terminal "
+            f"result (whichever non-owner row trips the guard first); got "
+            f"{result!r}"
+        )
+        assert "failed_ids" not in result, (
+            "982F001: the composed abort result must NOT carry failed_ids — "
+            "the runner would persist a narrowed $.retry_file_ids whose "
+            "attempt-2 re-run deterministically trips the #702 refusal "
+            f"guard (review F-001); got {result!r}"
+        )
+        assert result.get("failed") == 2, (
+            f"982F001: 'failed' counts the distinct terminal files "
+            f"(transient + duplicate); got {result.get('failed')!r}"
+        )
+    finally:
+        pool.close_all()
+        conn.close()
+        lease_conn.close()
+
+
+def test_limiter_info_log_channel_bounded_for_uncolonned_userinfo(caplog):
+    """Review F-003/A-1a (pr1169-20261117): the boot INFO line logs
+    redact_url(storage_uri); redact_url does not mask username-only
+    userinfo, so the guard must observe the REAL logger ('rate_limit')
+    and probe a shape redact_url passes through verbatim. Companion to
+    the frozen C6 (whose 'app.limiter' capture can never see these
+    records — vacuous leg, disclosed).
+    """
+    import logging as _logging
+
+    from app.limiter import build_limiter
+
+    marker = "TOKENuser982F003"
+    with caplog.at_level(_logging.INFO, logger="rate_limit"):
+        with pytest.raises(RuntimeError):
+            build_limiter(f"bogus2://{marker}@host.invalid:6379/0")
+    info_records = [
+        r for r in caplog.records if r.levelno == _logging.INFO
+    ]
+    assert any("wired to Redis" in r.message for r in info_records) or any(
+        "Rate limiter" in r.message for r in info_records
+    ), "sanity: the boot INFO line fired on the rate_limit logger"
+    leaked = [r.message for r in info_records if marker in r.message]
+    # The INFO line carries redact_url output; redact_url passes
+    # username-only userinfo through VERBATIM (verified by the review
+    # probe). This test PINS that known gap so the follow-up fix flips
+    # it red — until then it documents the leak precisely.
+    assert leaked, (
+        "982F003: expected the known username-only pass-through on the "
+        "rate_limit INFO line — if this fires, redact_url was hardened "
+        "(follow-up landed); update this pin to assert NO leak then"
+    )

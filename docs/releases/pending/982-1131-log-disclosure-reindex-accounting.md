@@ -52,9 +52,15 @@ family (#982) and the two reindex duplicate-accounting edges disclosed at PR
   credential-bearing `__context__` chain from boot tracebacks) — the final
   round's traceback guard test found that `redact_url` does not cover
   unknown-scheme URI shapes (`bogus://<secret>@host` rendered verbatim), so
-  the raised message carries no URI text at all. Boot still fails closed on
-  bad config; a known pathological residual (a colon-less `REDIS_URL` whose
-  first token is the scheme) is noted as equal-to-base.
+  the raised message carries no URI text beyond the scheme token, and a
+  colon-less or malformed `REDIS_URL` (whose split token would BE the
+  value) emits the literal `unparseable` placeholder instead — no part of
+  the raw value reaches the boot traceback. Boot still fails closed on bad
+  config. Known residuals (disclosed): the boot INFO line still prints
+  `redact_url(storage_uri)`, which passes username-only and
+  query-string-password shapes through verbatim (pre-existing; follow-up
+  filed), and non-`ConfigurationError` failures (cluster setups, bad
+  ports) escape the redacted handler with equal-to-base messages.
 
 ### #1131 — reindex duplicate accounting
 
@@ -81,15 +87,18 @@ family (#982) and the two reindex duplicate-accounting edges disclosed at PR
   (its own finalize failed the same unique index; nothing deletes it).
 - **RP-001 (staged-abort compose):** a staged dimension/identity rebuild
   that aborts after discovering duplicate-hash failures now returns the
-  per-file ledger (`duplicate_file_ids`, `failed_ids`, `failed` count,
+  duplicate ledger (`duplicate_file_ids`, `failed` count,
   ten-entry-bounded `details`) instead of the empty `("failed", {}, exc)`
-  shape, so the runner's existing arms surface the duplicates (pure-
-  duplicate aborts settle terminally via the duplicate-only arm; mixed
-  aborts requeue with the narrowed non-duplicate scope, protected by the
-  unchanged narrowed-staging refusal guard). Identity-only aborts with
-  empty ledgers keep the exact empty shape. No narrowed staging is
-  licensed (the staged table is a global replacement — the refusal guard
-  stays).
+  shape, so the runner's duplicate-only arm settles `failed` terminally on
+  the FIRST attempt — pure-duplicate and mixed aborts alike (review F-001:
+  composing `failed_ids` too made the runner persist a narrowed
+  `$.retry_file_ids` whose attempt-2 re-run deterministically trips the
+  #702 refusal guard while the dimension is still changed, burning every
+  attempt to cap; per the #820 determinism principle the compose carries
+  duplicates only and never persists a retry scope). A PURE-transient
+  staged abort keeps the empty global shape so the retry re-stages the
+  FULL scope and can complete. No narrowed staging is licensed (the
+  staged table is a global replacement — the refusal guard stays).
 - **ABSORB (re-selection loop):** all four reindex selection variants
   exclude rows that are terminally duplicate-settled
   (`status='error' AND error_message LIKE 'DUPLICATE_FILE:%'`, NULL-safe),

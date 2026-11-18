@@ -536,11 +536,25 @@ class EmailIngestionService:
             logger.info(f"Enqueued attachment for processing: {file_path}")
 
         if processed_attachments == 0:
-            logger.info(f"No valid document attachments found in email from {self._sanitize_log_value(sender)}")
+            # issue #982 Family B: the From address is user-derived PII —
+            # bounded form at default level (the sanitizer strips control
+            # chars only, it is not redaction), full value at DEBUG.
+            logger.info(
+                "No valid document attachments found in email "
+                f"(sender_len={len(self._sanitize_log_value(sender))})"
+            )
+            logger.debug(
+                "No valid document attachments in email from %s",
+                self._sanitize_log_value(sender),
+            )
         else:
             logger.info(
-                f"Processed {processed_attachments} attachment(s) from email from "
-                f"{self._sanitize_log_value(sender)}"
+                f"Processed {processed_attachments} attachment(s) from email "
+                f"(sender_len={len(self._sanitize_log_value(sender))})"
+            )
+            logger.debug(
+                "Processed attachments from email from %s",
+                self._sanitize_log_value(sender),
             )
 
     def _sanitize_log_value(self, value: str) -> str:

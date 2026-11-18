@@ -365,7 +365,13 @@ class FileWatcher:
                     )
                     logger.debug(f"Enqueued new file for processing: {file_path}")
             except Exception as e:
-                logger.error(f"Error scanning directory {directory}: {e}")
+                logger.error(
+                    f"Error scanning directory {directory}: "
+                    f"{type(e).__name__}"
+                )
+                logger.debug(
+                    "Error scanning directory %s: %s", directory, e
+                )
                 # K-01: vault-relative redaction — the operator knows which
                 # scan scope failed without the server's absolute filesystem
                 # layout or the raw exception text (logged above).

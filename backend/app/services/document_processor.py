@@ -3971,7 +3971,9 @@ class DocumentProcessor:
                 "(issue #703: an image whose OCR could not run is a "
                 "degraded failure, not a clean success).",
                 len(str(file_path)),
-                image_result.error,
+                type(image_result.error).__name__
+                if image_result.error
+                else "unknown",
             )
             logger.debug(
                 "Image processing failed for %s: %s",
@@ -4040,7 +4042,7 @@ class DocumentProcessor:
             logger.warning(
                 "Failed to plan image asset (path_len=%d): %s",
                 len(str(file_path)),
-                exc,
+                type(exc).__name__,
             )
             logger.debug("Failed to plan image asset for %s: %s", file_path, exc)
 

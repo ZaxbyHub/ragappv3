@@ -29,7 +29,13 @@ def _unlink_quietly(path: Path) -> None:
     try:
         path.unlink(missing_ok=True)
     except OSError as exc:
-        logger.warning("Could not remove upload temp %s: %s", path, exc)
+        # issue #982 Family B: temp names carry the user's filename stem.
+        logger.warning(
+            "Could not remove upload temp (path_len=%d): %s",
+            len(str(path)),
+            type(exc).__name__,
+        )
+        logger.debug("Could not remove upload temp %s: %s", path, exc)
 
 
 @dataclass

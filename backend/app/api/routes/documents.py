@@ -2618,9 +2618,12 @@ async def _discard_upload_artifacts(file_path: Path, temp_file_path: Path) -> No
             except OSError:
                 if attempt == 4:
                     logger.warning(
-                        "could not remove upload artifact %s; a canonical "
-                        ".part leftover is watcher-skipped",
-                        artifact,
+                        "could not remove upload artifact (path_len=%d); a "
+                        "canonical .part leftover is watcher-skipped",
+                        len(str(artifact)),
+                    )
+                    logger.debug(
+                        "could not remove upload artifact %s", artifact
                     )
                 else:
                     await asyncio.sleep(0.05)

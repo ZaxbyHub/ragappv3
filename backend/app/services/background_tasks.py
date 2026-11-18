@@ -4815,10 +4815,13 @@ class BackgroundProcessor:
                 # removed, re-embed the WHOLE vault. Settle terminally now
                 # (no cap prefix: the cap was never reached) with the
                 # composed duplicate outcome. The `result` guard keeps a
-                # GLOBAL failure shape (("failed", {}, exc) — staged-rebuild
-                # abort, vector-store refusal outside per-file accounting)
-                # on the retry ladder: it carries no per-file outcomes, and
-                # a pending payload retry scope must survive it.
+                # GLOBAL failure shape (("failed", {}, exc) —
+                # PURE-transient staged-rebuild abort, vector-store refusal
+                # outside per-file accounting) on the retry ladder: it
+                # carries no duplicate outcomes, and a pending payload
+                # retry scope must survive it. (An abort WITH duplicates
+                # composes a non-empty result above and settles here on
+                # the first attempt; review F-001.)
                 if (
                     not retry_scope_ids
                     and cumulative_duplicate_ids
@@ -5984,10 +5987,22 @@ class BackgroundProcessor:
             # duplicates instead of the empty global shape. An identity-only
             # abort with empty ledgers keeps the exact ("failed", {}, exc)
             # shape the cap arm's error-only contract expects.
-            if staged_aborted and (duplicate_ids or failed_ids):
+            # Review F-001 (pr1169-20261117): compose ONLY the duplicate
+            # ledger. Including failed_ids made the runner persist a
+            # narrowed $.retry_file_ids whose attempt-2 re-run can never
+            # execute — a staged rebuild only exists under a dimension/
+            # identity change, and that is exactly what the #702 refusal
+            # guard rejects for a scoped attempt, so every retry raised
+            # guidance to the attempt cap (base's empty shape kept the
+            # full scope and could complete). With duplicates composed
+            # alone, the duplicate-only terminal arm settles 'failed' on
+            # the first attempt (#820 determinism: deterministic refusals
+            # never burn the ladder) and the operator runs a fresh
+            # reindex; a PURE-transient staged abort keeps the empty
+            # shape so attempt 2 re-stages the FULL scope.
+            if staged_aborted and duplicate_ids:
                 composed_abort = {
                     "duplicate_file_ids": sorted(set(duplicate_ids)),
-                    "failed_ids": sorted(set(failed_ids)),
                     "failed": len(
                         {int(i) for i in failed_ids} | set(duplicate_ids)
                     ),
