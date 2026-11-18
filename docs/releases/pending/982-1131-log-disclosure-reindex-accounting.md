@@ -99,10 +99,17 @@ family (#982) and the two reindex duplicate-accounting edges disclosed at PR
   `$.retry_file_ids` whose attempt-2 re-run deterministically trips the
   #702 refusal guard while the dimension is still changed, burning every
   attempt to cap; per the #820 determinism principle the compose carries
-  duplicates only and never persists a retry scope). A PURE-transient
-  staged abort keeps the empty global shape so the retry re-stages the
-  FULL scope and can complete. No narrowed staging is licensed (the
-  staged table is a global replacement — the refusal guard stays).
+  duplicates only and never persists a retry scope). The mixed abort's
+  transient failures ride along as `transient_failed_ids` — transport
+  metadata the runner pops before persistence and folds into the settled
+  `failed` count WITHOUT ever entering the retry scope, so terminal
+  settlement preserves the distinct transient+duplicate accounting
+  (delta-review r2: without it the runner's cross-attempt recount saw an
+  empty transient input and silently dropped the transient from the
+  persisted count). A PURE-transient staged abort keeps the empty global
+  shape so the retry re-stages the FULL scope and can complete. No
+  narrowed staging is licensed (the staged table is a global replacement —
+  the refusal guard stays).
 - **ABSORB (re-selection loop):** all four reindex selection variants
   exclude rows that are terminally duplicate-settled
   (`status='error' AND error_message LIKE 'DUPLICATE_FILE:%'`, NULL-safe),

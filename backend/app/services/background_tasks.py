@@ -4651,6 +4651,14 @@ class BackgroundProcessor:
         # cumulative set (transport metadata, popped before persistence —
         # same contract as failed_ids).
         attempt_duplicate_ids = result.pop("duplicate_file_ids", None) or []
+        # Delta-review r2 F-1: a mixed staged-abort compose carries this
+        # attempt's transient failures under transient_failed_ids (the
+        # producer deliberately omits failed_ids so no narrowed retry scope
+        # is ever persisted). Pop them here — transport metadata, popped
+        # before persistence, and NEVER a retry input — so the terminal
+        # settlement can count them; the producer's own 'failed' count
+        # dies with the runner's cross-attempt recount.
+        attempt_transient_ids = result.pop("transient_failed_ids", None) or []
         cumulative_duplicate_ids = sorted(
             {*cumulative_duplicate_ids, *(int(i) for i in attempt_duplicate_ids)}
         )
@@ -4835,10 +4843,15 @@ class BackgroundProcessor:
                     # exactly like the completed and cap arms — a multi-attempt
                     # duplicate-only settlement (prior-attempt duplicates from
                     # payload + this attempt's) must not persist the producer's
-                    # current-attempt-only count.
+                    # current-attempt-only count. Delta-review r2 F-1: for a
+                    # mixed staged abort the transient ids ride in via
+                    # transient_failed_ids (failed_ids is deliberately empty
+                    # there — no narrowed retry scope), so they join the union
+                    # here or the recount silently drops them.
                     composed["failed"] = len(
                         {
                             *(int(i) for i in failed_ids),
+                            *(int(i) for i in attempt_transient_ids),
                             *cumulative_duplicate_ids,
                         }
                     )
@@ -4989,6 +5002,13 @@ class BackgroundProcessor:
             # settlement writes below (the legacy error/result payloads keep
             # their exact historical shapes).
             result.pop("failed_ids", None)
+            # Delta-review r2 F-1 companion: the mixed staged-abort compose
+            # carries this attempt's transients the same way — transport
+            # metadata only (the legacy transport settles after one pass and
+            # keeps the producer's own 'failed' count, which already counts
+            # them), so pop it to keep the persisted shape free of
+            # transport keys.
+            result.pop("transient_failed_ids", None)
             # issue #1112: the legacy transport settles terminally after one
             # pass (no retry ladder), so duplicates ride the composed result
             # directly — popped only to keep the persisted shape free of
@@ -6000,9 +6020,19 @@ class BackgroundProcessor:
             # never burn the ladder) and the operator runs a fresh
             # reindex; a PURE-transient staged abort keeps the empty
             # shape so attempt 2 re-stages the FULL scope.
+            # Delta-review r2 F-1: the transient failures of THIS attempt
+            # ride along as transient_failed_ids — transport metadata the
+            # runner pops before persistence (same contract as
+            # duplicate_file_ids) and folds into the settled 'failed'
+            # count WITHOUT entering the retry scope, so terminal
+            # settlement keeps the distinct transient+duplicate
+            # accounting instead of recounting duplicates alone.
             if staged_aborted and duplicate_ids:
                 composed_abort = {
                     "duplicate_file_ids": sorted(set(duplicate_ids)),
+                    "transient_failed_ids": sorted(
+                        {int(i) for i in failed_ids} - set(duplicate_ids)
+                    ),
                     "failed": len(
                         {int(i) for i in failed_ids} | set(duplicate_ids)
                     ),

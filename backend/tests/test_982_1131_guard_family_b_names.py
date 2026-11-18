@@ -1454,9 +1454,127 @@ async def test_mixed_staged_abort_settles_terminally_no_requeue(tmp_path):
             "attempt-2 re-run deterministically trips the #702 refusal "
             f"guard (review F-001); got {result!r}"
         )
+        assert "transient_failed_ids" in result, (
+            "982r2F1: the mixed compose must carry this attempt's transients "
+            "as transport metadata (popped by the runner before persistence, "
+            "folded into the settled 'failed' count, never a retry input); "
+            f"got {result!r}"
+        )
         assert result.get("failed") == 2, (
             f"982F001: 'failed' counts the distinct terminal files "
             f"(transient + duplicate); got {result.get('failed')!r}"
+        )
+    finally:
+        pool.close_all()
+        conn.close()
+        lease_conn.close()
+
+
+async def test_mixed_staged_abort_runner_settles_count_with_transients(
+    tmp_path, monkeypatch
+):
+    """Delta-review r2 F-1/F-2: the mixed staged-abort compose omits
+    failed_ids (no narrowed retry scope is persisted — review F-001), so the
+    runner's terminal recount saw an EMPTY transient input and overwrote the
+    producer's transient+duplicate 'failed' count with the duplicate count
+    alone — the exact per-file accounting loss #1131 RP-001 exists to close.
+    The compose now carries this attempt's transients as
+    transient_failed_ids (transport metadata, popped before persistence,
+    never a retry input) and the settlement recount folds them in.
+
+    Drives the RUNNER seam (_run_reindex_job_row with the new producer
+    result shape), not just the producer: the defect lived in the
+    settlement, downstream of the producer-level pin.
+    """
+    import json as _json
+    import sqlite3
+
+    from app.config import settings
+    from app.models.database import SQLiteConnectionPool, run_migrations
+    from app.services.background_tasks import BackgroundProcessor
+    from app.services.document_processor import DuplicateFileError
+    from app.services.job_lease import JobLease, ensure_jobs_schema
+
+    db_path = str(tmp_path / "mixed_runner.db")
+    run_migrations(db_path)
+    conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    lease_conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+    lease_conn.row_factory = sqlite3.Row
+    try:
+        ensure_jobs_schema(conn)
+        conn.execute(
+            "INSERT INTO jobs (queue, payload_json, status)"
+            " VALUES ('reindex', ?, 'pending')",
+            (_json.dumps({"vault_id": 1}),),
+        )
+        conn.commit()
+        monkeypatch.setattr(settings, "jobs_max_attempts", 3)
+
+        bp = BackgroundProcessor(pool=pool, retry_delay=0.05)
+
+        async def _producer(job_id, vault_id, retry_file_ids=None):  # noqa: ARG001
+            # The new staged-abort compose shape (review F-001 + r2 F-1):
+            # no failed_ids; transients under transport metadata; the
+            # duplicate ledger composed.
+            return (
+                "failed",
+                {
+                    "processed": 0,
+                    "failed": 2,
+                    "details": [
+                        "file_id=7: DUPLICATE_FILE: duplicate",
+                        "file_id=9: transient parse failure",
+                    ],
+                    "transient_failed_ids": [9],
+                    "duplicate_file_ids": [7],
+                },
+                DuplicateFileError("dup"),
+            )
+
+        monkeypatch.setattr(bp, "_reindex_embed_all", _producer)
+
+        lease = JobLease(lease_conn, reclaim_timeout_seconds=300.0, max_attempts=3)
+        row = lease.claim("reindex", "mixed-runner-worker")
+        assert row is not None
+        row = dict(row) if not isinstance(row, dict) else row
+        row["attempts"] = 1
+        await bp._run_reindex_job_row(row, "mixed-runner-worker")  # noqa: SLF001
+
+        jobs_row = conn.execute(
+            "SELECT status, error, result_json, payload_json FROM jobs"
+            " WHERE queue = 'reindex' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert jobs_row["status"] == "failed", (
+            "982r2F1: the mixed staged abort must settle terminally on the "
+            f"first attempt, not requeue; status={jobs_row['status']!r}"
+        )
+        result_json = _json.loads(jobs_row["result_json"] or "{}")
+        assert result_json.get("failed") == 2, (
+            "982r2F1: terminal settlement must preserve the distinct "
+            "transient+duplicate count — the recount dropped the transient "
+            f"when failed_ids went empty; result={result_json}"
+        )
+        assert result_json.get("duplicate_file_ids") == [7], (
+            f"982r2F1: the duplicate ledger persists; result={result_json}"
+        )
+        assert "transient_failed_ids" not in result_json, (
+            "982r2F1: transient_failed_ids is transport metadata and must be "
+            f"popped before persistence; result={result_json}"
+        )
+        assert "failed_ids" not in result_json, (
+            f"982r2F1: no failed_ids may persist; result={result_json}"
+        )
+        payload = _json.loads(jobs_row["payload_json"] or "{}")
+        assert "retry_file_ids" not in payload, (
+            "982r2F1: no narrowed retry scope may be persisted (the #702 "
+            f"refusal guard makes any attempt-2 re-run a dead end); "
+            f"payload={payload}"
+        )
+        assert "attempt_cap_exceeded" not in (jobs_row["error"] or ""), (
+            "982r2F1: first-attempt terminal settlement carries no cap "
+            f"prefix; error={jobs_row['error']!r}"
         )
     finally:
         pool.close_all()
