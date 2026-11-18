@@ -78,7 +78,17 @@ if (-not $SkipEmbedding) {
     $embeddingState = docker ps -a --filter "name=^$EmbeddingContainerName$" --format "{{.State}}" 2>&1 | Select-Object -First 1
     if ($embeddingState -eq "running") {
         Write-Output "$EmbeddingContainerName container already running"
-    } elseif ($embeddingState -in @("exited", "created", "paused", "restarting", "dead")) {
+    } elseif ($embeddingState -eq "paused") {
+        # A paused container is RUNNING but suspended: docker start cannot
+        # resume it ("You cannot start a paused container"); unpause is the
+        # correct operation (implementation-review CR-1).
+        Write-Output "Unpausing $EmbeddingContainerName container..."
+        docker unpause $EmbeddingContainerName
+        if ($LASTEXITCODE -ne 0) {
+            Write-Output "ERROR: docker unpause $EmbeddingContainerName failed (exit $LASTEXITCODE). Run 'docker inspect $EmbeddingContainerName' for the cause."
+            exit $LASTEXITCODE
+        }
+    } elseif ($embeddingState -in @("exited", "created", "restarting", "dead")) {
         Write-Output "Starting existing stopped $EmbeddingContainerName container..."
         docker start $EmbeddingContainerName
         if ($LASTEXITCODE -ne 0) {
