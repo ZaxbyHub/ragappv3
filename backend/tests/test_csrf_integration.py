@@ -107,7 +107,7 @@ class TestCSRFIntegrationInProcess(unittest.TestCase):
 
         main_app.dependency_overrides[get_db] = get_test_db
         main_app.state.csrf_manager = CSRFManager(
-            redis_url="redis://localhost:6379/0", ttl=900
+            redis_url="", ttl=900
         )
 
         self.client = TestClient(main_app)

@@ -142,15 +142,16 @@ class _CSRFAdversarialBase(unittest.TestCase):
 
         main_app.dependency_overrides[get_db] = get_test_db
 
-        self.csrf_manager = CSRFManager(
-            redis_url="redis://localhost:6379/0", ttl=900
-        )
-        # Force in-memory fallback and drop the redis handle so per-request
-        # _check_redis_available() doesn't block on redis ping retries (redis
-        # is absent in CI). test_csrf_auth.py tolerates this because it makes
-        # few requests; the adversarial suite is higher-volume.
-        self.csrf_manager._use_fallback = True
-        self.csrf_manager._redis = None
+        # The documented no-Redis configuration: the constructor goes
+        # straight to the in-memory fallback store, so per-request
+        # _check_redis_available() can never block on a Redis ping retry.
+        # Constructing with a real URL and then poking the privates (the
+        # previous approach) only works when the constructor's ping FAILS:
+        # when a real Redis is reachable on the guarded port the ping
+        # succeeds, _init_fallback_store never runs, and every token
+        # operation raises 503. test_csrf_auth.py tolerates the ping because
+        # it makes few requests; the adversarial suite is higher-volume.
+        self.csrf_manager = CSRFManager(redis_url="", ttl=900)
         main_app.state.csrf_manager = self.csrf_manager
 
         self.client = TestClient(main_app)
@@ -463,15 +464,14 @@ class TestCSRFRaceConditions(unittest.TestCase):
     """
 
     def setUp(self):
-        # In-memory fallback store (Redis absent in CI). thread-safe via _lock.
-        # We construct the manager then force it into fallback mode and drop the
-        # redis handle so _check_redis_available() short-circuits — otherwise each
-        # generate/validate call blocks on a redis ping retry when redis is down.
-        self.csrf_manager = CSRFManager(
-            redis_url="redis://localhost:6379/0", ttl=900
-        )
-        self.csrf_manager._use_fallback = True
-        self.csrf_manager._redis = None
+        # In-memory fallback store, thread-safe via _lock. The documented
+        # no-Redis configuration (empty URL) builds the fallback in the
+        # constructor, so _check_redis_available() short-circuits and no
+        # call can block on a Redis ping retry. (Constructing with a real
+        # URL and poking the privates only works when the constructor ping
+        # FAILS: when a real Redis is reachable on the guarded port the ping
+        # succeeds, the fallback is never built, and every call 503s.)
+        self.csrf_manager = CSRFManager(redis_url="", ttl=900)
 
     def test_concurrent_requests_same_token(self):
         """Many threads validating the same valid token should all succeed."""
@@ -685,7 +685,7 @@ class TestCSRFForgery(_CSRFAdversarialBase):
         cookie = resp.cookies.get(CSRF_COOKIE_NAME)
         fake = "fake_token_for_splitting"
         for order in [(cookie, fake), (fake, cookie)]:
-            cookie_header = "; ".join([f"X-CSRF-Token={c}" for c in order])
+            cookie_header = "; ".join([f"{CSRF_COOKIE_NAME}={c}" for c in order])
             resp = requests.post(
                 f"{BASE_URL}/auth/register",
                 json={
@@ -728,7 +728,7 @@ class TestCSRFTokenLeakage(_CSRFAdversarialBase):
         self.assertEqual(body_token, cookie_token)
 
     def test_csrf_cookie_name_not_prefixed(self):
-        """DOCUMENTATION: Cookie name 'X-CSRF-Token' has no __Host- prefix."""
+        """DOCUMENTATION: Cookie name 'meridian-csrf-token' has no __Host- prefix."""
         resp = self.client.get("/api/csrf-token")
         set_cookie = resp.headers.get("Set-Cookie", "")
         self.assertIn(

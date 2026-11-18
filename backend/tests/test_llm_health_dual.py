@@ -32,7 +32,7 @@ def test_check_chat_modes_returns_both_keys():
         instant_client=instant,
     )
     result = asyncio.run(checker.check_chat_modes())
-    assert result == {"thinking": True, "instant": True}
+    assert result == {"thinking": True, "instant": True, "editorial": False}
 
 
 def test_check_chat_modes_failing_instant_reported_false():
@@ -43,10 +43,10 @@ def test_check_chat_modes_failing_instant_reported_false():
         instant_client=instant,
     )
     result = asyncio.run(checker.check_chat_modes())
-    assert result == {"thinking": True, "instant": False}
+    assert result == {"thinking": True, "instant": False, "editorial": False}
 
 
 def test_check_chat_modes_missing_clients_fails_closed():
     checker = LLMHealthChecker()  # no clients
     result = asyncio.run(checker.check_chat_modes())
-    assert result == {"thinking": False, "instant": False}
+    assert result == {"thinking": False, "instant": False, "editorial": False}

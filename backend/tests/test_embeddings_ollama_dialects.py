@@ -243,7 +243,7 @@ class TestOllamaDialectDetection:
 class TestLegacyOllamaDialect:
     async def test_embed_batch_fans_out_prompt_requests_in_order(self):
         fake = LegacyFakeClient()
-        with patch.object(settings, "redis_url", ""), \
+        with patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "ollama_embedding_url", LEGACY_URL), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", ""), \
@@ -260,7 +260,7 @@ class TestLegacyOllamaDialect:
 
     async def test_embed_single_sends_prompt_body(self):
         fake = LegacyFakeClient()
-        with patch.object(settings, "redis_url", ""), \
+        with patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "ollama_embedding_url", LEGACY_URL), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", ""), \
@@ -274,7 +274,7 @@ class TestLegacyOllamaDialect:
     async def test_embed_batch_batch_size_one(self):
         """batch_size=1 on legacy still fans out per-item prompt requests."""
         fake = LegacyFakeClient()
-        with patch.object(settings, "redis_url", ""), \
+        with patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "ollama_embedding_url", LEGACY_URL), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", ""), \
@@ -289,7 +289,7 @@ class TestLegacyOllamaDialect:
         """A per-item timeout on the legacy fan-out gets backoff retry."""
         fake = LegacyFakeClient()
         fake.timeouts_remaining = 1
-        with patch.object(settings, "redis_url", ""), \
+        with patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "ollama_embedding_url", LEGACY_URL), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", ""), \
@@ -315,7 +315,7 @@ class TestLegacyOllamaDialect:
             return await original_post(url, json=json)
 
         fake.post = rejecting_post
-        with patch.object(settings, "redis_url", ""), \
+        with patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "ollama_embedding_url", LEGACY_URL), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", ""), \
@@ -338,7 +338,7 @@ class TestLegacyOllamaDialect:
             return await LegacyFakeClient.post(fake, url, json=json)
 
         fake.post = rejecting_post
-        with patch.object(settings, "redis_url", ""), \
+        with patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "ollama_embedding_url", LEGACY_URL), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", ""), \
@@ -357,7 +357,7 @@ class TestLegacyOllamaDialect:
 class TestModernOllamaDialect:
     async def test_embed_single_sends_scalar_input(self):
         fake = ModernFakeClient()
-        with patch.object(settings, "redis_url", ""), \
+        with patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "ollama_embedding_url", MODERN_URL), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", ""), \
@@ -374,7 +374,7 @@ class TestModernOllamaDialect:
 
     async def test_embed_batch_sends_list_input(self):
         fake = ModernFakeClient()
-        with patch.object(settings, "redis_url", ""), \
+        with patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "ollama_embedding_url", MODERN_URL), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", ""), \
@@ -397,7 +397,7 @@ class TestModernOllamaDialect:
             return FakeResponse(200, json_body={"embeddings": [[0.1, 0.2]]})
 
         fake.post = short_post
-        with patch.object(settings, "redis_url", ""), \
+        with patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "ollama_embedding_url", MODERN_URL), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", ""), \
@@ -416,7 +416,7 @@ class TestModernOllamaDialect:
 class TestRequestConfigSnapshot:
     async def test_held_request_completes_under_original_config(self):
         fake = GatedFakeClient()
-        with patch.object(settings, "redis_url", ""), \
+        with patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", ""), \
                 patch.object(settings, "embedding_query_prefix", ""), \
@@ -436,7 +436,7 @@ class TestRequestConfigSnapshot:
 
     async def test_held_request_metrics_name_original_config(self):
         fake = GatedFakeClient()
-        with patch.object(settings, "redis_url", ""), \
+        with patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", ""), \
                 patch.object(settings, "embedding_query_prefix", ""), \
@@ -455,7 +455,7 @@ class TestRequestConfigSnapshot:
 
     async def test_next_request_uses_new_config(self):
         fake = GatedFakeClient()
-        with patch.object(settings, "redis_url", ""), \
+        with patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", ""), \
                 patch.object(settings, "embedding_query_prefix", ""), \
@@ -483,7 +483,7 @@ class TestRequestConfigSnapshot:
     async def test_embed_batch_snapshots_once_for_whole_batch(self):
         """A batch in flight when settings flip completes under the issuing config."""
         fake = GatedFakeClient()
-        with patch.object(settings, "redis_url", ""), \
+        with patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", ""), \
                 patch.object(settings, "embedding_query_prefix", ""), \
@@ -503,7 +503,7 @@ class TestRequestConfigSnapshot:
     async def test_prefix_snapshot_keys_cache_entry(self):
         """The L1 cache key is derived from the issuing (snapshot) prefix."""
         fake = GatedFakeClient()
-        with patch.object(settings, "redis_url", ""), \
+        with patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", "OLD: "), \
                 patch.object(settings, "embedding_query_prefix", "OLDQ: "), \
@@ -560,7 +560,7 @@ class TestRedisCallsOffEventLoop:
     async def test_redis_get_runs_off_the_event_loop_thread(self):
         fake_redis = RecordingRedisClient()
         with patch("app.services.embeddings.redis") as mock_redis_module, \
-                patch.object(settings, "redis_url", "redis://localhost:6379/0"), \
+                patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "ollama_embedding_url", LEGACY_URL), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", ""), \
@@ -579,7 +579,7 @@ class TestRedisCallsOffEventLoop:
     async def test_redis_setex_runs_off_the_event_loop_thread(self):
         fake_redis = RecordingRedisClient()
         with patch("app.services.embeddings.redis") as mock_redis_module, \
-                patch.object(settings, "redis_url", "redis://localhost:6379/0"), \
+                patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "ollama_embedding_url", LEGACY_URL), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", ""), \
@@ -599,7 +599,7 @@ class TestRedisCallsOffEventLoop:
         """A redis get exceeding redis_io_timeout_seconds falls through to the provider."""
         fake_redis = RecordingRedisClient(delay=2.5)  # > redis_io_timeout_seconds (1.0)
         with patch("app.services.embeddings.redis") as mock_redis_module, \
-                patch.object(settings, "redis_url", "redis://localhost:6379/0"), \
+                patch.object(settings, "redis_url", "redis://redis.invalid:6379/0"), \
                 patch.object(settings, "ollama_embedding_url", LEGACY_URL), \
                 patch.object(settings, "embedding_model", "m"), \
                 patch.object(settings, "embedding_doc_prefix", ""), \

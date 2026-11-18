@@ -1016,8 +1016,8 @@ class TestStorageUriWiring(unittest.TestCase):
         from app.limiter import _resolve_storage_uri
 
         self.assertEqual(
-            _resolve_storage_uri("redis://localhost:6379/0"),
-            "redis://localhost:6379/0",
+            _resolve_storage_uri("redis://redis.invalid:6379/0"),
+            "redis://redis.invalid:6379/0",
         )
 
     def test_resolve_storage_uri_preserves_db_index_and_credentials(self):
@@ -1054,10 +1054,10 @@ class TestStorageUriWiring(unittest.TestCase):
 
         from app.limiter import build_limiter
 
-        lim = build_limiter("redis://localhost:6379/0")
+        lim = build_limiter("redis://redis.invalid:6379/0")
         self.assertIsInstance(lim._storage, RedisStorage)
         # The resolved URI is passed through to slowapi unchanged (F-LO1).
-        self.assertEqual(lim._storage_uri, "redis://localhost:6379/0")
+        self.assertEqual(lim._storage_uri, "redis://redis.invalid:6379/0")
         # build_limiter returns a WhitelistLimiter (preserves the health-check
         # whitelist bypass) — a type-anchor guard (PRR-005).
         from app.limiter import WhitelistLimiter
@@ -1083,7 +1083,7 @@ class TestStorageUriWiring(unittest.TestCase):
         live Redis is required."""
         from app.limiter import build_limiter
 
-        lim = build_limiter("redis://localhost:6379/0")
+        lim = build_limiter("redis://redis.invalid:6379/0")
         self.assertTrue(lim._in_memory_fallback_enabled)
 
     def test_module_global_limiter_is_whitelist_limiter(self):
@@ -1136,7 +1136,7 @@ class TestRedisUrlRedaction(unittest.TestCase):
     def test_redact_url_passthrough_when_no_credentials(self):
         from app.utils.secrets import redact_url
 
-        self.assertEqual(redact_url("redis://localhost:6379/0"), "redis://localhost:6379/0")
+        self.assertEqual(redact_url("redis://redis.invalid:6379/0"), "redis://redis.invalid:6379/0")
         self.assertEqual(redact_url("memory://"), "memory://")
 
     def test_redact_url_handles_tls_and_sentinel(self):

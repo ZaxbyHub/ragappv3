@@ -1633,6 +1633,19 @@ def create_editorial_client(timeout: Optional[float] = None) -> "LLMClient":
             "(OLLAMA_CHAT_URL + CHAT_MODEL) it falls back to, or configure "
             "them in Settings -> Models."
         )
+    # No-think control (issue #712): editorial desk stages need short,
+    # machine-shaped answers, and a reasoning-on template default burns the
+    # whole budget reasoning and can return empty content. The control is
+    # sent directly rather than via select_no_think_chat_template_kwargs
+    # because that helper only matches model ids containing "qwen" - a
+    # family served under an unrelated alias would silently miss it. A
+    # sturdier key would be the server-reported chat-template capability or
+    # an explicit operator setting; left as a note until a second family is
+    # actually deployed. editorial_enable_thinking=True opts out (provider
+    # default governs), mirroring the instant lane.
+    editorial_no_think = (
+        None if settings.editorial_enable_thinking else {"enable_thinking": False}
+    )
     return LLMClient(
         timeout=(
             timeout
@@ -1642,6 +1655,7 @@ def create_editorial_client(timeout: Optional[float] = None) -> "LLMClient":
         base_url=base_url,
         model=model,
         cb_name="llm_editorial",
+        chat_template_kwargs=editorial_no_think,
         keep_alive=settings.ollama_keep_alive,
         num_ctx=settings.ollama_num_ctx,
         api_key=settings.chat_api_key or None,

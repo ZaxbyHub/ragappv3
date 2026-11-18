@@ -37,7 +37,7 @@ class TestCSRFManagerRuntimeErrorRegressionF008(unittest.TestCase):
         Prior to F-008, RuntimeError was NOT in the except clause and would
         propagate as an unhandled exception / 500 error.
         """
-        manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        manager = CSRFManager(redis_url="", ttl=900)
 
         # Mock the store returned by _get_store() so expire() raises RuntimeError
         mock_store = MagicMock()
@@ -62,7 +62,7 @@ class TestCSRFManagerRuntimeErrorRegressionF008(unittest.TestCase):
         The token existence check (store.get) already succeeded, so the token
         is valid even if extending the TTL fails.
         """
-        manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        manager = CSRFManager(redis_url="", ttl=900)
 
         mock_store = MagicMock()
         mock_store.get.return_value = "1"
@@ -85,7 +85,7 @@ class TestCSRFManagerRuntimeErrorRegressionF008(unittest.TestCase):
         and revoke_token returns None. Prior to F-008, RuntimeError was NOT in the
         except clause and would propagate as an unhandled exception / 500 error.
         """
-        manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        manager = CSRFManager(redis_url="", ttl=900)
 
         mock_store = MagicMock()
         mock_store.delete.side_effect = RuntimeError("CSRF storage unavailable")
@@ -110,7 +110,7 @@ class TestCSRFManagerRuntimeErrorRegressionF008(unittest.TestCase):
         revoke_token must not raise when store.delete() raises RuntimeError.
         Revocation is best-effort; a storage failure should not crash the request.
         """
-        manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        manager = CSRFManager(redis_url="", ttl=900)
 
         mock_store = MagicMock()
         mock_store.delete.side_effect = RuntimeError("CSRF storage unavailable")
@@ -130,7 +130,7 @@ class TestCSRFManagerRuntimeErrorRegressionF008(unittest.TestCase):
         (this was already covered before F-008, but we verify the exception
         handling chain still works for the original exception types).
         """
-        manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        manager = CSRFManager(redis_url="", ttl=900)
 
         mock_store = MagicMock()
         mock_store.get.return_value = "1"
@@ -150,7 +150,7 @@ class TestCSRFManagerRuntimeErrorRegressionF008(unittest.TestCase):
         Sanity check: revoke_token still catches redis.RedisError from delete()
         (this was already covered before F-008).
         """
-        manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        manager = CSRFManager(redis_url="", ttl=900)
 
         mock_store = MagicMock()
         mock_store.delete.side_effect = redis.RedisError("Redis connection lost")
