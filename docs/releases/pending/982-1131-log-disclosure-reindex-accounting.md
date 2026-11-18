@@ -52,11 +52,15 @@ family (#982) and the two reindex duplicate-accounting edges disclosed at PR
   credential-bearing `__context__` chain from boot tracebacks) — the final
   round's traceback guard test found that `redact_url` does not cover
   unknown-scheme URI shapes (`bogus://<secret>@host` rendered verbatim), so
-  the raised message carries no URI text beyond the scheme token, and a
-  colon-less or malformed `REDIS_URL` (whose split token would BE the
-  value) emits the literal `unparseable` placeholder instead — no part of
-  the raw value reaches the boot traceback. Boot still fails closed on bad
-  config. Known residuals (disclosed): the boot INFO line still prints
+  the raised message carries no URI text beyond the scheme token. The token
+  is extracted STRUCTURALLY — echoed only when the entire prefix before the
+  first `://` is a single RFC 3986 scheme token; every other shape (a
+  colon-less `REDIS_URL`, whose bare split token would BE the entire secret
+  even when it is scheme-charset-conforming like a bare password — the
+  delta-review round 2 probe; a coloned non-URI such as `pass:word`; a
+  delimiter-less sentinel blob) emits the literal `unparseable`
+  placeholder, so no part of the raw value reaches the boot traceback.
+  Boot still fails closed on bad config. Known residuals (disclosed): the boot INFO line still prints
   `redact_url(storage_uri)`, which passes username-only and
   query-string-password shapes through verbatim (pre-existing; follow-up
   filed), and non-`ConfigurationError` failures (cluster setups, bad

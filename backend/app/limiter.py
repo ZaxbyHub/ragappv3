@@ -16,8 +16,11 @@ from app.utils.secrets import redact_url
 logger = logging.getLogger("rate_limit")
 
 # A well-formed URI scheme token (RFC 3986 scheme charset, pragmatic
-# subset). Anything else means the value has no scheme separator, so the
-# split token is raw input and must not be echoed (review F-002).
+# subset). A token is echoed in the boot-failure diagnosis ONLY when the
+# entire pre-"://" prefix of REDIS_URL matches it; every other shape gets
+# the literal 'unparseable' placeholder (review F-002 + delta-review
+# round 2: a charset-only guard still fullmatched and echoed colon-less
+# secrets like "hunter2golden").
 _SCHEME_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{0,31}")
 
 
@@ -207,14 +210,23 @@ def build_limiter(redis_url: str) -> WhitelistLimiter:
         # here) can carry the credential in positions its patterns do not
         # match (final-critic B2 probe: bogus://<secret>@host renders
         # verbatim). The raised message carries the scheme TOKEN only —
-        # and when even the token is not a well-formed scheme (a
-        # colon-less REDIS_URL makes split(':', 1)[0] the ENTIRE value,
-        # which is the secret itself — review F-002/A-1b), the literal
-        # 'unparseable' placeholder is emitted so no part of the raw
-        # value reaches the boot traceback.
-        _scheme = storage_uri.split(":", 1)[0]
-        if not _SCHEME_TOKEN_RE.fullmatch(_scheme or ""):
-            _scheme = "unparseable (colon-less or malformed REDIS_URL)"
+        # and the token is echoed only when the value has a real URI
+        # shape: everything before the first "://" is a single scheme
+        # token. Every other shape emits the literal 'unparseable'
+        # placeholder so no part of the raw value reaches the boot
+        # traceback. This must be STRUCTURAL, not charset-only: a bare
+        # split(":", 1)[0] on a colon-less REDIS_URL returns the ENTIRE
+        # secret, which can itself be scheme-charset-conforming
+        # ("hunter2golden" fullmatches and echoes verbatim — delta-review
+        # round 2 probe), and a coloned non-URI ("pass:word") leaks its
+        # first segment the same way (review F-002/A-1b).
+        _scheme = ""
+        if "://" in storage_uri:
+            _candidate = storage_uri.split("://", 1)[0]
+            if ":" not in _candidate and _SCHEME_TOKEN_RE.fullmatch(_candidate):
+                _scheme = _candidate
+        if not _scheme:
+            _scheme = "unparseable (no :// scheme delimiter in REDIS_URL)"
         raise RuntimeError(
             "Invalid REDIS_URL for rate-limiter storage "
             f"(scheme={_scheme!r}): {type(exc).__name__}"

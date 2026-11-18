@@ -1147,6 +1147,53 @@ def test_limiter_boot_traceback_severed_from_credential_chain():
             excinfo.value.__cause__
         )
 
+
+def test_limiter_scheme_echo_is_structural_not_charset():
+    """Delta-review round 2 (F-002 reopen): the scheme token echoed in the
+    boot-failure diagnosis must be extracted STRUCTURALLY — everything
+    before the first ``://`` — not by a charset check on a bare split
+    token. The shipped charset-only guard fullmatched colon-less secrets
+    (``hunter2golden``) and echoed them verbatim into the RuntimeError.
+
+    Every delimiter-less or URI-less shape (charset-conforming or not)
+    must emit the literal 'unparseable' placeholder with NO part of the
+    raw value in the message; a real URI shape must still echo its scheme
+    token (a blanket placeholder would gut the diagnosis value C6 pins).
+    """
+    from app.limiter import build_limiter
+
+    placeholder = "unparseable (no :// scheme delimiter in REDIS_URL)"
+    malformed_shapes = [
+        "hunter2golden",  # colon-less, scheme-charset-conforming secret
+        "x",  # minimal conforming token (reviewer probe)
+        "sup3r_s3cret",  # charset-illegal (safe under the old guard too)
+        "hunter2golden:golden",  # coloned non-URI: first segment is a secret
+        "://host-only",  # empty scheme prefix
+        "bad scheme://host",  # non-token prefix (space)
+    ]
+    for value in malformed_shapes:
+        with pytest.raises(RuntimeError) as excinfo:
+            build_limiter(value)
+        message = str(excinfo.value)
+        assert repr(placeholder) in message, (
+            "982C6-guard: a malformed REDIS_URL must emit the 'unparseable' "
+            f"placeholder, got: {message!r}"
+        )
+        assert value not in message, (
+            "982C6-guard: a malformed REDIS_URL echoed part of the raw "
+            f"value into the boot failure: value={value!r} message={message!r}"
+        )
+
+    # Positive control: a real URI shape still echoes ONLY its scheme token.
+    with pytest.raises(RuntimeError) as excinfo:
+        build_limiter("bogus://:hunter2golden@redis-host.invalid:6379/0")
+    message = str(excinfo.value)
+    assert "(scheme='bogus')" in message, (
+        "982C6-guard: a well-formed unregistered-scheme URI must still "
+        f"carry the scheme-token diagnosis, got: {message!r}"
+    )
+    assert "hunter2golden" not in message
+
 @pytest.mark.asyncio
 async def test_curator_sites_bounded_marker_probe(caplog):
     """Final-critic r2 B4: the three curator sibling fixes are pinned by an
