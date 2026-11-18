@@ -28,6 +28,7 @@ import types
 from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -915,6 +916,7 @@ def test_probe_lance_query_failure_is_no_evidence(tmp_path):
     fake_ldb = MagicMock()
     fake_db = fake_ldb.connect.return_value
     fake_db.table_names.return_value = ["chunks"]
+    fake_db.list_tables.return_value = SimpleNamespace(tables=["chunks"], page_token=None)
     fake_tbl = fake_db.open_table.return_value
     fake_tbl.schema.names = ["file_id"]
     fake_tbl.count_rows.return_value = 1
