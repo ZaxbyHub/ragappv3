@@ -102,11 +102,14 @@ family (#982) and the two reindex duplicate-accounting edges disclosed at PR
   duplicates only and never persists a retry scope). The mixed abort's
   transient failures ride along as `transient_failed_ids` — transport
   metadata the runner pops before persistence and folds into the settled
-  `failed` count WITHOUT ever entering the retry scope, so terminal
-  settlement preserves the distinct transient+duplicate accounting
-  (delta-review r2: without it the runner's cross-attempt recount saw an
-  empty transient input and silently dropped the transient from the
-  persisted count). A PURE-transient staged abort keeps the empty global
+  `failed` count WITHOUT ever entering the retry scope, so EVERY terminal
+  settlement recount (the below-cap duplicate-only arm AND the attempt-cap
+  arm — reachable on the first attempt at the supported
+  `jobs_max_attempts=1` setting) preserves the distinct transient+
+  duplicate accounting (delta-review r2/r3: without the fold the runner's
+  cross-attempt recounts saw an empty transient input and silently
+  dropped the transient from the persisted count). A PURE-transient
+  staged abort keeps the empty global
   shape so the retry re-stages the FULL scope and can complete. No
   narrowed staging is licensed (the staged table is a global replacement —
   the refusal guard stays).

@@ -4793,10 +4793,16 @@ class BackgroundProcessor:
                     # attempts' duplicates), matching the completed arm.
                     # failed_ids was popped above — the local is the only
                     # surviving copy of this attempt's transient failures
-                    # (Stage B review r1).
+                    # (Stage B review r1). Delta-review r3: a mixed staged
+                    # abort reaches the CAP arm first when
+                    # jobs_max_attempts == 1 (a supported config), so this
+                    # recount folds attempt_transient_ids in exactly like
+                    # the below-cap duplicate-only arm or it drops the
+                    # transients the same way that arm did.
                     fail_result["failed"] = len(
                         {
                             *(int(i) for i in failed_ids),
+                            *(int(i) for i in attempt_transient_ids),
                             *cumulative_duplicate_ids,
                         }
                     )

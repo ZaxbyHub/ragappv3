@@ -1582,6 +1582,97 @@ async def test_mixed_staged_abort_runner_settles_count_with_transients(
         lease_conn.close()
 
 
+async def test_mixed_staged_abort_cap_settlement_keeps_transient_count(
+    tmp_path, monkeypatch
+):
+    """Delta-review r3 F-1: the attempt-cap settlement is checked BEFORE the
+    duplicate-only arm, and jobs_max_attempts=1 is a supported config — a
+    first-attempt mixed staged abort therefore settles via the CAP arm,
+    whose recount had the same gap r2 F-1 fixed below-cap (transients
+    dropped from 'failed'). The cap recount now folds attempt_transient_ids
+    in like every other terminal recount.
+    """
+    import json as _json
+    import sqlite3
+
+    from app.config import settings
+    from app.models.database import SQLiteConnectionPool, run_migrations
+    from app.services.background_tasks import BackgroundProcessor
+    from app.services.document_processor import DuplicateFileError
+    from app.services.job_lease import JobLease, ensure_jobs_schema
+
+    db_path = str(tmp_path / "mixed_cap.db")
+    run_migrations(db_path)
+    conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    lease_conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+    lease_conn.row_factory = sqlite3.Row
+    try:
+        ensure_jobs_schema(conn)
+        conn.execute(
+            "INSERT INTO jobs (queue, payload_json, status)"
+            " VALUES ('reindex', ?, 'pending')",
+            (_json.dumps({"vault_id": 1}),),
+        )
+        conn.commit()
+        monkeypatch.setattr(settings, "jobs_max_attempts", 1)
+
+        bp = BackgroundProcessor(pool=pool, retry_delay=0.05)
+
+        async def _producer(job_id, vault_id, retry_file_ids=None):  # noqa: ARG001
+            return (
+                "failed",
+                {
+                    "processed": 0,
+                    "failed": 2,
+                    "details": [
+                        "file_id=7: DUPLICATE_FILE: duplicate",
+                        "file_id=9: transient parse failure",
+                    ],
+                    "transient_failed_ids": [9],
+                    "duplicate_file_ids": [7],
+                },
+                DuplicateFileError("dup"),
+            )
+
+        monkeypatch.setattr(bp, "_reindex_embed_all", _producer)
+
+        lease = JobLease(lease_conn, reclaim_timeout_seconds=300.0, max_attempts=1)
+        row = lease.claim("reindex", "mixed-cap-worker")
+        assert row is not None
+        row = dict(row) if not isinstance(row, dict) else row
+        row["attempts"] = 1
+        await bp._run_reindex_job_row(row, "mixed-cap-worker")  # noqa: SLF001
+
+        jobs_row = conn.execute(
+            "SELECT status, error, result_json, payload_json FROM jobs"
+            " WHERE queue = 'reindex' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert jobs_row["status"] == "failed", (
+            f"982r3F1: cap settlement fails the job; {jobs_row['status']!r}"
+        )
+        assert (jobs_row["error"] or "").startswith("attempt_cap_exceeded"), (
+            "982r3F1: the cap arm settles this path (max_attempts=1) and "
+            f"must say so; error={jobs_row['error']!r}"
+        )
+        result_json = _json.loads(jobs_row["result_json"] or "{}")
+        assert result_json.get("failed") == 2, (
+            "982r3F1: the CAP recount must preserve the distinct "
+            "transient+duplicate count exactly like the below-cap arm; "
+            f"result={result_json}"
+        )
+        assert result_json.get("duplicate_file_ids") == [7]
+        assert "transient_failed_ids" not in result_json
+        assert "failed_ids" not in result_json
+        payload = _json.loads(jobs_row["payload_json"] or "{}")
+        assert "retry_file_ids" not in payload
+    finally:
+        pool.close_all()
+        conn.close()
+        lease_conn.close()
+
+
 def test_limiter_info_log_channel_bounded_for_uncolonned_userinfo(caplog):
     """Review F-003/A-1a (pr1169-20261117): the boot INFO line logs
     redact_url(storage_uri); redact_url does not mask username-only
