@@ -96,6 +96,15 @@ def test_bogus_scheme_failure_never_surfaces_credential_uri():
 
 def test_valid_and_memory_uris_still_construct():
     """Positive pairing: a registered scheme and the no-Redis fallback keep
-    constructing the limiter (the redaction must not break boot wiring)."""
-    assert isinstance(build_limiter("redis://localhost:6379/0"), WhitelistLimiter)
+    constructing the limiter (the redaction must not break boot wiring).
+
+    CHECK_WRONG amend (base-sync with master 5eafe250): the URL host is
+    deliberately UNRESOLVABLE — tests/conftest.py's _refuse_real_redis
+    guard (added upstream) refuses loopback hosts, and an unresolvable
+    host is its sanctioned way to exercise a constructing-without-
+    connecting path; redis clients connect lazily either way, so the
+    assertion's semantics are unchanged."""
+    assert isinstance(
+        build_limiter("redis://redis-982c6.invalid:6379/0"), WhitelistLimiter
+    )
     assert isinstance(build_limiter(""), WhitelistLimiter)
