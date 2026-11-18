@@ -62,6 +62,43 @@ async def test_preflight_fails_fast_with_code(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_preflight_policy_and_probe_target_the_editorial_url(monkeypatch):
+    """The editorial mode resolves its OWN endpoint (mirrors the runtime
+    resolver in draft_pipeline._provider_base_url); the real
+    _provider_base_url_for_mode is exercised, not stubbed."""
+    monkeypatch.setattr(dr.settings, "ollama_chat_url", "http://thinking.example:8001")
+    monkeypatch.setattr(dr.settings, "instant_chat_url", "")
+    monkeypatch.setattr(dr.settings, "editorial_chat_url", "http://editorial.example:8002")
+
+    policy_urls = []
+    probed = []
+
+    def _policy(url, *, sensitive):
+        policy_urls.append(url)
+
+    async def _reach(url):
+        probed.append(url)
+        return True
+
+    monkeypatch.setattr(dr, "assert_provider_allowed", _policy)
+    monkeypatch.setattr(dr, "_provider_reachable", _reach)
+    await dr._preflight_providers(sensitive=False)
+
+    assert "http://editorial.example:8002" in policy_urls
+    assert "http://editorial.example:8002" in probed
+    assert dr._provider_base_url_for_mode("editorial") == "http://editorial.example:8002"
+    # thinking and instant still resolve to the thinking endpoint
+    assert policy_urls.count("http://thinking.example:8001") == 2
+    assert probed.count("http://thinking.example:8001") == 2
+
+
+def test_editorial_url_falls_back_to_thinking_when_unset(monkeypatch):
+    monkeypatch.setattr(dr.settings, "ollama_chat_url", "http://thinking.example:8001")
+    monkeypatch.setattr(dr.settings, "editorial_chat_url", "")
+    assert dr._provider_base_url_for_mode("editorial") == "http://thinking.example:8001"
+
+
+@pytest.mark.asyncio
 async def test_preflight_passes_when_all_providers_reachable(monkeypatch):
     monkeypatch.setattr(dr, "_assert_provider_policy", lambda *, sensitive: None)
 

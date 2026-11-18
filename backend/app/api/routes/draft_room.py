@@ -1988,8 +1988,11 @@ def _provider_base_url_for_mode(logical_mode: str) -> str:
 
     Mirrors ``draft_pipeline._provider_base_url``: SPEC section 14.2 requires
     single-model deployments to work, so an unconfigured ``instant`` endpoint
-    degrades to the ``thinking`` one instead of failing.
+    degrades to the ``thinking`` one instead of failing. ``editorial`` uses
+    its own endpoint when set, else the ``thinking`` one.
     """
+    if logical_mode == "editorial":
+        return (settings.editorial_chat_url or settings.ollama_chat_url or "").strip()
     if logical_mode == "instant":
         return (settings.instant_chat_url or settings.ollama_chat_url or "").strip()
     return (settings.ollama_chat_url or "").strip()
@@ -2005,8 +2008,8 @@ def _assert_revision_nonempty(row) -> None:
     once approved a zero-character revision whose hash was the SHA-256 of
     the empty string.
 
-    Accepts a DraftRevisionRecord (attribute access) or a sqlite3.Row
-    (subscript access). Text that was not loaded is not judged empty here;
+    Accepts a DraftRevisionRecord (attribute access) or a dict (key
+    access). Text that was not loaded is not judged empty here;
     the hash check still catches the known empty revision.
     """
     if row is None:
@@ -2145,6 +2148,39 @@ def _stale_lock_conflict() -> DraftConflictError:
     err = DraftConflictError("draft was modified by another request; reload and retry")
     err.code = "stale_lock_version"
     return err
+
+
+def _sync_is_idempotent_replay(
+    conn: sqlite3.Connection,
+    *,
+    draft_id: int,
+    owner_id: int,
+    idempotency_key: Optional[str],
+    request_fingerprint: str,
+) -> bool:
+    """Read-only pre-check mirroring ``_sync_enqueue_compile``'s replay match.
+
+    True only when ``idempotency_key`` already names a job on this draft with
+    an identical request fingerprint, i.e. exactly the case the enqueue
+    returns unchanged. Routes use it to skip the live provider probe for a
+    genuine replay (the stored response must not depend on provider
+    liveness). A missing key or a different-fingerprint reuse returns False,
+    so the normal preflight and the enqueue's 409 conflict still apply.
+    """
+    if idempotency_key is None:
+        return False
+    existing = conn.execute(
+        "SELECT draft_id, input_json FROM draft_jobs "
+        "WHERE created_by = ? AND idempotency_key = ?",
+        (owner_id, idempotency_key),
+    ).fetchone()
+    if existing is None:
+        return False
+    stored = _json_or(existing[1], {})
+    return (
+        int(existing[0]) == draft_id
+        and stored.get("request_fingerprint") == request_fingerprint
+    )
 
 
 def _sync_enqueue_compile(
@@ -3865,7 +3901,6 @@ async def retry_draft_job(
     idempotency_key = _validate_idempotency_key(
         request.headers.get(_IDEMPOTENCY_HEADER)
     )
-    await _preflight_providers(sensitive=draft.tier == "sensitive")
 
     def _prepare_retry() -> dict[str, Any]:
         # The *compile* fingerprint hashes the NORMALIZED stage (SPEC section
@@ -3898,6 +3933,19 @@ async def retry_draft_job(
         parent_job_id=job_id,
         input_snapshot=prepared["input_snapshot"],
     )
+    # Provider preflight runs before any job row exists, but a genuine
+    # Idempotency-Key replay returns the stored job and must not depend on a
+    # live provider probe.
+    if not await _run_store(
+        lambda: _sync_is_idempotent_replay(
+            db,
+            draft_id=draft_id,
+            owner_id=owner_id,
+            idempotency_key=idempotency_key,
+            request_fingerprint=fingerprint,
+        )
+    ):
+        await _preflight_providers(sensitive=draft.tier == "sensitive")
     # Bound by the drained unit below; pre-initialized purely so the unit's
     # `nonlocal` target exists (the unit either assigns it or raises).
     job: Optional[DraftJobRecord] = None
@@ -3996,7 +4044,6 @@ async def compile_draft(
     idempotency_key = _validate_idempotency_key(
         request.headers.get(_IDEMPOTENCY_HEADER)
     )
-    await _preflight_providers(sensitive=draft.tier == "sensitive")
 
     def _prepare_compile() -> dict[str, Any]:
         # The *compile* fingerprint hashes the NORMALIZED stage (SPEC section
@@ -4023,6 +4070,19 @@ async def compile_draft(
         parent_job_id=None,
         input_snapshot=prepared["input_snapshot"],
     )
+    # Provider preflight runs before any job row exists, but a genuine
+    # Idempotency-Key replay returns the stored job and must not depend on a
+    # live provider probe.
+    if not await _run_store(
+        lambda: _sync_is_idempotent_replay(
+            db,
+            draft_id=draft_id,
+            owner_id=owner_id,
+            idempotency_key=idempotency_key,
+            request_fingerprint=fingerprint,
+        )
+    ):
+        await _preflight_providers(sensitive=draft.tier == "sensitive")
     # Bound by the drained unit below; pre-initialized purely so the unit's
     # `nonlocal` target exists (the unit either assigns it or raises).
     job: Optional[DraftJobRecord] = None

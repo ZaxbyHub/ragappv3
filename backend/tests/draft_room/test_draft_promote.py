@@ -1617,11 +1617,14 @@ class TestPromoteCancellation(DraftPromoteTestBase):
 
         storage = DraftInputStorage(Path(settings.data_dir) / "draft-room")
 
+        enqueue_entered = asyncio.Event()
+
         class _SlowThenCancelledProcessor:
             async def enqueue(self, **kwargs):
-                # Give the killer task a chance to fire the cancel scope
-                # while this coroutine is still the one running.
-                await anyio.sleep(0.2)
+                # Signal the killer, then give it a chance to fire the cancel
+                # scope while this coroutine is still the one running.
+                enqueue_entered.set()
+                await anyio.sleep(30)
 
         outcome: dict = {}
 
@@ -1644,7 +1647,11 @@ class TestPromoteCancellation(DraftPromoteTestBase):
             async with anyio.create_task_group() as tg:
 
                 async def _killer():
-                    await anyio.sleep(0.05)
+                    # Fire only once promotion has reached ``enqueue`` (not on
+                    # a wall-clock timer): the DB/file steps before it run in
+                    # worker threads, so a fixed delay races them under load
+                    # and cancels mid-pipeline, before ids are recorded.
+                    await enqueue_entered.wait()
                     tg.cancel_scope.cancel()
 
                 tg.start_soon(_killer)

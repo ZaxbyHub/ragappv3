@@ -431,11 +431,7 @@ class TestMaintenanceAgainstRealApp(unittest.TestCase):
         response = self.client.get("/api/csrf-token")
         self.assertEqual(response.status_code, 200)
         token = response.json()["csrf_token"]
-<<<<<<< HEAD
-        cookie = self.client.cookies.get("meridian-csrf-token")
-=======
         cookie = self.client.cookies.get(CSRF_COOKIE_NAME)
->>>>>>> origin/master
         self.assertIsNotNone(cookie)
         return cookie, token
 

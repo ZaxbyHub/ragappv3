@@ -63,3 +63,67 @@ def test_compose_with_sections_passes():
         critic=OutlineCritic(verdict="approved", findings=[]),
     )
     dp._guard_outline_mode_and_sections(ok, _Ctx())
+
+
+# -- call sites inside the real _CompileRun._stage_outline ------------------
+# The helper tests above do not prove _stage_outline CALLS the guard. These
+# drive the real stage on a bare instance (built with __new__, collaborators
+# stubbed) down both its paths: the fresh model call and checkpoint reuse.
+
+
+def _bare_outline_run(*, outline: OutlineArtifact, reuse: bool):
+    import types
+
+    from app.services import draft_pipeline as dp
+
+    run = dp._CompileRun.__new__(dp._CompileRun)
+    run._ctx = types.SimpleNamespace(
+        mode="compose",
+        manuscript_inputs=[],
+        compile_world_sha256="w",
+        prompt_bundle_version="v",
+        brief_hash="b",
+        brief_json="{}",
+        max_sections=10,
+    )
+    run._packet = OutlineArtifact(
+        mode="compose", sections=[], voice_rules=[],
+        critic=OutlineCritic(verdict="approved", findings=[]),
+    )
+    run._source_snapshot_sha256 = "s"
+    run._outline = None
+    persisted = []
+
+    async def _persist(*args, **kwargs):
+        persisted.append(args)
+
+    async def _call_model(**kwargs):
+        return outline, None
+
+    record = types.SimpleNamespace(artifact_json=outline.model_dump_json())
+    run._reusable = lambda stage, input_sha: record if reuse else None
+    run._call_model = _call_model
+    run._render_context = lambda upstream, **extra: {}
+    run._persist_stage = _persist
+    return run, persisted
+
+
+def test_stage_outline_fresh_zero_sections_fails_outline_empty():
+    import asyncio
+
+    run, persisted = _bare_outline_run(outline=_artifact("compose"), reuse=False)
+    with pytest.raises(CompileFailure) as exc:
+        asyncio.run(run._stage_outline())
+    assert exc.value.code == "outline_empty"
+    assert run._outline is None
+    assert persisted == []
+
+
+def test_stage_outline_reused_checkpoint_with_zero_sections_fails_outline_empty():
+    import asyncio
+
+    run, _ = _bare_outline_run(outline=_artifact("compose"), reuse=True)
+    with pytest.raises(CompileFailure) as exc:
+        asyncio.run(run._stage_outline())
+    assert exc.value.code == "outline_empty"
+    assert run._outline is None

@@ -181,11 +181,7 @@ class _CSRFAdversarialBase(unittest.TestCase):
         resp = self.client.get("/api/csrf-token")
         assert resp.status_code == 200, resp.text
         token = resp.json()["csrf_token"]
-<<<<<<< HEAD
-        cookie = resp.cookies.get("meridian-csrf-token")
-=======
         cookie = resp.cookies.get(CSRF_COOKIE_NAME)
->>>>>>> origin/master
         if clear_jar:
             self.client.cookies.clear()
         return token, cookie
@@ -201,11 +197,7 @@ class _CSRFAdversarialBase(unittest.TestCase):
         if token is not None:
             kwargs["headers"] = {"X-CSRF-Token": token}
         if cookie is not None:
-<<<<<<< HEAD
-            kwargs["cookies"] = {"meridian-csrf-token": cookie}
-=======
             kwargs["cookies"] = {CSRF_COOKIE_NAME: cookie}
->>>>>>> origin/master
         kwargs.update(extra)
         return self.client.post("/api/auth/register", **kwargs)
 
@@ -436,11 +428,7 @@ class TestCSRFCookieAttributes(_CSRFAdversarialBase):
         resp = self.client.get("/api/csrf-token")
         self.assertEqual(resp.status_code, 200)
         body_token = resp.json()["csrf_token"]
-<<<<<<< HEAD
-        cookie_token = resp.cookies.get("meridian-csrf-token")
-=======
         cookie_token = resp.cookies.get(CSRF_COOKIE_NAME)
->>>>>>> origin/master
         self.assertEqual(
             body_token,
             cookie_token,
@@ -694,14 +682,10 @@ class TestCSRFForgery(_CSRFAdversarialBase):
         BASE_URL = "http://localhost:9090/api"
         resp = requests.get(f"{BASE_URL}/csrf-token", timeout=5)
         token = resp.json()["csrf_token"]
-<<<<<<< HEAD
-        cookie = resp.cookies.get("meridian-csrf-token")
-=======
         cookie = resp.cookies.get(CSRF_COOKIE_NAME)
->>>>>>> origin/master
         fake = "fake_token_for_splitting"
         for order in [(cookie, fake), (fake, cookie)]:
-            cookie_header = "; ".join([f"meridian-csrf-token={c}" for c in order])
+            cookie_header = "; ".join([f"{CSRF_COOKIE_NAME}={c}" for c in order])
             resp = requests.post(
                 f"{BASE_URL}/auth/register",
                 json={
@@ -740,11 +724,7 @@ class TestCSRFTokenLeakage(_CSRFAdversarialBase):
         """Confirm the body token and cookie are identical."""
         resp = self.client.get("/api/csrf-token")
         body_token = resp.json()["csrf_token"]
-<<<<<<< HEAD
-        cookie_token = resp.cookies.get("meridian-csrf-token")
-=======
         cookie_token = resp.cookies.get(CSRF_COOKIE_NAME)
->>>>>>> origin/master
         self.assertEqual(body_token, cookie_token)
 
     def test_csrf_cookie_name_not_prefixed(self):
@@ -752,11 +732,7 @@ class TestCSRFTokenLeakage(_CSRFAdversarialBase):
         resp = self.client.get("/api/csrf-token")
         set_cookie = resp.headers.get("Set-Cookie", "")
         self.assertIn(
-<<<<<<< HEAD
-            "meridian-csrf-token",
-=======
             CSRF_COOKIE_NAME,
->>>>>>> origin/master
             set_cookie,
             "Cookie name not found in Set-Cookie header",
         )
@@ -898,22 +874,14 @@ class TestCSRFEdgeCases(_CSRFAdversarialBase):
         BASE_URL = "http://localhost:9090/api"
         resp = requests.get(f"{BASE_URL}/csrf-token", timeout=5)
         token = resp.json()["csrf_token"]
-<<<<<<< HEAD
-        cookie = resp.cookies.get("meridian-csrf-token")
-=======
         cookie = resp.cookies.get(CSRF_COOKIE_NAME)
->>>>>>> origin/master
         resp = requests.post(
             f"{BASE_URL}/auth/register",
             json={
                 "username": random_username("multi_hdr"),
                 "password": "Password123!",
             },
-<<<<<<< HEAD
-            cookies={"meridian-csrf-token": cookie},
-=======
             cookies={CSRF_COOKIE_NAME: cookie},
->>>>>>> origin/master
             headers=[("X-CSRF-Token", token), ("X-CSRF-Token", "fake")],
             timeout=5,
         )
@@ -932,11 +900,7 @@ class TestCSRFEdgeCases(_CSRFAdversarialBase):
                 "password": "Password123!",
                 "X-CSRF-Token": token,  # In body, not header
             },
-<<<<<<< HEAD
-            cookies={"meridian-csrf-token": cookie},
-=======
             cookies={CSRF_COOKIE_NAME: cookie},
->>>>>>> origin/master
         )
         self.assertEqual(
             resp.status_code,
@@ -950,11 +914,7 @@ class TestCSRFEdgeCases(_CSRFAdversarialBase):
         resp = self.client.post(
             f"/api/auth/register?X-CSRF-Token={token}",
             json={"username": random_username("qs_csrf"), "password": "Password123!"},
-<<<<<<< HEAD
-            cookies={"meridian-csrf-token": cookie},
-=======
             cookies={CSRF_COOKIE_NAME: cookie},
->>>>>>> origin/master
         )
         self.assertEqual(
             resp.status_code,

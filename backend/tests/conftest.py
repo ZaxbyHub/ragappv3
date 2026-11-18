@@ -369,6 +369,7 @@ def _cache_bcrypt_hash_for_test_passwords():
     except Exception:
         pass
 _orig_from_url = None
+_orig_async_from_url = None
 
 
 def _reaches_a_real_redis(url) -> bool:
@@ -393,16 +394,28 @@ def _reaches_a_real_redis(url) -> bool:
     return any(ipaddress.ip_address(i[4][0]).is_loopback for i in infos)
 
 
-def _guarded_from_url(url, *args, **kwargs):
-    """redis.from_url wrapper that refuses production-shaped URLs."""
+def _refuse_real_redis(url) -> None:
     if _reaches_a_real_redis(url) and not os.environ.get("TEST_ALLOW_REAL_REDIS"):
         raise RuntimeError(
             f"test attempted to connect to a real Redis at {url!r}; "
             "use redis_url='' (no-Redis mode) or an unresolvable host"
         )
-    import redis as _redis_mod
 
-    return _redis_mod.from_url.__wrapped__(url, *args, **kwargs) if False else _orig_from_url(url, *args, **kwargs)
+
+def _guarded_from_url(url, *args, **kwargs):
+    """redis.from_url wrapper that refuses production-shaped URLs."""
+    _refuse_real_redis(url)
+    if _orig_from_url is None:
+        raise RuntimeError("redis.from_url guard installed without an original")
+    return _orig_from_url(url, *args, **kwargs)
+
+
+def _guarded_async_from_url(url, *args, **kwargs):
+    """redis.asyncio.from_url wrapper that refuses production-shaped URLs."""
+    _refuse_real_redis(url)
+    if _orig_async_from_url is None:
+        raise RuntimeError("redis.asyncio.from_url guard installed without an original")
+    return _orig_async_from_url(url, *args, **kwargs)
 
 
 def pytest_configure(config):
@@ -474,10 +487,13 @@ def pytest_configure(config):
     # with TEST_ALLOW_REAL_REDIS=1 only when a fixture has started a
     # throwaway instance.
     import redis as _redis
+    import redis.asyncio as _redis_asyncio
 
-    global _orig_from_url
+    global _orig_from_url, _orig_async_from_url
     _orig_from_url = _redis.from_url
     _redis.from_url = _guarded_from_url
+    _orig_async_from_url = _redis_asyncio.from_url
+    _redis_asyncio.from_url = _guarded_async_from_url
 
 
     app_keys = [
