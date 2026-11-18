@@ -2009,8 +2009,8 @@ def _assert_revision_nonempty(row) -> None:
     the empty string.
 
     Accepts a DraftRevisionRecord (attribute access) or a dict (key
-    access). Text that was not loaded is not judged empty here;
-    the hash check still catches the known empty revision.
+    access). Text that was not loaded fails closed (409 revision_empty):
+    callers must load content_md before calling this.
     """
     if row is None:
         raise DraftRoomHTTPError(
@@ -2024,8 +2024,8 @@ def _assert_revision_nonempty(row) -> None:
         text = getattr(row, "content_md", None)
         digest = getattr(row, "content_sha256", None)
     if text is None:
-        # Content was not loaded: the revision cannot be judged. Fail — a summary row reaching this guard would
-        # otherwise wave through a whitespace-only revision whose hash is not
+        # Content was not loaded, so the revision cannot be judged: fail
+        # closed. A summary row reaching this guard would otherwise wave through a whitespace-only revision whose hash is not
         # the empty-string hash. Every route that calls this loads content
         # (include_content=True, or the in-transaction SELECT of content_md).
         raise DraftRoomHTTPError(
