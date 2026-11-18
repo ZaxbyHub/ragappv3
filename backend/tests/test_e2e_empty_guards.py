@@ -54,10 +54,18 @@ class _Pool:
 @pytest.fixture()
 def world(tmp_path):
     from app.config import settings
+    from app.main import app
     from app.models.database import init_db, run_migrations
 
     old_data = settings.data_dir
     old_enabled = settings.draft_room_enabled
+    # _client() installs process-global overrides on the shared app; snapshot
+    # and restore them so later suites (e.g. test_memories_auth) are not
+    # served this module's fake authenticated user / CSRF bypass.
+    old_overrides = dict(app.dependency_overrides)
+    _missing = object()
+    old_db_pool = getattr(app.state, "db_pool", _missing)
+    old_csrf_manager = getattr(app.state, "csrf_manager", _missing)
     settings.data_dir = tmp_path
     settings.draft_room_enabled = True
     try:
@@ -73,6 +81,14 @@ def world(tmp_path):
     finally:
         settings.data_dir = old_data
         settings.draft_room_enabled = old_enabled
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(old_overrides)
+        for name, old in (("db_pool", old_db_pool), ("csrf_manager", old_csrf_manager)):
+            if old is _missing:
+                if hasattr(app.state, name):
+                    delattr(app.state, name)
+            else:
+                setattr(app.state, name, old)
 
 
 def _client(pool):
