@@ -6,7 +6,10 @@ review demanded without touching the frozen bytes (anti-tampering):
 fingerprint-VALUE pins, non-destructive migration semantics, the full
 A/B resolver tuple (a re-raising exposure handler must fail), the
 disabled-mode composition (a newline must not satisfy AC8's intent),
-CSRF RETENTION on mutating routes, and the fingerprint helper's shape.
+and the fingerprint helper's shape. The mutating-route CSRF-retention
+pin moved to ``tests/test_c04_prompts_read_csrf.py`` (issue #945 AC2's
+dedicated file); the fingerprint pins were superseded by the dedicated
+``tests/test_admin_scope_fingerprint.py`` (issue #945 AC3).
 
 The seeded_env/prompts_client fixtures intentionally mirror the frozen
 file (the manifest pins its bytes, so shared fixtures would edit frozen
@@ -271,45 +274,6 @@ def test_disabled_mode_composition_is_directive_append():
     assert CITATION_INSTRUCTION in base_none
     assert CITATION_INSTRUCTION not in base_off
     assert CITATION_DISABLED_DIRECTIVE in base_off
-
-
-# ---------------------------------------------------------------------------
-# CSRF retention — removal was scoped to reads; mutations keep the handshake
-# ---------------------------------------------------------------------------
-
-
-def test_mutating_prompts_routes_still_depend_on_csrf_protect():
-    import app.api.routes.prompts as prompts_module
-    import app.security as security_module
-
-    def _walk(node):
-        yield node
-        for sub in getattr(node, "dependencies", None) or []:
-            yield from _walk(sub)
-
-    mutating = [
-        ("POST", "/prompts"),
-        ("POST", "/prompts/{version}/activate"),
-        ("POST", "/prompts/ab-experiments"),
-        ("POST", "/prompts/ab-experiments/{experiment_id}/end"),
-    ]
-    matched = 0
-    for method, path in mutating:
-        hit = False
-        for route in prompts_module.router.routes:
-            methods = getattr(route, "methods", None) or set()
-            if method in methods and route.path == path:
-                dependant = getattr(route, "dependant", None)
-                nodes = list(_walk(dependant)) if dependant else []
-                assert any(
-                    getattr(n, "call", None) is security_module.csrf_protect
-                    for n in nodes
-                ), f"{method} {path} lost its csrf_protect dependency"
-                hit = True
-                break
-        assert hit, f"{method} {path} not found on the prompts router"
-        matched += 1
-    assert matched == len(mutating)
 
 
 # ---------------------------------------------------------------------------
