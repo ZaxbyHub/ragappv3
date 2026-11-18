@@ -17,8 +17,8 @@ PR: #1147
   provider (`GET /v1/models`, short timeout) after the origin-allowlist check
   and before the job is created; an unreachable provider answers 503
   `provider_unreachable` instead of burning a ~10 minute pipeline run first.
-  A genuine `Idempotency-Key` replay returns the stored job without a live
-  probe, so a replay of an accepted request stays 202 with the same job id
+  A genuine `Idempotency-Key` replay returns the stored job without the
+  provider policy check or live probe, so a replay of an accepted request stays 202 with the same job id
   even while a provider is down. The editorial lane's own endpoint
   (`DRAFT_EDITORIAL_CHAT_URL`, falling back to the thinking URL) is the one
   checked and policy-gated, matching the runtime resolver.

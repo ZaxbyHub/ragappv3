@@ -1651,8 +1651,13 @@ class TestPromoteCancellation(DraftPromoteTestBase):
                     # a wall-clock timer): the DB/file steps before it run in
                     # worker threads, so a fixed delay races them under load
                     # and cancels mid-pipeline, before ids are recorded.
-                    await enqueue_entered.wait()
-                    tg.cancel_scope.cancel()
+                    # Bounded so a promotion that never reaches enqueue fails
+                    # fast below instead of hanging the task group.
+                    try:
+                        with anyio.fail_after(30):
+                            await enqueue_entered.wait()
+                    finally:
+                        tg.cancel_scope.cancel()
 
                 tg.start_soon(_killer)
                 tg.start_soon(_body)
