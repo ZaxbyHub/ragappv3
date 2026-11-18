@@ -945,7 +945,10 @@ def stream_chat_response(
         return StreamingResponse(
             error_generator(),
             media_type="text/event-stream",
-            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+            headers={
+                "X-Accel-Buffering": "no",
+                "Cache-Control": "no-cache, no-transform",
+            },
         )
 
     # Shared mutable state between the outer and inner generators. The inner
@@ -1673,7 +1676,10 @@ def stream_chat_response(
             return StreamingResponse(
                 _resumable_event_stream(entry, last_event_id),
                 media_type="text/event-stream",
-                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+                headers={
+                    "X-Accel-Buffering": "no",
+                    "Cache-Control": "no-cache, no-transform",
+                },
             )
         # Loop-atomic check-and-insert (no await between lookup and insert):
         # a concurrent duplicate POST for a live turn attaches as a second
@@ -1702,13 +1708,19 @@ def stream_chat_response(
         return StreamingResponse(
             _resumable_event_stream(entry, 0),
             media_type="text/event-stream",
-            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+            headers={
+                "X-Accel-Buffering": "no",
+                "Cache-Control": "no-cache, no-transform",
+            },
         )
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache, no-transform",
+        },
     )
 
 

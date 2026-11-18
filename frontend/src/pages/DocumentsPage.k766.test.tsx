@@ -324,7 +324,7 @@ describe('DocumentsPage K766 acceptance checks', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     // Any CSRF cookie seeded by a test must not leak into the next one.
-    document.cookie = 'X-CSRF-Token=; path=/; max-age=0';
+    document.cookie = 'meridian-csrf-token=; path=/; max-age=0';
     vi.restoreAllMocks();
   });
 
@@ -367,7 +367,7 @@ describe('DocumentsPage K766 acceptance checks', () => {
 
   it('pagehide with a cached CSRF credential issues the keepalive delete', { timeout: 30_000 }, async () => {
     // Seed the readable CSRF cookie the keepalive channel reads.
-    document.cookie = 'X-CSRF-Token=test-token';
+    document.cookie = 'meridian-csrf-token=test-token';
 
     let utils!: ReturnType<typeof render>;
     await act(async () => {

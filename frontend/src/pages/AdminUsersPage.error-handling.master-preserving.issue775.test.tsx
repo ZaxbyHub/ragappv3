@@ -31,11 +31,13 @@ vi.mock('@/stores/useAuthStore', () => ({
 vi.mock('@/lib/api', () => ({
   default: {
     get: vi.fn(),
-    patch: vi.fn(),
-    delete: vi.fn(),
     post: vi.fn(),
+    delete: vi.fn(),
     put: vi.fn(),
   },
+  withMethodOverride: () => ({ 'X-HTTP-Method-Override': 'PATCH' }),
+  METHOD_OVERRIDE_HEADER: 'X-HTTP-Method-Override',
+  ERROR_CODE_HEADER: 'X-Meridian-Error-Code',
 }));
 
 vi.mock('sonner', () => ({
@@ -267,9 +269,7 @@ describe('AdminUsersPage error handling', () => {
       }
       return Promise.resolve({ data: {} });
     });
-    (api.default.patch as ReturnType<typeof vi.fn>).mockImplementation(() => Promise.resolve({ data: {} }));
     (api.default.delete as ReturnType<typeof vi.fn>).mockImplementation(() => Promise.resolve({ data: {} }));
-    (api.default.post as ReturnType<typeof vi.fn>).mockImplementation(() => Promise.resolve({ data: {} }));
     (api.default.put as ReturnType<typeof vi.fn>).mockImplementation(() => Promise.resolve({ data: {} }));
   });
 
@@ -335,7 +335,7 @@ describe('AdminUsersPage error handling', () => {
   // ============================================================
   it('handleRoleChange: surfaces backend detail from API error', async () => {
     const api = await import('@/lib/api');
-    api.default.patch.mockRejectedValueOnce(makeApiError('Cannot change role of superadmin'));
+    api.default.post.mockRejectedValueOnce(makeApiError('Cannot change role of superadmin'));
 
     await act(async () => { render(<AdminUsersPage />); });
     // #771: table-scoped (below-sm card list duplicates the text)
@@ -354,7 +354,7 @@ describe('AdminUsersPage error handling', () => {
 
   it('handleRoleChange: uses generic fallback when error has no response.detail', async () => {
     const api = await import('@/lib/api');
-    api.default.patch.mockRejectedValueOnce(makeNetworkError());
+    api.default.post.mockRejectedValueOnce(makeNetworkError());
 
     await act(async () => { render(<AdminUsersPage />); });
     // #771: table-scoped (below-sm card list duplicates the text)
@@ -375,7 +375,7 @@ describe('AdminUsersPage error handling', () => {
   // ============================================================
   it('handleActiveToggle: surfaces backend detail from API error', async () => {
     const api = await import('@/lib/api');
-    api.default.patch.mockRejectedValueOnce(makeApiError('User is protected'));
+    api.default.post.mockRejectedValueOnce(makeApiError('User is protected'));
 
     await act(async () => { render(<AdminUsersPage />); });
     // #771: table-scoped (below-sm card list duplicates the text)
@@ -394,7 +394,7 @@ describe('AdminUsersPage error handling', () => {
 
   it('handleActiveToggle: uses generic fallback when error has no response.detail', async () => {
     const api = await import('@/lib/api');
-    api.default.patch.mockRejectedValueOnce(makeNetworkError());
+    api.default.post.mockRejectedValueOnce(makeNetworkError());
 
     await act(async () => { render(<AdminUsersPage />); });
     // #771: table-scoped (below-sm card list duplicates the text)
@@ -472,7 +472,7 @@ describe('AdminUsersPage error handling', () => {
   // ============================================================
   it('handleSaveEdit: surfaces backend detail from API error', async () => {
     const api = await import('@/lib/api');
-    api.default.patch.mockRejectedValueOnce(makeApiError('Username already taken'));
+    api.default.post.mockRejectedValueOnce(makeApiError('Username already taken'));
 
     await act(async () => { render(<AdminUsersPage />); });
     // #771: table-scoped (below-sm card list duplicates the text)
@@ -500,7 +500,7 @@ describe('AdminUsersPage error handling', () => {
 
   it('handleSaveEdit: uses generic fallback when error has no response.detail', async () => {
     const api = await import('@/lib/api');
-    api.default.patch.mockRejectedValueOnce(makeNetworkError());
+    api.default.post.mockRejectedValueOnce(makeNetworkError());
 
     await act(async () => { render(<AdminUsersPage />); });
     // #771: table-scoped (below-sm card list duplicates the text)
@@ -529,7 +529,7 @@ describe('AdminUsersPage error handling', () => {
   // ============================================================
   it('handleResetPassword: surfaces backend detail from API error', async () => {
     const api = await import('@/lib/api');
-    api.default.patch.mockRejectedValueOnce(makeApiError('Password does not meet complexity requirements'));
+    api.default.post.mockRejectedValueOnce(makeApiError('Password does not meet complexity requirements'));
 
     await act(async () => { render(<AdminUsersPage />); });
     // #771: table-scoped (below-sm card list duplicates the text)
@@ -564,7 +564,7 @@ describe('AdminUsersPage error handling', () => {
 
   it('handleResetPassword: uses generic fallback when error has no response.detail', async () => {
     const api = await import('@/lib/api');
-    api.default.patch.mockRejectedValueOnce(makeNetworkError());
+    api.default.post.mockRejectedValueOnce(makeNetworkError());
 
     await act(async () => { render(<AdminUsersPage />); });
     // #771: table-scoped (below-sm card list duplicates the text)

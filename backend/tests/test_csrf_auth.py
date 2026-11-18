@@ -65,7 +65,7 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.models.database import SQLiteConnectionPool, init_db, run_migrations
-from app.security import CSRFManager
+from app.security import CSRF_COOKIE_NAME, CSRFManager
 
 
 class TestCSRFProtection(unittest.TestCase):
@@ -147,7 +147,7 @@ class TestCSRFProtection(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         csrf_token = response.json()["csrf_token"]
         # Get the cookie from response
-        csrf_cookie = response.cookies.get("X-CSRF-Token")
+        csrf_cookie = response.cookies.get(CSRF_COOKIE_NAME)
         self.assertIsNotNone(csrf_cookie, "CSRF cookie should be set")
         self.assertIsNotNone(csrf_token, "CSRF token should be returned")
         return csrf_cookie, csrf_token
@@ -168,7 +168,7 @@ class TestCSRFProtection(unittest.TestCase):
         reg_response = self.client.post(
             "/api/auth/register",
             json={"username": "logintest", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={CSRF_COOKIE_NAME: csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -191,7 +191,7 @@ class TestCSRFProtection(unittest.TestCase):
         reg_response = self.client.post(
             "/api/auth/register",
             json={"username": "refreshtest", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={CSRF_COOKIE_NAME: csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -207,7 +207,7 @@ class TestCSRFProtection(unittest.TestCase):
         login_response = self.client.post(
             "/api/auth/login",
             json={"username": "refreshtest", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={CSRF_COOKIE_NAME: csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -233,7 +233,7 @@ class TestCSRFProtection(unittest.TestCase):
         reg_response = self.client.post(
             "/api/auth/register",
             json={"username": "logouttest", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={CSRF_COOKIE_NAME: csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -249,7 +249,7 @@ class TestCSRFProtection(unittest.TestCase):
         login_response = self.client.post(
             "/api/auth/login",
             json={"username": "logouttest", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={CSRF_COOKIE_NAME: csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -275,7 +275,7 @@ class TestCSRFProtection(unittest.TestCase):
         reg_response = self.client.post(
             "/api/auth/register",
             json={"username": "updatetest", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={CSRF_COOKIE_NAME: csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -291,7 +291,7 @@ class TestCSRFProtection(unittest.TestCase):
         login_response = self.client.post(
             "/api/auth/login",
             json={"username": "updatetest", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={CSRF_COOKIE_NAME: csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -322,7 +322,7 @@ class TestCSRFProtection(unittest.TestCase):
         reg_response = self.client.post(
             "/api/auth/register",
             json={"username": "cpwcsrf", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={CSRF_COOKIE_NAME: csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -334,7 +334,7 @@ class TestCSRFProtection(unittest.TestCase):
         login_response = self.client.post(
             "/api/auth/login",
             json={"username": "cpwcsrf", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={CSRF_COOKIE_NAME: csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -378,7 +378,7 @@ class TestCSRFProtection(unittest.TestCase):
         reg_response = self.client.post(
             "/api/auth/register",
             json={"username": "setupuser", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={CSRF_COOKIE_NAME: csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -398,7 +398,7 @@ class TestCSRFProtection(unittest.TestCase):
         response = self.client.post(
             "/api/auth/register",
             json={"username": "validuser", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie},
+            cookies={CSRF_COOKIE_NAME: csrf_cookie},
             headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(
@@ -452,7 +452,7 @@ class TestCSRFProtection(unittest.TestCase):
         # Header equals the first transmitted (app-scoped) value -> accepted
         response = self._post_with_raw_cookie(
             "/api/auth/register",
-            cookie_header=f"X-CSRF-Token={csrf_token1}; X-CSRF-Token={csrf_token2}",
+            cookie_header=f"{CSRF_COOKIE_NAME}={csrf_token1}; {CSRF_COOKIE_NAME}={csrf_token2}",
             csrf_header=csrf_token1,
             json_body={"username": "dupfirst", "password": "Password123"},
         )
@@ -475,7 +475,7 @@ class TestCSRFProtection(unittest.TestCase):
         response = self.client.post(
             "/api/auth/register",
             json={"username": "invalidcsrf", "password": "Password123"},
-            cookies={"X-CSRF-Token": "invalid-cookie"},
+            cookies={CSRF_COOKIE_NAME: "invalid-cookie"},
             headers={"X-CSRF-Token": "invalid-header"},
         )
         self.assertEqual(response.status_code, 403)

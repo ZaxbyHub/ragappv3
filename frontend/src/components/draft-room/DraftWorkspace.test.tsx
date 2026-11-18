@@ -594,6 +594,73 @@ describe("DraftWorkspace", () => {
     expect(idempotencyKey.length).toBeGreaterThan(0);
   });
 
+  it("shows the compile failure reason inside the confirmation dialog and does not close it", async () => {
+    const user = userEvent.setup();
+    // A body-replacing portal serves HTML with the machine-readable code
+    // only in the X-Meridian-Error-Code header (T3c).
+    mockCompileDraft.mockRejectedValue({
+      message: "Request failed (provider_origin_not_allowed)",
+      originalError: {
+        response: {
+          status: 503,
+          headers: { "x-meridian-error-code": "provider_origin_not_allowed" },
+          data: "<html>503 Service Unavailable</html>",
+        },
+      },
+    });
+    renderWorkspace();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Create draft" }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    await user.click(
+      within(dialog).getByRole("button", { name: "Create draft" }),
+    );
+
+    await waitFor(() => {
+      expect(within(dialog).getByTestId("compile-error")).toBeInTheDocument();
+    });
+    const error = within(dialog).getByTestId("compile-error");
+    expect(error.textContent).toMatch(/administrator/i);
+    expect(error.textContent).toMatch(/retrying will not help/i);
+    // The dialog stays open so the user can read the reason.
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("clears a previous compile failure when the dialog is reopened", async () => {
+    const user = userEvent.setup();
+    mockCompileDraft.mockRejectedValue({
+      message: "Request failed (provider_origin_not_allowed)",
+      originalError: {
+        response: {
+          status: 503,
+          headers: { "x-meridian-error-code": "provider_origin_not_allowed" },
+          data: "<html>503</html>",
+        },
+      },
+    });
+    renderWorkspace();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Create draft" }),
+    );
+    let dialog = await screen.findByRole("dialog");
+    await user.click(
+      within(dialog).getByRole("button", { name: "Create draft" }),
+    );
+    await waitFor(() => {
+      expect(within(dialog).getByTestId("compile-error")).toBeInTheDocument();
+    });
+
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Create draft" }),
+    );
+    dialog = await screen.findByRole("dialog");
+    expect(within(dialog).queryByTestId("compile-error")).not.toBeInTheDocument();
+  });
+
   it("focuses the compile confirmation's heading on open, not the Cancel button", async () => {
     const user = userEvent.setup();
     renderWorkspace();

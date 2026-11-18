@@ -1,4 +1,4 @@
-import { apiClient, API_BASE_URL, _jwtAccessToken, getCsrfCookie, getCsrfToken, ChatStreamCallbacks, ChatMessage, Source, UsedMemory, WikiReference, KMSReference, CitationValidationDebug, ChatMetadataFilter, CitationEnforcement, ChatSession, ChatSessionDetail, ChatSessionMessage, CreateSessionRequest, AddMessageRequest, ChatHistoryItem, ensureCsrfToken, refreshAccessToken, isTokenNearExpiry, httpStatusOf } from "./core";
+import { apiClient, API_BASE_URL, _jwtAccessToken, getCsrfCookie, getCsrfToken, ChatStreamCallbacks, ChatMessage, Source, UsedMemory, WikiReference, KMSReference, CitationValidationDebug, ChatMetadataFilter, CitationEnforcement, ChatSession, ChatSessionDetail, ChatSessionMessage, CreateSessionRequest, AddMessageRequest, ChatHistoryItem, ensureCsrfToken, refreshAccessToken, isTokenNearExpiry, httpStatusOf, withMethodOverride } from "./core";
 import { setChatHistory as storageSetChatHistory, getChatHistory as storageGetChatHistory } from "../storage";
 import { captureAuthOwner, captureAuthPrincipalGeneration, isCurrentAuthOwner, subscribeAuthPrincipal } from "./auth-lifecycle";
 
@@ -783,9 +783,13 @@ export async function updateMessageFeedback(
   messageId: number,
   rating: "up" | "down" | null
 ): Promise<ChatSessionMessage> {
-  const response = await apiClient.patch(
+  // POST + X-HTTP-Method-Override: the portal in front of this deployment
+  // rejects PATCH on the wire; the backend rewrites the method before
+  // routing (only for paths that have a PATCH handler).
+  const response = await apiClient.post<ChatSessionMessage>(
     `/chat/sessions/${sessionId}/messages/${messageId}/feedback`,
-    { rating }
+    { rating },
+    withMethodOverride()
   );
   return response.data;
 }

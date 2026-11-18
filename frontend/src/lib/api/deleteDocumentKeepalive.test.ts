@@ -29,14 +29,14 @@ describe("deleteDocumentKeepalive (issue #766)", () => {
   });
 
   afterEach(() => {
-    document.cookie = "X-CSRF-Token=; path=/; max-age=0";
+    document.cookie = "meridian-csrf-token=; path=/; max-age=0";
     setJwtAccessToken(null);
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
   it("sends one exact credentialed keepalive delete when a credential is cached", async () => {
-    document.cookie = "X-CSRF-Token=tok";
+    document.cookie = "meridian-csrf-token=tok";
     setJwtAccessToken("jwt-token");
 
     const attempted = deleteDocumentKeepalive("7");
@@ -61,7 +61,7 @@ describe("deleteDocumentKeepalive (issue #766)", () => {
   });
 
   it("logs a non-2xx outcome instead of dropping it silently, and never throws", async () => {
-    document.cookie = "X-CSRF-Token=tok";
+    document.cookie = "meridian-csrf-token=tok";
     fetchMock.mockResolvedValue({ ok: false, status: 403 } as Response);
     const errorSpy = vi.mocked(console.error);
 
@@ -81,7 +81,7 @@ describe("deleteDocumentKeepalive (issue #766)", () => {
   });
 
   it("logs when the keepalive delete does not reach the server, and never throws", async () => {
-    document.cookie = "X-CSRF-Token=tok";
+    document.cookie = "meridian-csrf-token=tok";
     fetchMock.mockRejectedValue(new Error("document is unloading"));
     const errorSpy = vi.mocked(console.error);
 

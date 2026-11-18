@@ -37,9 +37,12 @@ vi.mock('@/lib/api', () => ({
       return Promise.resolve({ data: mockOrgs });
     }),
     post: vi.fn().mockResolvedValue({ data: { id: 3, name: 'New Org', description: null, member_count: 0, vault_count: 0, created_at: '2024-03-01' } }),
-    patch: vi.fn().mockResolvedValue({ data: {} }),
+
     delete: vi.fn().mockResolvedValue({ data: {} }),
   },
+  withMethodOverride: () => ({ 'X-HTTP-Method-Override': 'PATCH' }),
+  METHOD_OVERRIDE_HEADER: 'X-HTTP-Method-Override',
+  ERROR_CODE_HEADER: 'X-Meridian-Error-Code',
 }));
 
 vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -377,7 +380,7 @@ describe('OrgsPage ADVERSARIAL', () => {
         if (url.includes('/members')) return Promise.resolve({ data: { members: mockMembers } });
         return Promise.resolve({ data: mockOrgs });
       });
-      vi.mocked(api.default.patch).mockResolvedValue({ data: {} });
+      vi.mocked(api.default.post).mockResolvedValue({ data: {} });
 
       await act(async () => { render(<OrgsPage />); });
 
@@ -404,7 +407,7 @@ describe('OrgsPage ADVERSARIAL', () => {
       });
 
       await waitFor(() => {
-        expect(api.default.patch).toHaveBeenCalled();
+        expect(api.default.post).toHaveBeenCalled();
       });
 
       // Component should still render

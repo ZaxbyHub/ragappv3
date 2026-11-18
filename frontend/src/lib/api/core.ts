@@ -1,5 +1,5 @@
 import { APP_BASENAME } from "@/lib/paths";
-import axios, { AxiosRequestHeaders } from "axios";
+import axios, { AxiosRequestConfig, AxiosRequestHeaders } from "axios";
 import { appPath } from "../paths";
 import { type AuthOwner, captureAuthPrincipalGeneration, captureAuthOwner, enqueueAuthTransport, getAuthTransportContext, getAuthTransportOwner, isCurrentAuthOwner, StaleAuthOwnerError } from "./auth-lifecycle";
 
@@ -93,16 +93,23 @@ export function getJwtAccessToken(): string | null {
 // the current scoped one. document.cookie collapses duplicates last-wins,
 // so the read may surface the stale value. When multiple candidates exist,
 // purge the broader-path shadows and re-read so the scoped cookie wins.
+// T4c: Meridian-specific CSRF cookie name (matches CSRF_COOKIE_NAME in the
+// backend). The request HEADER name stays "X-CSRF-Token" — only the cookie
+// was renamed, so it cannot collide with another application's cookie on a
+// shared host. The pre-rename "X-CSRF-Token" cookie is ignored, not deleted:
+// deleting it could touch another application's cookie on a shared origin.
+export const CSRF_COOKIE_NAME = "meridian-csrf-token";
+
 export function getCsrfCookie(): string | null {
   const read = () => {
     const match = document.cookie
       .split('; ')
-      .find(row => row.startsWith('X-CSRF-Token='));
+      .find(row => row.startsWith(`${CSRF_COOKIE_NAME}=`));
     // Use split with limit=2 so token values containing '=' (base64 padding) are preserved
     return match ? decodeURIComponent(match.split('=', 2)[1]) : null;
   };
   let token = read();
-  if (document.cookie.split('; ').filter(row => row.startsWith('X-CSRF-Token=')).length > 1) {
+  if (document.cookie.split('; ').filter(row => row.startsWith(`${CSRF_COOKIE_NAME}=`)).length > 1) {
     // Duplicate same-name cookies: purge JS-addressable path-variants and
     // re-read (falls back to the pre-purge read if none survive). If the
     // purge removed the good cookie too, ensureCsrfToken's network fetch
@@ -113,9 +120,10 @@ export function getCsrfCookie(): string | null {
   return token;
 }
 
-// Shadow-cookie cleanup for the whole origin: removes stale X-CSRF-Token
-// cookies at common paths so only the scoped one remains. Safe to call
-// anytime; the next token fetch re-establishes the cookie if needed.
+// Shadow-cookie cleanup for the whole origin: removes stale
+// meridian-csrf-token cookies at common paths so only the scoped one
+// remains. Safe to call anytime; the next token fetch re-establishes the
+// cookie if needed. Only ever touches Meridian's own cookie name (T4c).
 export function purgeStaleCsrfCookies(): void {
   // The server sets the CSRF cookie at the app-root path (APP_BASENAME —
   // `/meridian` for a subpath deployment, `/` for a root deployment). That
@@ -128,7 +136,7 @@ export function purgeStaleCsrfCookies(): void {
   const candidates = ['/', base + '/', location.pathname.replace(/\/[^/]*$/, '') || '/'];
   for (const p of new Set(candidates)) {
     if (appRoot !== '' && (p === appRoot || p === appRoot + '/')) continue;
-    document.cookie = `X-CSRF-Token=; path=${p}; max-age=0`;
+    document.cookie = `${CSRF_COOKIE_NAME}=; path=${p}; max-age=0`;
   }
 }
 
@@ -306,6 +314,17 @@ export function attachCsrfInterceptor(instance: ReturnType<typeof axios.create>)
         }
         config.headers["X-CSRF-Token"] = token;
       }
+      // T3: stamp a request id so a portal-replaced error body can be
+      // recovered via GET /errors/lookup (the portal replaces both the
+      // body and the headers of non-2xx responses). Reused if the caller
+      // already set one (e.g. a retry of the same logical request).
+      if (!config.headers) {
+        config.headers = {} as AxiosRequestHeaders;
+      }
+      if (!config.headers[REQUEST_ID_HEADER]) {
+        config.headers[REQUEST_ID_HEADER] = newRequestId();
+      }
+      return config;
     }
     return config;
   }, undefined, {
@@ -347,12 +366,20 @@ export function attachCsrfInterceptor(instance: ReturnType<typeof axios.create>)
         }
         if (owner) assertCurrentRequestOwner(config);
       }
-      const detail = error.response?.data?.detail || "";
-      const isCsrfError = error.response?.status === 403 && (
-        error.response?.headers?.["x-csrf-error"] === "true" ||
-        (typeof detail === "string" && detail.toLowerCase().includes("csrf"))
-      );
-      if (isCsrfError && config && !config._csrfRetry) {
+      // T4b: a 403 on a mutating request is treated as possibly-CSRF. The
+      // portal strips response headers and replaces error bodies, so the
+      // x-csrf-error header / detail classification this retry previously
+      // keyed on is unavailable in production; a 403 means the request was
+      // not executed, so exactly one token-refresh retry is safe (the
+      // _csrfRetry guard caps it; non-403 failures are never retried here).
+      if (
+        shouldRefreshAndRetryAfter403(
+          error.response?.status,
+          config?.method,
+          Boolean(config?._csrfRetry),
+        ) &&
+        config
+      ) {
         resetCsrfToken(); // force refresh on next request
         purgeStaleCsrfCookies(); // drop shadow cookies before refetch
         config._csrfRetry = true;
@@ -496,6 +523,116 @@ apiClient.interceptors.request.use((config) => {
 // Attach CSRF protection for all mutating requests on apiClient
 attachCsrfInterceptor(apiClient);
 
+/**
+ * Method override for PATCH behind a body-replacing portal.
+ *
+ * The portal in front of this deployment rejects PATCH requests outright,
+ * so every PATCH call is expressed as POST + `X-HTTP-Method-Override: PATCH`.
+ * The backend rewrites the method before routing — but only for paths that
+ * already have a PATCH handler — so CSRF, auth, and the route contract are
+ * identical to a native PATCH. Use this instead of `apiClient.patch` for
+ * every PATCH call site (see the PATCH inventory in the portal-resilience
+ * notes); the request interceptor still attaches the CSRF token because
+ * the wire method is POST.
+ */
+export const METHOD_OVERRIDE_HEADER = "X-HTTP-Method-Override";
+
+const MUTATING_METHODS = new Set(["post", "put", "patch", "delete"]);
+
+/** * whether a failed request should refresh the CSRF token and retry once.
+ *
+ * A 403 on a mutating request is treated as possibly-CSRF: the portal in
+ * front of this deployment strips response headers and replaces error
+ * bodies, so the `x-csrf-error` header / "csrf"-in-detail classification
+ * the retry previously keyed on never arrives in production — a stale
+ * token on a long-open page produced two silent 403s where a reload fixed
+ * it. A 403 means the request was not executed, so one retry is safe.
+ *
+ * Never retries: non-403 statuses, non-mutating methods (CSRF does not
+ * apply to them), or a request that already retried (the `_csrfRetry`
+ * cap — exactly one retry, never more).
+ */
+export function shouldRefreshAndRetryAfter403(
+  status: number | undefined,
+  method: string | undefined,
+  alreadyRetried: boolean,
+): boolean {
+  if (status !== 403 || alreadyRetried) return false;
+  return MUTATING_METHODS.has((method ?? "").toLowerCase());
+}
+
+/** Response header carrying the backend's machine-readable error code on every non-2xx. */
+export const ERROR_CODE_HEADER = "x-meridian-error-code";
+
+/** * request-id header stamped on every mutating request. The portal
+ * replaces both the body and the headers of non-2xx responses, so when an
+ * error body is not JSON the client recovers the recorded detail from
+ * GET /errors/lookup using this id (see `lookupRecordedError`).
+ */
+export const REQUEST_ID_HEADER = "X-Meridian-Request-Id";
+
+function newRequestId(): string {
+  const c = globalThis.crypto;
+  if (c && typeof c.randomUUID === "function") return c.randomUUID();
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+async function lookupRecordedError(
+  requestId: string,
+): Promise<{ detail?: string; code?: string } | null> {
+  try {
+    const resp = await apiClient.get("/errors/lookup", {
+      params: { request_id: requestId },
+      headers: { [REQUEST_ID_HEADER]: requestId },
+      // Recursion guard: if the lookup itself fails with a non-JSON body,
+      // its error path must not start another lookup.
+      _errorLookupDone: true,
+    } as Parameters<typeof apiClient.get>[1]);
+    const data = resp.data as { detail?: unknown; code?: unknown } | null;
+    if (data && typeof data === "object") {
+      return {
+        detail: typeof data.detail === "string" ? data.detail : undefined,
+        code: typeof data.code === "string" ? data.code : undefined,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function readErrorCodeHeader(headers: unknown): string | null {
+  if (!headers || typeof headers !== "object") return null;
+  const h = headers as Record<string, unknown>;
+  const raw = h[ERROR_CODE_HEADER] ?? h[ERROR_CODE_HEADER.toUpperCase()];
+  if (typeof raw === "string" && raw) return raw;
+  if (Array.isArray(raw) && typeof raw[0] === "string" && raw[0]) return raw[0];
+  return null;
+}
+
+/** * config that expresses a PATCH as POST + `X-HTTP-Method-Override: PATCH`.
+ *
+ * The portal in front of this deployment rejects PATCH requests outright,
+ * so every PATCH call site sends POST plus this header; the backend rewrites
+ * the method before routing (only for paths that have a PATCH handler), so
+ * CSRF, auth, and the route contract are identical to a native PATCH.
+ *
+ * This is a config BUILDER rather than a request helper on purpose: call
+ * sites keep issuing `apiClient.post(url, data, withMethodOverride())`, so
+ * the module-level `apiClient` binding they resolve stays the seam tests
+ * mock. A helper that closed over the real instance would bypass those
+ * mocks and hit the network in unit tests.
+ */
+export function withMethodOverride(config?: AxiosRequestConfig): AxiosRequestConfig {
+  return {
+    ...(config ?? {}),
+    headers: {
+      ...((config?.headers ?? {}) as Record<string, string>),
+      [METHOD_OVERRIDE_HEADER]: "PATCH",
+    },
+  };
+}
+
 // Parse JWT token to extract expiry timestamp (exp claim)
 export function getTokenExpiry(token: string): number | null {
   try {
@@ -632,6 +769,36 @@ apiClient.interceptors.response.use(
         message = formatted || data?.message || data?.error || error.response.statusText || message;
       } else {
         message = detail || data?.message || data?.error || error.response.statusText || message;
+      }
+      // T3b: a body-replacing proxy serves its own HTML error page, so the
+      // JSON contract (detail/message/error) is gone. Recover the recorded
+      // outcome from GET /errors/lookup using the request id stamped on the
+      // request (a fronting proxy strips the error-code header too), then fall
+      // back to the header code, then to a status-based message — a failed
+      // request must never be silent.
+      const bodyIsJsonEnvelope =
+        data !== null &&
+        typeof data === "object" &&
+        !(typeof Blob !== "undefined" && data instanceof Blob);
+      if (!bodyIsJsonEnvelope) {
+        const rawRequestId = error.config?.headers?.[REQUEST_ID_HEADER];
+        const requestId =
+          typeof rawRequestId === "string"
+            ? rawRequestId
+            : Array.isArray(rawRequestId)
+              ? rawRequestId[0]
+              : undefined;
+        const looked =
+          requestId && !error.config?._errorLookupDone
+            ? await lookupRecordedError(requestId)
+            : null;
+        const code = readErrorCodeHeader(error.response.headers);
+        message =
+          looked?.detail ||
+          (looked?.code ? `Request failed (${looked.code})` : "") ||
+          (code ? `Request failed (${code})` : "") ||
+          error.response.statusText ||
+          `Request failed with status ${error.response.status}`;
       }
     } else if (error.request) {
       // Request was made but no response received

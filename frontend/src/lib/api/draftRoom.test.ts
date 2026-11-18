@@ -161,11 +161,22 @@ const endpointCases: EndpointCase[] = [
     },
   },
   {
-    name: "updateDraft -> PATCH /draft-room/drafts/:id",
+    name: "updateDraft -> POST + X-HTTP-Method-Override: PATCH /draft-room/drafts/:id",
     run: async () => {
       const body = { lock_version: 2, title: "new" };
       await updateDraft(7, body);
-      expect(mockPatch).toHaveBeenCalledWith("/draft-room/drafts/7", body);
+      // T2b: the portal rejects PATCH on the wire; the backend rewrites the
+      // method before routing only for paths with a PATCH handler.
+      expect(mockPatch).not.toHaveBeenCalled();
+      expect(mockPost).toHaveBeenCalledWith(
+        "/draft-room/drafts/7",
+        body,
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            "X-HTTP-Method-Override": "PATCH",
+          }),
+        }),
+      );
     },
   },
   {
@@ -190,11 +201,20 @@ const endpointCases: EndpointCase[] = [
     },
   },
   {
-    name: "updateDraftInput -> PATCH /draft-room/drafts/:id/inputs/:inputId",
+    name: "updateDraftInput -> POST + X-HTTP-Method-Override: PATCH /draft-room/drafts/:id/inputs/:inputId",
     run: async () => {
       const body = { role: "reference" as const };
       await updateDraftInput(7, 9, body);
-      expect(mockPatch).toHaveBeenCalledWith("/draft-room/drafts/7/inputs/9", body);
+      expect(mockPatch).not.toHaveBeenCalled();
+      expect(mockPost).toHaveBeenCalledWith(
+        "/draft-room/drafts/7/inputs/9",
+        body,
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            "X-HTTP-Method-Override": "PATCH",
+          }),
+        }),
+      );
     },
   },
   {

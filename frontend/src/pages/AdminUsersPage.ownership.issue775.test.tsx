@@ -20,7 +20,7 @@ const mocks = vi.hoisted(() => ({
   api: {
     get: vi.fn(),
     put: vi.fn(),
-    patch: vi.fn(),
+    post: vi.fn(),
     post: vi.fn(),
     delete: vi.fn(),
   },
@@ -43,7 +43,12 @@ const mocks = vi.hoisted(() => ({
   sheetOnOpenChange: null as ((open: boolean) => void) | null,
 }));
 
-vi.mock("@/lib/api", () => ({ default: mocks.api }));
+vi.mock("@/lib/api", () => ({
+  default: mocks.api,
+  withMethodOverride: () => ({ 'X-HTTP-Method-Override': 'PATCH' }),
+  METHOD_OVERRIDE_HEADER: 'X-HTTP-Method-Override',
+  ERROR_CODE_HEADER: 'X-Meridian-Error-Code',
+}));
 vi.mock("@/stores/useAuthStore", () => ({ useAuthStore: mocks.auth.useAuthStore }));
 vi.mock("@/fixtures/TestModeContext", () => ({ useTestMode: () => false }));
 vi.mock("@/hooks/useDebounce", () => ({ useDebounce: (value: string) => [value] }));
@@ -248,7 +253,6 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     vi.clearAllMocks();
     mocks.api.get.mockReset();
     mocks.api.put.mockReset();
-    mocks.api.patch.mockReset();
     getQueues.clear();
     mocks.selectHandlers.clear();
     mocks.sheetOnOpenChange = null;
@@ -387,9 +391,13 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     const role = await inTable().findByRole("combobox", { name: "Change role for target" });
     const retainedA = mocks.selectHandlers.get("Change role for target");
     if (!retainedA) throw new Error("expected the A role callback to be captured");
-    mocks.api.patch.mockReturnValueOnce(patch.promise);
+    mocks.api.post.mockReturnValueOnce(patch.promise);
     fireEvent.change(role, { target: { value: "admin" } });
-    expect(mocks.api.patch).toHaveBeenCalledWith("/users/2/role", { role: "admin" });
+    expect(mocks.api.post).toHaveBeenCalledWith(
+      "/users/2/role",
+      { role: "admin" },
+      expect.objectContaining({ "X-HTTP-Method-Override": "PATCH" }),
+    );
 
     queueGet(usersUrl(), usersB.promise.then(() => ({ data: { users: [targetUser], total: 40 } })));
     reserveReplacementAuthOwner();
@@ -398,15 +406,19 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     const replacementRole = await inTable().findByRole("combobox", { name: "Change role for target" });
 
     await act(async () => retainedA("viewer"));
-    expect(mocks.api.patch).toHaveBeenCalledTimes(1);
+    expect(mocks.api.post).toHaveBeenCalledTimes(1);
 
     const patchB = deferred<unknown>();
-    mocks.api.patch.mockReturnValueOnce(patchB.promise);
+    mocks.api.post.mockReturnValueOnce(patchB.promise);
     const currentB = mocks.selectHandlers.get("Change role for target");
     if (!currentB) throw new Error("expected the B role callback to be captured");
     act(() => { void currentB("admin"); });
-    expect(mocks.api.patch).toHaveBeenCalledTimes(2);
-    expect(mocks.api.patch).toHaveBeenLastCalledWith("/users/2/role", { role: "admin" });
+    expect(mocks.api.post).toHaveBeenCalledTimes(2);
+    expect(mocks.api.post).toHaveBeenLastCalledWith(
+      "/users/2/role",
+      { role: "admin" },
+      expect.objectContaining({ "X-HTTP-Method-Override": "PATCH" }),
+    );
 
     await act(async () => patch.resolve({ data: {} }));
     expect(replacementRole).toHaveValue("member");
@@ -426,7 +438,7 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     renderPage();
     // #771: table-scoped (below-sm card list duplicates the text)
     const role = await inTable().findByRole("combobox", { name: "Change role for target" });
-    mocks.api.patch.mockReturnValueOnce(patch.promise);
+    mocks.api.post.mockReturnValueOnce(patch.promise);
     fireEvent.change(role, { target: { value: "admin" } });
 
     fireEvent.change(screen.getByRole("textbox", { name: "Search users" }), { target: { value: "target" } });
@@ -448,7 +460,7 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     renderPage();
     // #771: table-scoped (below-sm card list duplicates the text)
     const role = await inTable().findByRole("combobox", { name: "Change role for target" });
-    mocks.api.patch.mockReturnValueOnce(patch.promise);
+    mocks.api.post.mockReturnValueOnce(patch.promise);
     fireEvent.change(role, { target: { value: "admin" } });
 
     fireEvent.change(screen.getByRole("textbox", { name: "Search users" }), { target: { value: "target" } });
@@ -471,7 +483,7 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     renderPage();
     // #771: table-scoped (below-sm card list duplicates the text)
     const role = await inTable().findByRole("combobox", { name: "Change role for target" });
-    mocks.api.patch.mockReturnValueOnce(olderPatch.promise);
+    mocks.api.post.mockReturnValueOnce(olderPatch.promise);
     fireEvent.change(role, { target: { value: "admin" } });
 
     fireEvent.change(screen.getByRole("textbox", { name: "Search users" }), { target: { value: "target" } });
@@ -479,13 +491,13 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     await act(async () => searchResults.resolve({ data: { users: [{ ...targetUser, role: "member" }], total: 40 } }));
     // #771: table-scoped (below-sm card list duplicates the text)
     const currentRoleInput = await inTable().findByRole("combobox", { name: "Change role for target" });
-    mocks.api.patch.mockReturnValueOnce(newerPatch.promise);
+    mocks.api.post.mockReturnValueOnce(newerPatch.promise);
     const currentRole = mocks.selectHandlers.get("Change role for target");
     if (!currentRole) throw new Error("expected the current role callback");
     await act(async () => {
       void currentRole("admin");
     });
-    expect(mocks.api.patch).toHaveBeenCalledTimes(2);
+    expect(mocks.api.post).toHaveBeenCalledTimes(2);
 
     await act(async () => olderPatch.resolve({ data: {} }));
     expect(mocks.toast.success).not.toHaveBeenCalledWith("Role updated successfully");

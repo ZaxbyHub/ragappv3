@@ -4,7 +4,8 @@ FastAPI application with lifespan context manager.
 
 import logging
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -25,6 +26,7 @@ from app.api.routes.documents import (
 from app.api.routes.draft_room import DraftRoomHTTPError, draft_room_exception_handler
 from app.api.routes.draft_room import router as draft_room_router
 from app.api.routes.email import router as email_router
+from app.api.routes.errors import router as errors_router
 from app.api.routes.eval import router as eval_router
 from app.api.routes.folders import router as folders_router
 from app.api.routes.groups import router as groups_router
@@ -53,6 +55,10 @@ from app.lifespan import lifespan
 from app.limiter import limiter
 from app.middleware.logging import LoggingMiddleware
 from app.middleware.maintenance import MaintenanceMiddleware
+from app.middleware.portal_resilience import (
+    ErrorCodeHeaderMiddleware,
+    MethodOverrideMiddleware,
+)
 from app.utils.paths import is_unstripped_prefix, normalize_root_path
 
 logger = logging.getLogger(__name__)
@@ -101,6 +107,15 @@ if (
 # LoggingMiddleware still do not: CORS preflight OPTIONS, invalid-Host 400s,
 # and unhandled 500s — see docs/admin-guide.md.) Always-registered core,
 # outermost first: CORS → Logging → SlowAPI → Maintenance.
+# ── Portal-resilience layer (innermost of the core) ────────────────────
+# Added FIRST so these two sit closest to the app (last added = outermost,
+# per the ordering note above): the method override must run before routing,
+# and the error-code middleware must see the exception-handler responses.
+# They sit INSIDE Maintenance/SlowAPI/Logging, so maintenance 503s and
+# rate-limit 429s keep their existing shape and are unaffected.
+app.add_middleware(ErrorCodeHeaderMiddleware)
+app.add_middleware(MethodOverrideMiddleware)
+
 # Note: MaintenanceMiddleware is initialized with a lazy getter since
 # maintenance_service is only available after lifespan startup
 app.state._maintenance_service_getter = lambda: getattr(
@@ -159,6 +174,9 @@ if settings.allowed_hosts:
 
 app.include_router(health_router, prefix="/api")
 
+# T3: error-detail lookup for clients behind a body-replacing proxy.
+app.include_router(errors_router, prefix="/api")
+
 # E3 telemetry (issue #518): GET /metrics — Prometheus exposition of the
 # measured turn/stage/queue/provider metrics (multiprocess-aggregated).
 from app.services.telemetry import (  # noqa: E402
@@ -200,6 +218,34 @@ app.include_router(onboarding_router, prefix="/api")
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
 # Register Draft Room's {detail, code, context} error contract (SPEC section 8.3).
 app.add_exception_handler(DraftRoomHTTPError, draft_room_exception_handler)
+
+
+@app.exception_handler(HTTPException)
+async def _logging_http_exception_handler(request: Request, exc: HTTPException):
+    """Log every 403 with its denial reason, then defer to the default.
+
+    A 403 access log line carries only the status; the *reason* (authz
+    denial vs CSRF failure vs an API-key rejection) lived nowhere. This
+    wrapper logs category + detail + method + path + request id before
+    delegating to FastAPI's default handler, whose response (including the
+    ``x-csrf-error`` header the frontend retry keys on) is unchanged.
+    """
+    if exc.status_code == 403:
+        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        exc_headers = exc.headers or {}
+        is_csrf = (
+            exc_headers.get("x-csrf-error") == "true"
+            or "csrf" in detail.lower()
+        )
+        logger.warning(
+            "403 denial: category=%s detail=%r method=%s path=%s request_id=%s",
+            "csrf" if is_csrf else "authz",
+            detail,
+            request.method,
+            request.url.path,
+            request.headers.get("x-request-id"),
+        )
+    return await http_exception_handler(request, exc)
 
 
 @app.get("/health")

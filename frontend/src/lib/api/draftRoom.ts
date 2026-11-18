@@ -1,4 +1,10 @@
-import { apiClient, API_BASE_URL, httpStatusOf } from "./core";
+import {
+  apiClient,
+  API_BASE_URL,
+  ERROR_CODE_HEADER,
+  httpStatusOf,
+  withMethodOverride,
+} from "./core";
 
 // ============================================================================
 // Draft Room — enums (const tuples + derived union types)
@@ -629,6 +635,8 @@ interface NormalizedApiError {
         code?: string;
         context?: Record<string, unknown>;
       };
+      headers?: unknown;
+      status?: unknown;
     };
   };
 }
@@ -663,12 +671,44 @@ export function parseDraftRoomError(error: unknown): DraftRoomErrorInfo {
     typeof data?.detail === "string" && data.detail
       ? data.detail
       : fallbackDetail;
-  const code =
+  let code =
     typeof data?.code === "string" && data.code ? data.code : "unknown";
   const context =
     data?.context && typeof data.context === "object" ? data.context : {};
 
+  // Body-replacing portal fallback: when the proxy serves its own HTML
+  // error page there is no JSON envelope, but the backend mirrors the
+  // machine-readable code onto X-Meridian-Error-Code for every non-2xx.
+  // Read it so the Draft Room can still classify the failure (e.g. show
+  // the right copy for provider_origin_not_allowed) instead of "unknown".
+  if (code === "unknown") {
+    const headers = error.originalError?.response?.headers;
+    if (headers && typeof headers === "object") {
+      const raw =
+        (headers as Record<string, unknown>)[ERROR_CODE_HEADER] ??
+        (headers as Record<string, unknown>)[ERROR_CODE_HEADER.toUpperCase()];
+      if (typeof raw === "string" && raw) code = raw;
+      else if (Array.isArray(raw) && typeof raw[0] === "string" && raw[0]) code = raw[0];
+    }
+  }
+
   return { detail, code, context, status: httpStatusOf(error) };
+}
+
+/**
+ * User-facing failure copy for a compile attempt, shown in the compile
+ * confirmation dialog.
+ *
+ * `provider_origin_not_allowed` is a server-side configuration issue — the
+ * model provider origin is not on the allowlist — so retrying cannot
+ * succeed: the copy says exactly that and points at an administrator.
+ */
+export function draftCompileFailureMessage(error: unknown): string {
+  const parsed = parseDraftRoomError(error);
+  if (parsed.code === "provider_origin_not_allowed") {
+    return "Compile cannot start: the configured model provider is not permitted for this draft. This is a server configuration issue for an administrator — retrying will not help.";
+  }
+  return parsed.detail;
 }
 
 /** Predicate for checking a caught error against a known Draft Room error code. */
@@ -767,9 +807,10 @@ export async function updateDraft(
   draftId: number,
   data: DraftUpdateRequest,
 ): Promise<DraftSummary> {
-  const response = await apiClient.patch<DraftSummary>(
+  const response = await apiClient.post<DraftSummary>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}`,
     data,
+    withMethodOverride()
   );
   return response.data;
 }
@@ -849,9 +890,10 @@ export async function updateDraftInput(
   inputId: number,
   data: InputUpdateRequest,
 ): Promise<DraftInput> {
-  const response = await apiClient.patch<DraftInput>(
+  const response = await apiClient.post<DraftInput>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/inputs/${inputId}`,
     data,
+    withMethodOverride()
   );
   return response.data;
 }
