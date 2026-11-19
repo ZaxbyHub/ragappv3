@@ -15,7 +15,8 @@ ARG VITE_APP_BASENAME=/
 ARG VITE_API_URL=
 ENV VITE_APP_BASENAME=${VITE_APP_BASENAME}
 ENV VITE_API_URL=${VITE_API_URL}
-# validate_vite_env inlined to avoid dependency on external file.
+# validate_vite_env inlined; the inlined copy is the sole authority
+# (standalone script removed for having no caller, issue #754).
 # BuildKit heredoc form: the previous unquoted multi-line `RUN node -e "..."`
 # was un-parseable Dockerfile syntax (every JS line read as a Dockerfile
 # instruction — "unknown instruction: const"); nothing exercised it until the

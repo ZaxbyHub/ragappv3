@@ -310,6 +310,12 @@ jobs:
               # review F-006).
               - scripts/docker_smoke/**
               - backend/tests/fixtures/real_docs/sample_table.pdf
+              # The image pip-installs backend/requirements-lock.txt from
+              # backend/requirements.txt, so a lock-only change IS a docker
+              # surface change: without these paths a relock-only PR never runs
+              # docker-smoke (issue #751 AC1).
+              - backend/requirements.txt
+              - backend/requirements-lock.txt
 
   # BUILD-002: smoke-build the root image (no push) whenever the docker surface
   # changes, so a green CI run proves the shipped image still builds under the
@@ -385,20 +391,16 @@ jobs:
 
       # Universal lockfiles (issue #567): each lock must regenerate
       # byte-identically from its source spec with the same uv invocation the
-      # update scripts use. Seeding the scratch file with the committed lock
-      # pins every version; any drift (source edit without relock, or a
-      # non-universal regeneration) fails the diff.
-      - name: Verify lockfiles (universal regeneration)
+      # update script uses. Since issue #751 the verification runs THE
+      # documented script itself (scripts/update-lock.sh) on ubuntu, which
+      # regenerates both locks in place — proving the script executes past its
+      # POSIX prologue on every PR (the CRLF defect class) — followed by an
+      # in-place fixed-point diff.
+      - name: Verify lockfiles (universal regeneration via scripts/update-lock.sh)
         working-directory: .
         run: |
-          for spec in requirements.txt:requirements-lock.txt requirements-ci.txt:requirements-lock-ci.txt; do
-            src="backend/${spec%%:*}"
-            lock="backend/${spec##*:}"
-            cp "$lock" /tmp/verify-lock.txt
-            uv pip compile --universal --generate-hashes --no-strip-extras --no-header \
-              --python-version 3.11 "$src" -o /tmp/verify-lock.txt
-            git diff --no-index --exit-code "$lock" /tmp/verify-lock.txt
-          done
+          bash scripts/update-lock.sh
+          git diff --exit-code -- backend/requirements-lock.txt backend/requirements-lock-ci.txt
 
       - name: Install dependencies
         run: |

@@ -33,6 +33,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -98,7 +99,11 @@ async def test_scale_timeout_propagates():
         # Mock db with table_names to indicate table exists (same as the
         # existing multi-scale semaphore tests).
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
 
         with patch("app.services.vector_store.settings") as mock_settings:

@@ -32,7 +32,7 @@ from app.services.embeddings import (
     EmbeddingService,
     resolve_effective_prefixes,
 )
-from app.services.vector_store import VectorStore
+from app.services.vector_store import VectorStore, _list_table_names
 
 OLD_MODEL = "old-model"
 NEW_MODEL = "new-model"
@@ -636,7 +636,7 @@ def test_commit_failure_preserves_real_temp_table(tmp_path, monkeypatch):
         handle = await vs.begin_dimension_rebuild(8)
         with pytest.raises(RuntimeError):
             await vs.commit_dimension_rebuild(handle)
-        return DIMENSION_REBUILD_TABLE in await vs.db.table_names()
+        return DIMENSION_REBUILD_TABLE in await _list_table_names(vs.db)
 
     assert asyncio.run(_run()) is True
 
@@ -768,6 +768,13 @@ class _FakeDB:
     def __init__(self):
         self._tables = {}
         self.fail_drop_chunks = False
+
+    async def list_tables(self, page_token=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            tables=list(await self.table_names()), page_token=None
+        )
 
     async def table_names(self):
         return list(self._tables.keys())
@@ -1204,6 +1211,6 @@ def test_begin_cancellation_rolls_back_flag_and_staged_table(
         assert vs.rebuild_in_progress is False
         assert vs._serving_pin is None
         assert vs._serving_pin_resolved is False
-        assert DIMENSION_REBUILD_TABLE not in await vs.db.table_names()
+        assert DIMENSION_REBUILD_TABLE not in await _list_table_names(vs.db)
 
     asyncio.run(_run())

@@ -30,6 +30,8 @@ except ImportError:
     import types
     sys.modules["pyarrow"] = types.ModuleType("pyarrow")
 
+from types import SimpleNamespace
+
 from _db_pool import SimpleConnectionPool
 from fastapi.testclient import TestClient
 
@@ -81,7 +83,11 @@ class DocumentsDeleteAuditTestBase(unittest.TestCase):
         # Mock vector store for tests
         self._mock_vector_store = MagicMock()
         self._mock_vector_store.db = MagicMock()
-        self._mock_vector_store.db.table_names = AsyncMock(return_value=["chunks"])
+        self._mock_vector_store.db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         self._mock_vector_store.db.open_table = AsyncMock(return_value=MagicMock())
         self._mock_vector_store.delete_by_file = AsyncMock(return_value=1)
 

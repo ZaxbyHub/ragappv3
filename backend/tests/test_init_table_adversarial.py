@@ -17,6 +17,7 @@ Attack surfaces tested:
 import asyncio
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.vector_store import (
@@ -44,7 +45,7 @@ class TestAdversarialUnexpectedExceptionTypes(unittest.IsolatedAsyncioTestCase):
 
         mock_db = MagicMock()
         # KeyError is NOT in the caught exception types
-        mock_db.table_names = AsyncMock(side_effect=KeyError("unexpected key error"))
+        mock_db.list_tables = AsyncMock(side_effect=KeyError("unexpected key error"))
         store.db = mock_db
 
         with patch("app.services.vector_store.pa") as mock_pa:
@@ -63,7 +64,7 @@ class TestAdversarialUnexpectedExceptionTypes(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(side_effect=TypeError("unexpected type"))
+        mock_db.list_tables = AsyncMock(side_effect=TypeError("unexpected type"))
         store.db = mock_db
 
         with patch("app.services.vector_store.pa") as mock_pa:
@@ -81,7 +82,7 @@ class TestAdversarialUnexpectedExceptionTypes(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(
+        mock_db.list_tables = AsyncMock(
             side_effect=AttributeError("unexpected attribute")
         )
         store.db = mock_db
@@ -101,7 +102,7 @@ class TestAdversarialUnexpectedExceptionTypes(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(side_effect=KeyboardInterrupt())
+        mock_db.list_tables = AsyncMock(side_effect=KeyboardInterrupt())
         store.db = mock_db
 
         with patch("app.services.vector_store.pa") as mock_pa:
@@ -131,7 +132,11 @@ class TestAdversarialCorruptTable(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
 
         # Mock table that appears valid but list_indices fails
         mock_table = MagicMock()
@@ -177,7 +182,11 @@ class TestAdversarialCorruptTable(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(
@@ -228,7 +237,11 @@ class TestAdversarialOverwritePathFailures(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
 
         # open_table fails transiently
         mock_db.open_table = AsyncMock(side_effect=RuntimeError("Stale table"))
@@ -260,7 +273,11 @@ class TestAdversarialOverwritePathFailures(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
 
         # open_table fails transiently
         mock_db.open_table = AsyncMock(side_effect=RuntimeError("Stale table"))
@@ -305,10 +322,13 @@ class TestAdversarialConcurrency(unittest.IsolatedAsyncioTestCase):
         call_order = []
         create_count = [0]
 
-        async def mock_table_names():
-            call_order.append("table_names")
+        async def mock_list_tables(page_token=None):
+            call_order.append("list_tables")
             await asyncio.sleep(0.01)  # Simulate latency
-            return []  # No tables exist
+            # Response shape of lancedb ListTablesResponse (issue #754)
+            from types import SimpleNamespace
+
+            return SimpleNamespace(tables=[], page_token=None)
 
         async def mock_create_table(name, schema=None, mode=None):
             call_order.append(f"create_{len(call_order)}")
@@ -320,11 +340,11 @@ class TestAdversarialConcurrency(unittest.IsolatedAsyncioTestCase):
             return mock_table
 
         mock_db1 = MagicMock()
-        mock_db1.table_names = mock_table_names
+        mock_db1.list_tables = mock_list_tables
         mock_db1.create_table = mock_create_table
 
         mock_db2 = MagicMock()
-        mock_db2.table_names = mock_table_names
+        mock_db2.list_tables = mock_list_tables
         mock_db2.create_table = mock_create_table
 
         store1.db = mock_db1
@@ -369,7 +389,11 @@ class TestAdversarialConcurrency(unittest.IsolatedAsyncioTestCase):
             return mock_table
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
         mock_db.create_table = mock_create_table
 
         store.db = mock_db
@@ -410,7 +434,11 @@ class TestAdversarialEmbeddingDimBoundary(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[])
@@ -455,7 +483,11 @@ class TestAdversarialEmbeddingDimBoundary(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
         mock_db.create_table = AsyncMock(return_value=MagicMock())
         store.db = mock_db
 
@@ -487,7 +519,11 @@ class TestAdversarialEmbeddingDimBoundary(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[])
@@ -521,7 +557,11 @@ class TestAdversarialEmbeddingDimBoundary(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[])
@@ -561,7 +601,11 @@ class TestAdversarialSchemaMismatch(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
 
         # Mock table with completely different schema
         mock_table = MagicMock()
@@ -606,7 +650,11 @@ class TestAdversarialSchemaMismatch(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
 
         mock_table = MagicMock()
 
@@ -657,7 +705,11 @@ class TestAdversarialFTSCreationEdgeCases(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[])
@@ -692,7 +744,11 @@ class TestAdversarialFTSCreationEdgeCases(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
 
         mock_table = MagicMock()
         # Returns None instead of list
@@ -732,7 +788,11 @@ class TestAdversarialFTSCreationEdgeCases(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
 
         mock_table = MagicMock()
 
@@ -786,7 +846,11 @@ class TestAdversarialTableJustCreatedState(unittest.IsolatedAsyncioTestCase):
 
         mock_db = MagicMock()
 
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         # open_table fails transiently
         mock_db.open_table = AsyncMock(side_effect=RuntimeError("Cannot open"))
         mock_db.drop_table = AsyncMock(side_effect=OSError("Cannot drop"))
@@ -821,7 +885,11 @@ class TestAdversarialTableJustCreatedState(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         mock_db.open_table = AsyncMock(side_effect=RuntimeError("Stale"))
         mock_db.drop_table = AsyncMock()
         mock_db.create_table = AsyncMock()
@@ -872,7 +940,11 @@ class TestAdversarialInputInjection(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=malicious_path)
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[])
@@ -910,7 +982,11 @@ class TestAdversarialInputInjection(unittest.IsolatedAsyncioTestCase):
         store = VectorStore(db_path=unicode_path)
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[])

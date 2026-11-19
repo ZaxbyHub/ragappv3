@@ -425,7 +425,7 @@ def test_migrate_memories_backup_predates_init_db(scratch_dir, tmp_path, monkeyp
     monkeypatch.setattr(migrate_memories, "run_migrations", lambda _path: None)
     monkeypatch.chdir(scratch_dir)
 
-    migrate_memories.migrate(rollback=False, backup=None, retention=30)
+    migrate_memories.migrate(rollback=False, backup=None)
 
     backups = sorted((scratch_dir / "backups").glob("app_backup_*.db"))
     assert backups, "expected a pre-migration backup under scratch/backups"

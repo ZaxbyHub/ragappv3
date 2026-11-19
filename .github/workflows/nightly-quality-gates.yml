@@ -197,6 +197,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends libmagic1 poppler-utils tesseract-ocr
 
       - name: Install full parser stack + Schemathesis
+        # LATEST-WITHIN-RANGES CANARY (issue #751): this tier deliberately
+        # installs the UNLOCKED source specs (backend/requirements.txt), not
+        # the shipped lock, so dependency drift inside the declared ranges
+        # stays visible. The shipped-lock tier lives in nightly.yml.
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt

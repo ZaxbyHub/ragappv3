@@ -27,6 +27,7 @@ import pytest
 from app.services.vector_store import (
     VectorStore,
     VectorStoreValidationError,
+    _list_table_names,
 )
 
 
@@ -129,7 +130,7 @@ class TestVectorStoreInitTable(TestVectorStoreAsync):
         # Should have table
         self.assertIsNotNone(store.table)
         # Table should be named 'chunks'
-        table_names = await store.db.table_names()
+        table_names = await _list_table_names(store.db)
         self.assertIn("chunks", table_names)
 
     @pytest.mark.asyncio

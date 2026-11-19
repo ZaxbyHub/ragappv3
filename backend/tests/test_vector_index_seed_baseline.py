@@ -19,6 +19,7 @@ the engine's naming convention is not load-bearing. These tests pin the real
 
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.vector_store import VectorStore
@@ -46,7 +47,11 @@ def _make_store_opening_existing(indices, row_count):
     mock_table.create_index = AsyncMock()
 
     mock_db = MagicMock()
-    mock_db.table_names = AsyncMock(return_value=["chunks"])
+    mock_db.list_tables = AsyncMock(
+        return_value=SimpleNamespace(
+            tables=["chunks"], page_token=None
+        )
+    )
     mock_db.open_table = AsyncMock(return_value=mock_table)
     store.db = mock_db
     return store

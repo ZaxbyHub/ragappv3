@@ -30,6 +30,8 @@ def _hermetic_env() -> None:
 
 _hermetic_env()
 
+from types import SimpleNamespace  # noqa: E402
+
 from app.config import settings  # noqa: E402
 from app.services.vector_store import (  # noqa: E402
     CHUNKS_STAGING_TABLE,
@@ -246,6 +248,12 @@ class _FakeTable:
 class _FakeDB:
     def __init__(self, tables: dict):
         self.tables = dict(tables)
+
+    async def list_tables(self, page_token=None):
+
+        return SimpleNamespace(
+            tables=list(await self.table_names()), page_token=None
+        )
 
     async def table_names(self):
         return list(self.tables)

@@ -33,6 +33,8 @@ import sys
 import warnings
 from pathlib import Path
 
+from app.services.vector_store import _list_table_names
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
@@ -134,7 +136,7 @@ def test_equal_id_sets_drop_staging_without_rebuild(tmp_path, caplog) -> None:
                 except BaseException as exc:  # noqa: BLE001
                     raised = exc
 
-            names = set(await store.db.table_names())
+            names = set(await _list_table_names(store.db))
             table = await store.db.open_table("chunks")
             ids_df = await table.query().select(["id"]).to_pandas()
             canonical_ids = set(ids_df["id"].astype(str))

@@ -24,7 +24,7 @@ Check these files when present:
 - `frontend/vite.paths.ts`
 - `frontend/src/stores/useSettingsStore.ts`
 - `scripts/check_config_contract.py` ← CI contract enforcer; must be updated atomically with env var defaults
-- `scripts/validate_vite_env.mjs` ← Build-time frontend env validator; must stay in sync with inline Dockerfile validation
+- `Dockerfile` + `frontend/Dockerfile` ← Build-time `VITE_APP_BASENAME` validation is inlined in both; the standalone `scripts/validate_vite_env.mjs` was removed in #754 and no longer exists
 - `README.md`
 - `INSTALLATION.md`
 - `docs/admin-guide.md`
@@ -56,9 +56,11 @@ CI with a mismatch error that is hard to diagnose without knowing all five
 surfaces must agree. The script itself is part of the contract, not just an
 observer of it.
 
-Additionally: the inline validation in `frontend/Dockerfile` and the standalone
-`scripts/validate_vite_env.mjs` must implement identical validation rules.
-If you add or relax a check in one, update the other.
+Additionally: the inlined `VITE_APP_BASENAME` validation blocks in the root
+`Dockerfile` and `frontend/Dockerfile` must implement identical validation
+rules. If you add or relax a check in one, update the other. There is no
+standalone `scripts/validate_vite_env.mjs` (removed in #754); both Dockerfiles
+are the sole authorities.
 
 ## Automation
 

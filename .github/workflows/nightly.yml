@@ -40,18 +40,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libmagic1 poppler-utils tesseract-ocr
 
-      - name: Install full parser stack (backend/requirements.txt incl. unstructured[all-docs])
+      - name: Install full parser stack (the SHIPPED lock; issue #751 AC2)
+        # The runtime set under test is backend/requirements-lock.txt — exactly
+        # what the Dockerfile installs with --require-hashes — so a green
+        # nightly proves the shipped set, not an unlocked resolve. Test/OTel
+        # tooling is layered on top CONSTRAINED to the lock (pip freeze of the
+        # just-installed shipped env), so tooling deps cannot bump any locked
+        # runtime pin. The latest-within-ranges drift signal stays available on
+        # every PR via ci.yml's Backend job (CI lock) and nightly-quality-gates
+        # schemathesis (unlocked source specs, labelled there).
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -r requirements-dev.txt
-          pip install pytest-xdist
+          pip install --require-hashes -r requirements-lock.txt
+          python -m pip freeze > /tmp/lock-constraints.txt
+          pip install -c /tmp/lock-constraints.txt -r requirements-dev.txt pytest-xdist
           # OTel closure units: TestRealTracerPipeline skips without the SDK
           # (issue #743, TQ-sibling-batch-04-01) — CI/nightly never installed
           # requirements-otel.txt, so the F-001c held-span-lifetime guard was
           # skipped on every run. Validated locally with this exact pin:
           # opentelemetry-sdk 1.45.0 -> 10 passed, 0 skipped.
-          pip install -r requirements-otel.txt
+          pip install -c /tmp/lock-constraints.txt -r requirements-otel.txt
+          pip check
 
       - name: OTel closure units (real tracer pipeline, unskipped)
         run: pytest --tb=short -v --timeout=300 --timeout-method=thread tests/test_518_closure_units.py

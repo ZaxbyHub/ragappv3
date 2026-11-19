@@ -86,7 +86,7 @@ from app.services.upload_validation import (
     secure_filename,
     validate_image_content,
 )
-from app.services.vector_store import VectorStore
+from app.services.vector_store import VectorStore, _list_table_names
 
 logger = logging.getLogger(__name__)
 
@@ -3388,7 +3388,7 @@ async def _purge_file_derived_data(
 
     try:
         db = vector_store.db
-        if db is not None and "chunks" in await db.table_names():
+        if db is not None and "chunks" in await _list_table_names(db):
             vector_store.table = await db.open_table("chunks")
             deleted_chunks = await vector_store.delete_by_file(str(file_id))
             logger.info(

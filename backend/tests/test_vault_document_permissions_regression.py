@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -27,7 +28,11 @@ def permission_client():
 
     vector_store = MagicMock()
     vector_store.db = MagicMock()
-    vector_store.db.table_names = AsyncMock(return_value=["chunks"])
+    vector_store.db.list_tables = AsyncMock(
+        return_value=SimpleNamespace(
+            tables=["chunks"], page_token=None
+        )
+    )
     vector_store.db.open_table = AsyncMock(return_value=MagicMock())
     vector_store.delete_by_file = AsyncMock(return_value=1)
 

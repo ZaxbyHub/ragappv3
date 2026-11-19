@@ -15,6 +15,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 BACKEND = Path(__file__).resolve().parents[1]
 REPO = BACKEND.parent
@@ -581,7 +582,7 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
         )
         fake = types.SimpleNamespace(
             connect=lambda _p: types.SimpleNamespace(
-                table_names=lambda: ["chunks"], open_table=lambda _n: table
+                table_names=lambda: ["chunks"], list_tables=lambda page_token=None: SimpleNamespace(tables=["chunks"], page_token=None), open_table=lambda _n: table
             )
         )
         saved_mod = sys.modules.get("lancedb")

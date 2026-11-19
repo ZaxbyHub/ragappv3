@@ -171,7 +171,7 @@ def _detect_stored_dim(lancedb_path: Path) -> int | None:
         import lancedb as _ldb  # type: ignore
 
         db = _ldb.connect(str(lancedb_path))
-        if "chunks" not in db.table_names():
+        if "chunks" not in _list_table_names(db):
             return None
         tbl = db.open_table("chunks")
         schema = tbl.schema
@@ -286,7 +286,7 @@ def _index_shares_claimed_ids(
             import lancedb as _ldb  # type: ignore
 
             db = _ldb.connect(str(lancedb_path))
-            if "chunks" not in db.table_names():
+            if "chunks" not in _list_table_names(db):
                 return None
             tbl = db.open_table("chunks")
             # An empty table, or one whose file_id values are all NULL,
@@ -1178,6 +1178,32 @@ def run_migration(
         )
     print()
     return reset_count
+
+
+
+def _list_table_names(db: object) -> list[str]:
+    """List all table names via the non-deprecated paginated API (issue #754).
+
+    ``table_names()`` is deprecated in the pinned lancedb; ``list_tables()``
+    returns ``ListTablesResponse`` with ``.tables`` and ``.page_token`` (None
+    or empty when exhausted). Stops on any falsy token; fails loudly on a
+    repeated token.
+    """
+    names: list[str] = []
+    token: str | None = None
+    seen: set[str] = set()
+    while True:
+        response = db.list_tables(page_token=token)
+        names.extend(response.tables)
+        token = response.page_token
+        if not token:
+            return names
+        if token in seen:
+            raise RuntimeError(
+                "lancedb list_tables returned a repeated page token; "
+                "refusing to loop forever"
+            )
+        seen.add(token)
 
 
 def main() -> None:

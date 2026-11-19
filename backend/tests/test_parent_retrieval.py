@@ -1,5 +1,6 @@
 """Tests for parent-document retrieval: schema migration, ingestion, dedup, and prompt expansion (Issue #12)."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -346,7 +347,11 @@ class TestMigrateAddParentWindow:
         df = FakeDF()
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         mock_db.open_table = AsyncMock(return_value=mock_table)
 
         store.db = mock_db
@@ -385,7 +390,9 @@ class TestMigrateAddParentWindow:
 
         store = VectorStore(db_path=Path("/tmp/mig_test"))
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])  # No "chunks" table
+        mock_db.list_tables = AsyncMock(  # No "chunks" table
+            return_value=SimpleNamespace(tables=[], page_token=None)
+        )
         store.db = mock_db
 
         count = await store.migrate_add_parent_window(dry_run=True)

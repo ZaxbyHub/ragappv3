@@ -45,6 +45,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from app.services.vector_store import _list_table_names
+
 # Repo root: this file lives at <repo>/backend/tests/issue513_checks/<name>.py
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "backend"))
@@ -557,7 +559,7 @@ async def _scenario() -> tuple[str, str, str, str]:
             )
         except Exception:  # noqa: BLE001
             aborted_searchable = False
-        table_names4 = await store4.db.table_names()
+        table_names4 = await _list_table_names(store4.db)
         if (
             aborted_dim != OLD_DIM
             or aborted_count != baseline4

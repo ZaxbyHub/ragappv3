@@ -100,6 +100,13 @@ def main() -> int:
             return result
 
         class _FakeVSDB:
+            async def list_tables(self, page_token=None):
+                from types import SimpleNamespace
+
+                return SimpleNamespace(
+                    tables=list(await self.table_names()), page_token=None
+                )
+
             async def table_names(self):
                 return ["chunks"]
 

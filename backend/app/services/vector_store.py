@@ -25,6 +25,34 @@ from app.config import settings
 from app.models import migration_journal
 from app.utils.fusion import rrf_fuse
 
+
+async def _list_table_names(db: object) -> list[str]:
+    """List all table names via the non-deprecated paginated API.
+
+    Replaces ``AsyncConnection.table_names()`` (deprecated in the pinned
+    lancedb; issue #754). ``list_tables()`` returns a ``ListTablesResponse``
+    with ``.tables`` (page of names) and ``.page_token`` (None or empty when
+    exhausted). The loop stops on any falsy token and fails loudly on a
+    repeated token (server-side pagination bug) instead of looping forever
+    or truncating silently.
+    """
+    names: list[str] = []
+    token: str | None = None
+    seen: set[str] = set()
+    while True:
+        response = await db.list_tables(page_token=token)
+        names.extend(response.tables)
+        token = response.page_token
+        if not token:
+            return names
+        if token in seen:
+            raise RuntimeError(
+                "lancedb list_tables returned a repeated page token; "
+                "refusing to loop forever"
+            )
+        seen.add(token)
+
+
 logger = logging.getLogger(__name__)
 
 # Thread lock for FTS exceptions counter
@@ -852,7 +880,7 @@ class VectorStore:
 
         # Create or open table with error handling
         try:
-            table_names = await self.db.table_names()
+            table_names = await _list_table_names(self.db)
             if "chunks" in table_names:
                 try:
                     self.table = await self.db.open_table("chunks")
@@ -1320,7 +1348,7 @@ class VectorStore:
             if self.db is None:
                 return 0
             try:
-                table_names = await self.db.table_names()
+                table_names = await _list_table_names(self.db)
                 if "chunks" not in table_names:
                     return 0
                 self.table = await self.db.open_table("chunks")
@@ -1627,7 +1655,7 @@ class VectorStore:
 
         if self.table is None:
             try:
-                table_names = await self.db.table_names()
+                table_names = await _list_table_names(self.db)
             except (OSError, RuntimeError, ValueError) as e:
                 raise VectorStoreConnectionError(
                     f"Failed to list table names: {e}"
@@ -1841,7 +1869,7 @@ class VectorStore:
         # Try to open existing table if not already loaded
         if self.table is None:
             try:
-                table_names = await self.db.table_names()
+                table_names = await _list_table_names(self.db)
             except (OSError, RuntimeError, ValueError) as e:
                 raise VectorStoreConnectionError(
                     f"Failed to list table names: {e}"
@@ -2209,7 +2237,7 @@ class VectorStore:
                 await self.connect()
             if self.table is None:
                 try:
-                    table_names = await self.db.table_names()
+                    table_names = await _list_table_names(self.db)
                 except (OSError, RuntimeError, ValueError) as e:
                     raise VectorStoreConnectionError(
                         f"Failed to list table names: {e}"
@@ -2277,7 +2305,7 @@ class VectorStore:
         # Try to open existing table if not already loaded
         if self.table is None:
             try:
-                table_names = await self.db.table_names()
+                table_names = await _list_table_names(self.db)
             except (OSError, RuntimeError, ValueError) as e:
                 raise VectorStoreConnectionError(
                     f"Failed to list table names: {e}"
@@ -2350,7 +2378,7 @@ class VectorStore:
         # Try to open existing table if not already loaded
         if self.table is None:
             try:
-                table_names = await self.db.table_names()
+                table_names = await _list_table_names(self.db)
             except (OSError, RuntimeError, ValueError) as e:
                 raise VectorStoreConnectionError(
                     f"Failed to list table names: {e}"
@@ -2462,7 +2490,7 @@ class VectorStore:
         if self.table is None:
             try:
                 if self.db is not None:
-                    table_names = await self.db.table_names()
+                    table_names = await _list_table_names(self.db)
                     if "chunks" not in table_names:
                         return 0
                     self.table = await self.db.open_table("chunks")
@@ -2785,7 +2813,7 @@ class VectorStore:
         """
         if self.db is None:
             return
-        table_names = await self.db.table_names()
+        table_names = await _list_table_names(self.db)
         if CHUNKS_STAGING_TABLE not in table_names:
             return
 
@@ -3066,7 +3094,7 @@ class VectorStore:
             return None
         if self.table is None:
             try:
-                table_names = await self.db.table_names()
+                table_names = await _list_table_names(self.db)
             except (OSError, RuntimeError, ValueError):
                 return None
             if "chunks" not in table_names:
@@ -3159,7 +3187,7 @@ class VectorStore:
                         "Database connection is not available."
                     )
                 try:
-                    table_names = await self.db.table_names()
+                    table_names = await _list_table_names(self.db)
                     if DIMENSION_REBUILD_TABLE in table_names:
                         await self.db.drop_table(DIMENSION_REBUILD_TABLE)
                         logger.warning(
@@ -3424,7 +3452,7 @@ class VectorStore:
                 if self.db is None:
                     return
                 try:
-                    table_names = await self.db.table_names()
+                    table_names = await _list_table_names(self.db)
                     if handle.table_name in table_names:
                         await self.db.drop_table(handle.table_name)
                         logger.info(
@@ -3475,7 +3503,7 @@ class VectorStore:
         await self._reconcile_chunks_rebuild_state(migration_name="LanceDB vault_id migration")
 
         try:
-            table_names = await self.db.table_names()
+            table_names = await _list_table_names(self.db)
         except (OSError, RuntimeError, ValueError) as e:
             logger.warning(f"LanceDB vault_id migration failed: {e}")
             raise
@@ -3575,7 +3603,7 @@ class VectorStore:
         await self._reconcile_chunks_rebuild_state(migration_name="LanceDB chunk_scale migration")
 
         try:
-            table_names = await self.db.table_names()
+            table_names = await _list_table_names(self.db)
         except (OSError, RuntimeError, ValueError) as e:
             logger.warning(f"LanceDB chunk_scale migration failed: {e}")
             raise
@@ -3676,7 +3704,7 @@ class VectorStore:
         await self._reconcile_chunks_rebuild_state(migration_name="LanceDB sparse_embedding migration")
 
         try:
-            table_names = await self.db.table_names()
+            table_names = await _list_table_names(self.db)
         except (OSError, RuntimeError, ValueError) as e:
             logger.warning(f"LanceDB sparse_embedding migration failed: {e}")
             raise
@@ -3775,7 +3803,7 @@ class VectorStore:
         await self._reconcile_chunks_rebuild_state(migration_name="LanceDB parent_window migration")
 
         try:
-            table_names = await self.db.table_names()
+            table_names = await _list_table_names(self.db)
         except (OSError, RuntimeError, ValueError) as e:
             logger.warning(f"LanceDB parent_window migration failed: {e}")
             raise
@@ -4073,7 +4101,7 @@ class VectorStore:
             }
 
         try:
-            table_names = await self.db.table_names()
+            table_names = await _list_table_names(self.db)
             table_exists = "chunks" in table_names
         except (OSError, RuntimeError, ValueError) as e:
             logger.warning(f"Failed to check table existence: {e}")

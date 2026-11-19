@@ -18,6 +18,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -89,7 +90,11 @@ class TestAdversarialLargeScaleCount(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = _table_mock()
 
@@ -151,7 +156,11 @@ class TestAdversarialScaleStringParsing(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = _table_mock()
 
@@ -190,7 +199,11 @@ class TestAdversarialScaleStringParsing(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = _table_mock()
 
@@ -228,7 +241,11 @@ class TestAdversarialScaleStringParsing(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = _table_mock()
 
@@ -289,7 +306,11 @@ class TestAdversarialExceptions(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = _table_mock()
 
@@ -325,7 +346,11 @@ class TestAdversarialExceptions(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = _table_mock()
 
@@ -386,7 +411,11 @@ class TestAdversarialConcurrency(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = _table_mock()
 
@@ -449,7 +478,11 @@ class TestAdversarialInvalidConfig(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = _table_mock()
 
@@ -484,7 +517,11 @@ class TestAdversarialInvalidConfig(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = _table_mock()
 
@@ -541,7 +578,11 @@ class TestAdversarialSQLInjection(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = _table_mock()
 
@@ -582,7 +623,11 @@ class TestAdversarialSQLInjection(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = _table_mock()
 
@@ -647,7 +692,11 @@ class TestAdversarialLargeFetchK(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = _table_mock()
 
@@ -717,7 +766,11 @@ class TestAdversarialSemaphoreEdgeCases(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = _table_mock()
 

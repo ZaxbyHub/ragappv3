@@ -17,6 +17,7 @@ This module tests:
 
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.vector_store import (
@@ -46,7 +47,11 @@ class TestInitTableDefersVectorIndex(unittest.IsolatedAsyncioTestCase):
 
         # Mock the database connection
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
 
         # Mock table creation - track create_index calls
         mock_table = MagicMock()
@@ -102,7 +107,11 @@ class TestFTSIndexGuard(unittest.IsolatedAsyncioTestCase):
 
         # Mock the database connection
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
 
         # Mock table with no existing FTS index
         mock_table = MagicMock()
@@ -145,7 +154,11 @@ class TestFTSIndexGuard(unittest.IsolatedAsyncioTestCase):
 
         # Mock the database connection
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
 
         # Mock existing FTS index with the REAL engine-reported shape
         # (auto-named 'text_idx'; detection is column+type based).

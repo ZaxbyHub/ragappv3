@@ -70,8 +70,47 @@ if (-not $SkipOllama) {
 }
 
 if (-not $SkipEmbedding) {
-    $embeddingExists = docker ps --format "{{.Names}}" 2>&1 | Select-String -SimpleMatch $EmbeddingContainerName
-    if (-not $embeddingExists) {
+    # Three-state model (issue #753): docker-compose.yml reuses this exact
+    # container name, so after a host restart or `docker compose stop` the
+    # container exists in EXITED state — a running-only probe misses it and
+    # `docker run --name` then fails on the name conflict. Probe ALL
+    # containers by exact name and carry the state.
+    # Probe failure must not be mistaken for an absent container: a failed
+    # docker query would otherwise fall through to `docker run --name` (review
+    # ST-001/CS-002). Escape the configured name so a `.` in a valid Docker
+    # name is matched literally rather than as a regex wildcard. Check for
+    # the executable first: a missing docker must not leave $LASTEXITCODE
+    # stale and print an empty "(exit )" message (Stage B test probe).
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        Write-Output "ERROR: docker executable not found; cannot probe or start $EmbeddingContainerName."
+        exit 1
+    }
+    $embeddingState = docker ps -a --filter "name=^$([regex]::Escape($EmbeddingContainerName))$" --format "{{.State}}"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Output "ERROR: could not query docker for $EmbeddingContainerName (exit $LASTEXITCODE); is the docker daemon available?"
+        exit $LASTEXITCODE
+    }
+    $embeddingState = $embeddingState | Select-Object -First 1
+    if ($embeddingState -eq "running") {
+        Write-Output "$EmbeddingContainerName container already running"
+    } elseif ($embeddingState -eq "paused") {
+        # A paused container is RUNNING but suspended: docker start cannot
+        # resume it ("You cannot start a paused container"); unpause is the
+        # correct operation (implementation-review CR-1).
+        Write-Output "Unpausing $EmbeddingContainerName container..."
+        docker unpause $EmbeddingContainerName
+        if ($LASTEXITCODE -ne 0) {
+            Write-Output "ERROR: docker unpause $EmbeddingContainerName failed (exit $LASTEXITCODE). Run 'docker inspect $EmbeddingContainerName' for the cause."
+            exit $LASTEXITCODE
+        }
+    } elseif ($embeddingState -in @("exited", "created", "restarting", "dead")) {
+        Write-Output "Starting existing stopped $EmbeddingContainerName container..."
+        docker start $EmbeddingContainerName
+        if ($LASTEXITCODE -ne 0) {
+            Write-Output "ERROR: docker start $EmbeddingContainerName failed (exit $LASTEXITCODE). Run 'docker start $EmbeddingContainerName' manually and inspect 'docker inspect $EmbeddingContainerName' for the cause."
+            exit $LASTEXITCODE
+        }
+    } else {
         Write-Output "Starting $EmbeddingContainerName embedding container..."
         New-Item -ItemType Directory -Force -Path $EmbeddingDataDir | Out-Null
         $dockerArgs = @(
@@ -91,9 +130,11 @@ if (-not $SkipEmbedding) {
         # EMBEDDING_BATCH_SIZE is 64 — without the flag, every ingestion batch
         # over 32 texts fails with a 422 on this launch path (issue #698).
         $dockerArgs += @($EmbeddingImage, "--model-id", $EmbeddingModel, "--port", "8080", "--max-batch-tokens", "16384", "--max-client-batch-size", "128")
-        docker @dockerArgs 2>&1 | Out-Null
-    } else {
-        Write-Output "$EmbeddingContainerName container already running"
+        docker @dockerArgs
+        if ($LASTEXITCODE -ne 0) {
+            Write-Output "ERROR: docker run for $EmbeddingContainerName failed (exit $LASTEXITCODE). A stopped container with this name existing is the usual cause - run 'docker ps -a --filter name=$EmbeddingContainerName' and 'docker start' it, or remove it first."
+            exit $LASTEXITCODE
+        }
     }
 }
 
@@ -131,7 +172,7 @@ Write-Output "  $FrontendPort  (Frontend):    $frontend"
 if ($ollama -eq "OK" -and $backend -eq "OK" -and $frontend -eq "OK") {
     Write-Output "ALL SERVICES RUNNING"
     if (-not $SkipEmbedding -and $embedding -ne "OK") {
-        Write-Output "NOTE: $EmbeddingContainerName may still be loading models."
+        Write-Output "NOTE: $EmbeddingContainerName was started this run and may still be loading models; its container start/exit code was checked above (issue #753)."
     }
 } else {
     Write-Output "WARNING: Some services failed to start"

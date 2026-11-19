@@ -1,0 +1,7 @@
+# Shell scripts must stay LF in the git index: a CRLF blob breaks every POSIX
+# bash at `set -euo pipefail` ("set: pipefail: invalid option name"), which is
+# exactly how scripts/update-lock.sh shipped broken for Linux/macOS (issue #751
+# AC3/AC4; guard test backend/tests/test_i04_shipped_lock.py). Only the *.sh
+# rule is asserted — deliberately no global `* text=auto` (mass renormalization
+# is out of scope).
+*.sh text eol=lf

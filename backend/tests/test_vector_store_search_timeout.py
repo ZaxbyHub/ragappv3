@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from types import SimpleNamespace
+
 from app.config import Settings, settings
 from app.services.vector_store import VectorStore, VectorStoreError
 
@@ -134,7 +136,11 @@ class TestSearchSemaphoreTimeoutIntegration(unittest.IsolatedAsyncioTestCase):
         """
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
         store.db = MagicMock()
-        store.db.table_names = AsyncMock(return_value=["chunks"])
+        store.db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.table = MagicMock()
         store.table.list_indices = AsyncMock(return_value=[])
         store.table.count_rows = AsyncMock(return_value=0)

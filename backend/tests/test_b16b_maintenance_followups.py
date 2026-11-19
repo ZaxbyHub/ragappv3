@@ -49,7 +49,7 @@ def test_rollback_clears_maintenance_carried_by_real_backup(tmp_path, monkeypatc
 
     # A full migrate run: the flag is enabled BEFORE the backup is taken, so
     # the produced backup carries maintenance=1.
-    migrate_memories.migrate(rollback=False, backup=None, retention=30)
+    migrate_memories.migrate(rollback=False, backup=None)
     assert _maintenance_value(db_path) == 0  # flag cleared after the run
 
     backups = sorted((scratch / "backups").glob("app_backup_*.db"))
@@ -66,7 +66,7 @@ def test_rollback_clears_maintenance_carried_by_real_backup(tmp_path, monkeypatc
     # Rollback with the REAL decrypt_backup (plain-SQLite copy path) restores
     # the backup over the database; the post-restore clear must flip the
     # carried flag back to 0.
-    migrate_memories.migrate(rollback=True, backup=backups[0], retention=30)
+    migrate_memories.migrate(rollback=True, backup=backups[0])
     assert _maintenance_value(db_path) == 0
 
 

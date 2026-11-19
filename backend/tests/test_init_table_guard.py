@@ -16,6 +16,7 @@ This module tests:
 
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.vector_store import (
@@ -39,7 +40,9 @@ class TestTableJustCreatedTracking(unittest.IsolatedAsyncioTestCase):
 
         # Mock database - no existing tables
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])  # No existing tables
+        mock_db.list_tables = AsyncMock(  # No existing tables
+            return_value=SimpleNamespace(tables=[], page_token=None)
+        )
 
         # Mock table
         mock_table = MagicMock()
@@ -90,7 +93,11 @@ class TestTableJustCreatedTracking(unittest.IsolatedAsyncioTestCase):
 
         # Mock database - chunks table exists
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
 
         # open_table fails transiently
         mock_db.open_table = AsyncMock(side_effect=RuntimeError("Stale table"))
@@ -125,7 +132,11 @@ class TestTableJustCreatedTracking(unittest.IsolatedAsyncioTestCase):
 
         # Mock database - chunks table exists
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
 
         # Mock table with existing FTS index
         mock_table = MagicMock()
@@ -176,7 +187,11 @@ class TestFTSIndexReplaceFalse(unittest.IsolatedAsyncioTestCase):
 
         # Mock database
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
 
         # Track create_index call arguments
         create_index_calls = []
@@ -229,7 +244,11 @@ class TestFTSIndexReplaceFalse(unittest.IsolatedAsyncioTestCase):
 
         # Mock database
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
 
         # Mock existing FTS index
         existing_fts = MagicMock()
@@ -267,7 +286,11 @@ class TestFTSIndexReplaceFalse(unittest.IsolatedAsyncioTestCase):
 
         # Mock database
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
 
         # Mock existing FTS index
         existing_fts = MagicMock()
@@ -314,7 +337,11 @@ class TestFTSIndexCreationFailure(unittest.IsolatedAsyncioTestCase):
 
         # Mock database
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[])  # No existing FTS
@@ -362,7 +389,11 @@ class TestDeferredIndexLogMessage(unittest.IsolatedAsyncioTestCase):
 
         # Mock database - no existing tables
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=[])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=[], page_token=None
+            )
+        )
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[])

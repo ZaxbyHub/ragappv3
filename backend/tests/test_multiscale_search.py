@@ -17,6 +17,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -90,7 +91,11 @@ class TestMultiScaleSearchSemaphore(unittest.IsolatedAsyncioTestCase):
 
         # Mock db with table_names to indicate table exists
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = MagicMock()
         store.table.list_indices = AsyncMock(return_value=[])
@@ -138,7 +143,11 @@ class TestMultiScaleSearchSemaphore(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = MagicMock()
         store.table.list_indices = AsyncMock(return_value=[])
@@ -227,7 +236,11 @@ class TestMultiScaleSemaphoreConcurrency(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = MagicMock()
         store.table.list_indices = AsyncMock(return_value=[])
@@ -288,7 +301,11 @@ class TestMultiScaleSemaphoreConcurrency(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = MagicMock()
         store.table.list_indices = AsyncMock(return_value=[])
@@ -349,7 +366,11 @@ class TestMultiScaleSemaphoreConcurrency(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = MagicMock()
         store.table.list_indices = AsyncMock(return_value=[])
@@ -416,7 +437,11 @@ class TestMultiScaleSearchEdgeCases(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = tracking_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         mock_db.open_table = AsyncMock(
             return_value=MagicMock()
         )  # Mock open_table as async
@@ -477,7 +502,11 @@ class TestMultiScaleSearchEdgeCases(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = MagicMock()
         store.table.list_indices = AsyncMock(return_value=[])
@@ -529,7 +558,11 @@ class TestMultiScaleSearchEdgeCases(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = MagicMock()
         store.table.list_indices = AsyncMock(return_value=[])
@@ -584,7 +617,11 @@ class TestMultiScaleSearchEdgeCases(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
         store.table = MagicMock()
         store.table.list_indices = AsyncMock(return_value=[])
@@ -663,7 +700,11 @@ class TestMultiScaleSearchEdgeCases(unittest.IsolatedAsyncioTestCase):
         store._search_single_scale = mock_search_single_scale
 
         mock_db = MagicMock()
-        mock_db.table_names = AsyncMock(return_value=["chunks"])
+        mock_db.list_tables = AsyncMock(
+            return_value=SimpleNamespace(
+                tables=["chunks"], page_token=None
+            )
+        )
         store.db = mock_db
 
         with patch("app.services.vector_store.settings") as mock_settings:

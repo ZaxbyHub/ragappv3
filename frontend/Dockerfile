@@ -24,9 +24,10 @@ ARG VITE_API_URL=
 ENV VITE_APP_BASENAME=${VITE_APP_BASENAME}
 ENV VITE_API_URL=${VITE_API_URL}
 
-# validate_vite_env inlined to avoid dependency on an external file; the
-# validation rules and error-message text are identical to
-# scripts/validate_vite_env.mjs (config-env-contract parity), with one repo-
+# validate_vite_env inlined: this inlined copy is the SOLE authority (the
+# standalone scripts/validate_vite_env.mjs had no caller and was removed,
+# issue #754); rules and error text match the original config-env-contract
+# parity (with one repo-
 # mandated addition: every throw concatenates JSON.stringify(raw) so build
 # logs name the received value (issue #567 — pinned by
 # frontend/src/base-path-message.test.ts).

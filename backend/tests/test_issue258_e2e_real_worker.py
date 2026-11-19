@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 """Issue #258 (E2) acceptance checks — AC6 / TEST-008: real-worker e2e + real
 row deletion.
 
@@ -75,6 +77,12 @@ _SQL_CONTENT = (
 
 class _FakeLanceDB:
     """Minimal double of the lancedb connection the delete purge inspects."""
+
+    async def list_tables(self, page_token=None):
+
+        return SimpleNamespace(
+            tables=list(await self.table_names()), page_token=None
+        )
 
     async def table_names(self):
         return ["chunks"]

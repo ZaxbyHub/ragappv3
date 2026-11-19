@@ -1006,6 +1006,12 @@ class TestVectorStoreAdversarial:
 
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
         store.db = AsyncMock()
+        # Response shape of lancedb list_tables (issue #754): a bare AsyncMock
+        # returns the same truthy page_token on every call, which the helper's
+        # repeated-token guard correctly rejects.
+        from types import SimpleNamespace
+
+        store.db.list_tables.return_value = SimpleNamespace(tables=[], page_token=None)
 
         # Very large dimension
         try:

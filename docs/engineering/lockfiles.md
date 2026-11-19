@@ -25,18 +25,30 @@ and the universal-marker invariant by the `TestUniversalLockfiles` tests in
 
 ## CI verification (the contract to stay green)
 
-The Backend CI job (`.github/workflows/ci.yml`, `working-directory: backend`)
-verifies BOTH lockfiles on every push: each lock is seeded into a scratch
-file, re-resolved with the same `uv pip compile --universal` invocation used
-for regeneration, and byte-compared (`git diff --no-index --exit-code`) to
-the committed lock. A lockfile that is out of sync with its source spec (or
-was regenerated with a different procedure or a different uv) fails the job
-before any test runs — CI pins `uv==0.12.15` and the update scripts install
-the same version for byte-diff parity. CI installs from `requirements-lock-ci.txt` (with `--require-hashes` —
-the hash gate is enforced at the real consumer) + `requirements-dev.txt` on
-Linux, and the root Dockerfile installs `requirements-lock.txt` with
-`--require-hashes`; resolution parseability on any host is asserted by
-`backend/tests/test_lockfile_install.py`.
+The Backend CI job (`.github/workflows/ci.yml`, repository root) verifies BOTH
+lockfiles on every push by running the documented regeneration script itself
+on ubuntu and asserting a fixed point:
+
+```bash
+bash scripts/update-lock.sh
+git diff --exit-code -- backend/requirements-lock.txt backend/requirements-lock-ci.txt
+```
+
+This proves both that the committed locks are a regeneration fixed point and
+that `scripts/update-lock.sh` executes past its POSIX prologue (the CRLF defect
+class from #751, pinned by `.gitattributes`). A lockfile out of sync with its
+source spec — or regenerated with a different procedure or uv — fails before
+any test runs. CI pins `uv==0.12.15` and the update scripts install the same
+version for byte-diff parity. CI installs from `requirements-lock-ci.txt` with
+`--require-hashes` plus `requirements-dev.txt` on Linux; the scheduled nightly
+full-parser tier installs the **shipped** `requirements-lock.txt` with
+`--require-hashes` and layers dev/OTel tooling on top under a `pip freeze`
+constraint from that shipped environment plus `pip check`. The root Dockerfile
+installs `requirements-lock.txt` with `--require-hashes`; resolution
+parseability on any host is asserted by `backend/tests/test_lockfile_install.py`.
+A lock-only push also triggers docker-smoke because the docker-scope path
+filter includes both `backend/requirements.txt` and
+`backend/requirements-lock.txt`.
 
 ## Regeneration procedure (any platform)
 
@@ -84,11 +96,27 @@ above closes that class: regenerate anywhere, install anywhere.
 2. Regenerate **both** lockfiles (procedure above); diff and justify every
    delta beyond the edit you intended (marker/format-only churn is expected
    when the procedure changes, not when a version moves).
-3. Verify exactly what CI verifies (seed + re-resolve + byte-diff), then
-   install and test from the locks:
+3. Verify the regeneration is a fixed point. **During a deliberate relock**,
+   snapshot the intended regenerated locks, run the script a second time, and
+   compare against that snapshot — *not* against HEAD, which still holds the
+   old locks and would show your intended changes as drift:
+   ```bash
+   cp backend/requirements-lock.txt backend/requirements-lock.txt.intended
+   cp backend/requirements-lock-ci.txt backend/requirements-lock-ci.txt.intended
+   bash scripts/update-lock.sh
+   diff -u backend/requirements-lock.txt.intended backend/requirements-lock.txt
+   diff -u backend/requirements-lock-ci.txt.intended backend/requirements-lock-ci.txt
+   rm backend/requirements-lock.txt.intended backend/requirements-lock-ci.txt.intended
+   ```
+   (`git diff --exit-code` against HEAD is CI's check on the clean committed
+   tree, not the relock procedure.) Then install and test from the locks:
    ```bash
    cd backend
-   pip install -r requirements-lock-ci.txt -r requirements-dev.txt
+   # Hash-checking applies to EVERY requirement in the command, so the lock
+   # installs separately from the unlocked dev tooling (as CI does).
+   pip install --require-hashes -r requirements-lock-ci.txt
+   pip install -r requirements-dev.txt
+   pip install pytest-xdist
    pytest --tb=short -q tests/
    ```
 4. Commit source spec + both lockfiles together in one commit (a lockfile
@@ -106,7 +134,9 @@ git revert <commit-that-bumped-the-dependency>
 
 # Lockfiles only (e.g. a regeneration gone wrong, source spec is fine)
 git checkout <last-known-good-sha> -- backend/requirements-lock.txt backend/requirements-lock-ci.txt
-# then confirm consistency the same way CI does (seed + re-resolve + byte-diff)
+# then re-run the fixed-point verification from step 3 against the restored
+# locks. Snapshot them first: HEAD still holds the bad locks, so comparing
+# against HEAD would report the intended rollback as drift.
 ```
 
 Because every entry is hash-pinned, `pip install -r requirements-lock*.txt`
