@@ -511,14 +511,36 @@ def _snapshot_tmp_artifacts() -> set:
     return set(glob.glob(os.path.join(tempfile.gettempdir(), "tmp*")))
 
 
+@contextmanager
+def _recording_mkddir(module):
+    """Record the exact temp dir a fixture's bare mkdtemp() creates, so the
+    leftover assertion is scoped to THAT dir — under xdist the shared /tmp
+    tmp* namespace is concurrently polluted by other workers' mkstemp files
+    and a glob diff is a false positive (CI round 1)."""
+    import tempfile as tempfile_mod
+
+    original = tempfile_mod.mkdtemp
+    created: list = []
+
+    def recording(*args, **kwargs):
+        path = original(*args, **kwargs)
+        created.append(path)
+        return path
+
+    try:
+        setattr(module.tempfile, "mkdtemp", recording)
+        yield created
+    finally:
+        setattr(module.tempfile, "mkdtemp", original)
+
+
 def test_org_overrides_setup_db_failure_cleans_up(monkeypatch):
     """Implementation-review round 5 (#946 class): the autouse class fixture
     setup_db in test_prompt_org_overrides (TestPromptOverrideAPIFixtures) is
     the module's third mkdtemp site — the same original-error + no-leftover
-    contract applies to the migration leg (round-6 reviewer question: the
-    SEED phase — a raise after sqlite3.connect — gets its own leg below,
-    driving hash_password to fail so the nested conn.close() must run before
-    the rmtree). RED at the pre-fix tree, GREEN after the fix.
+    contract applies to the migration leg (the SEED phase gets its own leg
+    below). RED at the pre-fix tree, GREEN after the fix. The leftover
+    assertion is scoped to the exact recorded mkdtemp dir (xdist-safe).
     """
     import types
 
@@ -526,32 +548,22 @@ def test_org_overrides_setup_db_failure_cleans_up(monkeypatch):
     holder = getattr(module, "TestPromptOverrideAPIFixtures")
     fixture = types.MethodType(_unwrap_fixture(holder.setup_db), holder())
 
-    def _snap() -> set:
-        return _snapshot_c04_dirs() | _snapshot_tmp_artifacts()
-
-    before = _snap()
-    leftovers = []
-    try:
-        _drive_setup_failure(
-            fixture,
-            monkeypatch,
-            "AC5",
-            "test_prompt_org_overrides.setup_db",
-        )
-        leftovers = sorted(_snap() - before)
-        assert leftovers == [], (
-            f"AC5-LEFTOVER-DIR: setup_db left temp dir(s)/file(s) behind on "
-            f"setup failure: {leftovers}"
-        )
-    finally:
-        for path in leftovers or (_snap() - before):
-            if os.path.isdir(path):
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+    with _recording_mkddir(module) as created:
+        try:
+            _drive_setup_failure(
+                fixture,
+                monkeypatch,
+                "AC5",
+                "test_prompt_org_overrides.setup_db",
+            )
+        except Exception:  # noqa: BLE001 — the drive asserts internally
+            pass
+        assert created, "sanity: setup_db created its temp dir"
+        for path in created:
+            assert not os.path.exists(path), (
+                f"AC5-LEFTOVER-DIR: setup_db left {path} behind on setup "
+                "failure"
+            )
 
 
 def test_org_overrides_setup_db_seed_failure_closes_conn(monkeypatch):
@@ -582,12 +594,7 @@ def test_org_overrides_setup_db_seed_failure_closes_conn(monkeypatch):
         finally:
             module.hash_password = original
 
-    def _snap() -> set:
-        return _snapshot_c04_dirs() | _snapshot_tmp_artifacts()
-
-    before = _snap()
-    leftovers = []
-    try:
+    with _recording_mkddir(module) as created:
         _drive_setup_failure(
             fixture,
             monkeypatch,
@@ -595,20 +602,12 @@ def test_org_overrides_setup_db_seed_failure_closes_conn(monkeypatch):
             "test_prompt_org_overrides.setup_db(seed)",
             failure_ctx=_forced_hash_failure(),
         )
-        leftovers = sorted(_snap() - before)
-        assert leftovers == [], (
-            f"AC5-LEFTOVER-DIR: setup_db left temp dir(s)/file(s) behind on "
-            f"seed failure (conn not closed before rmtree): {leftovers}"
-        )
-    finally:
-        for path in leftovers or (_snap() - before):
-            if os.path.isdir(path):
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+        assert created, "sanity: setup_db created its temp dir"
+        for path in created:
+            assert not os.path.exists(path), (
+                f"AC5-LEFTOVER-DIR: setup_db left {path} behind on seed "
+                "failure (conn not closed before rmtree)"
+            )
 
 
 def test_issue645_mkddir_fixture_setup_failure_cleans_up(monkeypatch):
