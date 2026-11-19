@@ -227,7 +227,7 @@ jobs:
           PYTEST_CURRENT_TEST: nightly-schemathesis
         run: |
           mkdir -p schemathesis-data
-          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 9090 \
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 9090 --no-access-log \
             > schemathesis-uvicorn.log 2>&1 &
           for i in $(seq 1 60); do
             code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9090/openapi.json || true)

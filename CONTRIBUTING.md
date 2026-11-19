@@ -189,7 +189,7 @@ python -m venv venv
 # Windows: venv\Scripts\activate   |   macOS/Linux: source venv/bin/activate
 pip install -r requirements.txt
 pip install -r requirements-dev.txt   # ruff, pytest-cov, pytest-asyncio, requests
-python -m uvicorn app.main:app --host 0.0.0.0 --port 9090
+python -m uvicorn app.main:app --host 0.0.0.0 --port 9090 --no-access-log
 ```
 
 **Frontend** (from `frontend/`):

@@ -191,8 +191,17 @@ class CuratorClient:
                     resp = await client.post(self.endpoint, json=payload)
             if resp.status_code >= 300:
                 if _is_outage_status(resp.status_code):
+                    # issue #982 Family A: provider bodies can echo request
+                    # payloads — carry a bounded summary in the raised
+                    # message; full body at DEBUG.
+                    logger.debug(
+                        "Curator error body (HTTP %d): %s",
+                        resp.status_code,
+                        resp.text,
+                    )
                     raise httpx.HTTPStatusError(
-                        f"Curator returned HTTP {resp.status_code}: {resp.text[:200]}",
+                        f"Curator returned HTTP {resp.status_code} "
+                        f"(body_len={len(resp.text)})",
                         request=resp.request,
                         response=resp,
                     )
@@ -216,8 +225,14 @@ class CuratorClient:
             if data.status_code >= 300:
                 # Non-outage error transported out of the breaker wrapper so
                 # it does not count as a breaker failure (see _do_post).
+                logger.debug(
+                    "Curator error body (HTTP %d): %s",
+                    data.status_code,
+                    data.text,
+                )
                 raise httpx.HTTPStatusError(
-                    f"Curator returned HTTP {data.status_code}: {data.text[:200]}",
+                    f"Curator returned HTTP {data.status_code} "
+                    f"(body_len={len(data.text)})",
                     request=data.request,
                     response=data,
                 )

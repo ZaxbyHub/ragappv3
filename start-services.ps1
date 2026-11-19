@@ -139,7 +139,7 @@ if (-not $SkipEmbedding) {
 }
 
 Start-Process $BackendPython `
-    -ArgumentList "-m","uvicorn","app.main:app","--host","0.0.0.0","--port",$BackendPort `
+    -ArgumentList "-m","uvicorn","app.main:app","--host","0.0.0.0","--port",$BackendPort,"--no-access-log" `
     -WorkingDirectory $BackendDir `
     -WindowStyle Hidden
 

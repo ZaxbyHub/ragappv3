@@ -132,6 +132,41 @@ class TestInbandErrorRaises:
         assert detail != "None"
 
     @pytest.mark.asyncio
+    async def test_inband_error_body_is_bounded_in_raised_message(self, caplog):
+        """Feedback FB-002 (review 6984415094 F-02): the in-band SSE arm had
+        NO marker probe — mutating the bounded summary back to the raw
+        ``{error_msg}`` left every test green. The body must never appear in
+        the raised LLMError; it belongs only at DEBUG.
+        """
+        import logging
+
+        marker = "FB002_INBAND_SECRET_MARKER_9f3a"
+        client = LLMClient(base_url="http://llm-test-host:1234/v1", model="m")
+        client._client = FakeAsyncHTTP(
+            stream_lines=[
+                'data: {"error": {"message": "' + marker + '", "code": 503}}',
+                "",
+                "data: [DONE]",
+                "",
+            ]
+        )
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(LLMError) as excinfo:
+                async for _ in client.chat_completion_stream(
+                    [{"role": "user", "content": "q"}]
+                ):
+                    pass
+        raised = str(excinfo.value)
+        assert marker not in raised, (
+            "FB-002: the in-band SSE error body leaked into the raised "
+            f"LLMError: {raised!r}"
+        )
+        assert "body_len=" in raised and "body_sha256=" in raised
+        assert any(marker in r.getMessage() for r in caplog.records), (
+            "FB-002: the full body must still be available at DEBUG"
+        )
+
+    @pytest.mark.asyncio
     async def test_bare_json_error_line_raises(self):
         """PRR-012: issue #719 named TWO in-band shapes — a ``data:``-framed
         error event AND a bare JSON error object on a non-``data`` line.

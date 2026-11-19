@@ -420,8 +420,13 @@ class TestLLMClient(unittest.TestCase):
             with self.assertRaises(LLMError) as context:
                 await client.chat_completion(messages)
 
+            # issue #982 Family A: the raised message carries a bounded
+            # summary (status + body_len + fingerprint) — the provider body
+            # itself no longer composes into the exception that default-
+            # level callers format into logs; it moves to DEBUG.
             self.assertIn("503", str(context.exception))
-            self.assertIn("Service Unavailable", str(context.exception))
+            self.assertIn("body_len=19", str(context.exception))
+            self.assertNotIn("Service Unavailable", str(context.exception))
 
         asyncio.run(run_test())
 
