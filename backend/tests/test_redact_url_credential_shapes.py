@@ -166,6 +166,18 @@ def test_ac1_malformed_credential_shapes_fail_closed():
         "AC1: a port-only netloc is not a credential and must be preserved"
     )
 
+    # Implementation-review round 1: URLs merely CONTAINING "@" later in the
+    # query or path are credential-free and must pass through unchanged —
+    # the pair regex's password class is bounded at "/", and the widened
+    # empty-username arm requires ":" immediately after "://" and stops at
+    # "?" and "#".
+    assert redact_url("redis://host:6379/0?email=a@b") == (
+        "redis://host:6379/0?email=a@b"
+    ), "AC1: an @ inside an unrelated query value is not a credential"
+    assert redact_url("redis://host:6379/path@x") == (
+        "redis://host:6379/path@x"
+    ), "AC1: an @ inside an unrelated path segment is not a credential"
+
 
 def test_ac1_malformed_shapes_off_the_boot_info_channel():
     """AC1 amend (plan-critic round 2): the malformed credential shapes must

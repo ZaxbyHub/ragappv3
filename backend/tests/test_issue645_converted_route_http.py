@@ -85,21 +85,27 @@ def seeded_env(monkeypatch):
         )
 
         conn = sqlite3.connect(db_path)
-        conn.execute("PRAGMA foreign_keys = ON")
-        pw = hash_password("testpass")
-        users = [
-            (2, "admin1", "admin"),  # org owner / prompt admin via static token
-            (3, "member1@x.com", "member"),
-            (4, "member2@x.com", "member"),
-        ]
-        for uid, username, role in users:
-            conn.execute(
-                "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
-                "VALUES (?, ?, ?, ?, ?, 1)",
-                (uid, username, pw, username.title(), role),
-            )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            pw = hash_password("testpass")
+            users = [
+                (2, "admin1", "admin"),  # org owner / prompt admin via static token
+                (3, "member1@x.com", "member"),
+                (4, "member2@x.com", "member"),
+            ]
+            for uid, username, role in users:
+                conn.execute(
+                    "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
+                    "VALUES (?, ?, ?, ?, ?, 1)",
+                    (uid, username, pw, username.title(), role),
+                )
+            conn.commit()
+        finally:
+            # Implementation-review round 1: a failure after connect (hash,
+            # insert, commit) must still close the connection BEFORE the
+            # rmtree below — an open handle can block directory removal on
+            # Windows and ignore_errors would hide it.
+            conn.close()
 
         env = {"db_path": db_path, "temp_dir": temp_dir}
         yield env
