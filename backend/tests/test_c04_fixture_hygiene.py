@@ -505,6 +505,54 @@ def _snapshot_issue645_dirs() -> set:
     )
 
 
+def _snapshot_tmp_artifacts() -> set:
+    """setup_db uses a bare tempfile.mkdtemp() (no prefix) — snapshot the
+    generic tmp* namespace around its probe."""
+    return set(glob.glob(os.path.join(tempfile.gettempdir(), "tmp*")))
+
+
+def test_org_overrides_setup_db_failure_cleans_up(monkeypatch):
+    """Implementation-review round 5 (#946 class): the autouse class fixture
+    setup_db in test_prompt_org_overrides (TestPromptOverrideAPIFixtures) is
+    the module's third mkdtemp site — the same original-error + no-leftover
+    contract applies, INCLUDING the seed phase (a raise after
+    sqlite3.connect must close the conn before the rmtree). RED at the
+    pre-fix tree, GREEN after the fix.
+    """
+    import types
+
+    module = importlib.import_module("test_prompt_org_overrides")
+    holder = getattr(module, "TestPromptOverrideAPIFixtures")
+    fixture = types.MethodType(_unwrap_fixture(holder.setup_db), holder())
+
+    def _snap() -> set:
+        return _snapshot_c04_dirs() | _snapshot_tmp_artifacts()
+
+    before = _snap()
+    leftovers = []
+    try:
+        _drive_setup_failure(
+            fixture,
+            monkeypatch,
+            "AC5",
+            "test_prompt_org_overrides.setup_db",
+        )
+        leftovers = sorted(_snap() - before)
+        assert leftovers == [], (
+            f"AC5-LEFTOVER-DIR: setup_db left temp dir(s)/file(s) behind on "
+            f"setup failure: {leftovers}"
+        )
+    finally:
+        for path in leftovers or (_snap() - before):
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
 def test_issue645_mkddir_fixture_setup_failure_cleans_up(monkeypatch):
     """Plan-critic round 2 (#946 class): the mkdtemp harness ANCESTOR in
     test_issue645_converted_route_http.py has the same pre-yield exposure

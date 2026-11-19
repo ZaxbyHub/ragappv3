@@ -273,36 +273,42 @@ class TestPromptOverrideAPIFixtures:
 
             # Seed test users
             conn = sqlite3.connect(db_path)
-            conn.execute("PRAGMA foreign_keys = ON")
-            pw = hash_password("testpass")
-            conn.execute(
-                "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
-                "VALUES (?, ?, ?, ?, ?, 1)",
-                (1, "superadmin", pw, "Super Admin", "superadmin"),
-            )
-            conn.execute(
-                "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
-                "VALUES (?, ?, ?, ?, ?, 1)",
-                (2, "admin1", pw, "Admin One", "admin"),
-            )
-            conn.execute(
-                "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
-                "VALUES (?, ?, ?, ?, ?, 1)",
-                (3, "member1", pw, "Member One", "member"),
-            )
-            conn.execute(
-                "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
-                "VALUES (?, ?, ?, ?, ?, 1)",
-                (4, "member2", pw, "Member Two", "member"),
-            )
-            # Seed test org so FK constraints on prompt_org_overrides pass.
-            conn.execute(
-                "INSERT INTO organizations (id, name, slug, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (10, "Test Org", "test-org", "2024-01-01T00:00:00Z"),
-            )
-            conn.commit()
-            conn.close()
+            try:
+                conn.execute("PRAGMA foreign_keys = ON")
+                pw = hash_password("testpass")
+                conn.execute(
+                    "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
+                    "VALUES (?, ?, ?, ?, ?, 1)",
+                    (1, "superadmin", pw, "Super Admin", "superadmin"),
+                )
+                conn.execute(
+                    "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
+                    "VALUES (?, ?, ?, ?, ?, 1)",
+                    (2, "admin1", pw, "Admin One", "admin"),
+                )
+                conn.execute(
+                    "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
+                    "VALUES (?, ?, ?, ?, ?, 1)",
+                    (3, "member1", pw, "Member One", "member"),
+                )
+                conn.execute(
+                    "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
+                    "VALUES (?, ?, ?, ?, ?, 1)",
+                    (4, "member2", pw, "Member Two", "member"),
+                )
+                # Seed test org so FK constraints on prompt_org_overrides pass.
+                conn.execute(
+                    "INSERT INTO organizations (id, name, slug, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (10, "Test Org", "test-org", "2024-01-01T00:00:00Z"),
+                )
+                conn.commit()
+            finally:
+                # Implementation-review round 5: a failure after connect (hash,
+                # insert, commit) must still close the connection BEFORE the
+                # rmtree below — an open handle can block directory removal on
+                # Windows and ignore_errors would hide it (issue645 precedent).
+                conn.close()
 
             self._db_path = db_path
             self._temp_dir = temp_dir

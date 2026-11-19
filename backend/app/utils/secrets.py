@@ -109,8 +109,10 @@ def redact_url(url: str) -> str:
     Handles ``redis://``, ``rediss://``, ``redis+sentinel://`` (including
     multi-host sentinel/cluster forms), ``mongodb://``, and similar
     ``scheme://[user[:password]@]host`` forms. Also masks a username-only
-    userinfo (``scheme://token@host``) and ``password=``/``username=`` query
-    parameters (both are live credentials for redis-py), and fails closed on
+    userinfo (``scheme://token@host``), ``password=``/``username=`` query
+    parameters, and any other ``...password``-suffixed query key (live
+    credentials for redis-py — ``ssl_password`` is the TLS private-key
+    passphrase redis-py 8.x routes to SSLConnection), and fails closed on
     malformed credential-bearing netlocs (``scheme://:token`` with a
     non-numeric token) instead of echoing them verbatim. Schemes without
     credentials (e.g. ``memory://``, ``redis://localhost:6379/0``) are
