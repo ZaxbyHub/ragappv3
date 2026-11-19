@@ -515,9 +515,10 @@ def test_org_overrides_setup_db_failure_cleans_up(monkeypatch):
     """Implementation-review round 5 (#946 class): the autouse class fixture
     setup_db in test_prompt_org_overrides (TestPromptOverrideAPIFixtures) is
     the module's third mkdtemp site — the same original-error + no-leftover
-    contract applies, INCLUDING the seed phase (a raise after
-    sqlite3.connect must close the conn before the rmtree). RED at the
-    pre-fix tree, GREEN after the fix.
+    contract applies to the migration leg (round-6 reviewer question: the
+    SEED phase — a raise after sqlite3.connect — gets its own leg below,
+    driving hash_password to fail so the nested conn.close() must run before
+    the rmtree). RED at the pre-fix tree, GREEN after the fix.
     """
     import types
 
@@ -541,6 +542,63 @@ def test_org_overrides_setup_db_failure_cleans_up(monkeypatch):
         assert leftovers == [], (
             f"AC5-LEFTOVER-DIR: setup_db left temp dir(s)/file(s) behind on "
             f"setup failure: {leftovers}"
+        )
+    finally:
+        for path in leftovers or (_snap() - before):
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
+def test_org_overrides_setup_db_seed_failure_closes_conn(monkeypatch):
+    """Round-6 reviewer question (#946 class): the SEED phase of the same
+    setup_db fixture — hash_password raises AFTER sqlite3.connect, so the
+    nested conn.close() in the finally must run before the outer rmtree
+    (an open handle can block directory removal on Windows and
+    ignore_errors would hide it). RED if the nested close is deleted,
+    GREEN with it.
+    """
+    import types
+    from contextlib import contextmanager
+
+    module = importlib.import_module("test_prompt_org_overrides")
+    holder = getattr(module, "TestPromptOverrideAPIFixtures")
+    fixture = types.MethodType(_unwrap_fixture(holder.setup_db), holder())
+
+    @contextmanager
+    def _forced_hash_failure():
+        original = module.hash_password
+
+        def boom(*args, **kwargs):
+            raise RuntimeError(PROBE_MARKER)
+
+        try:
+            module.hash_password = boom
+            yield
+        finally:
+            module.hash_password = original
+
+    def _snap() -> set:
+        return _snapshot_c04_dirs() | _snapshot_tmp_artifacts()
+
+    before = _snap()
+    leftovers = []
+    try:
+        _drive_setup_failure(
+            fixture,
+            monkeypatch,
+            "AC5",
+            "test_prompt_org_overrides.setup_db(seed)",
+            failure_ctx=_forced_hash_failure(),
+        )
+        leftovers = sorted(_snap() - before)
+        assert leftovers == [], (
+            f"AC5-LEFTOVER-DIR: setup_db left temp dir(s)/file(s) behind on "
+            f"seed failure (conn not closed before rmtree): {leftovers}"
         )
     finally:
         for path in leftovers or (_snap() - before):
