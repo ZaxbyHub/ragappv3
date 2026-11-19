@@ -20,23 +20,32 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 
 # Matches a leading credential pair in the userinfo (``user:pass@`` or
 # ``:pass@``). Used as a fast path and a fallback when urlsplit cannot parse
-# the scheme (e.g. ``redis+sentinel://``). The password class stops at ``/``:
-# URLs merely CONTAINING ``@`` later in the path or query
-# (``redis://host:6379/0?email=a@b``) are credential-free and must not match.
-_CREDENTIALS_RE = re.compile(r"(?<=://)([^/@:]*):[^/@]*@")
+# the scheme (e.g. ``redis+sentinel://``). Both classes stop at ``/``, ``?``
+# and ``#``: URLs merely CONTAINING ``@`` later in the path or query
+# (``redis://host:6379/0?email=a@b``, ``redis://host:6379?email=a@b``) are
+# credential-free and must not match, and no documented shape carries an
+# unescaped ``?``/``#`` in a password (both terminate the netloc for
+# urlsplit; the slash-crossing shapes live in the ambiguous arm below).
+_CREDENTIALS_RE = re.compile(r"(?<=://)([^/@:?#]*):[^/@?#]*@")
 
 # A username-only userinfo (no colon): the bare token is itself the
 # credential (redis-py AUTH). Non-empty capture only — ``scheme://@host``
 # carries no credential and passes through.
 _USERNAME_ONLY_RE = re.compile(r"(?<=://)([^/@:?#]+)@")
 
-# Empty-username password that itself contains an unescaped ``/``
-# (``redis://:Ab3/xYz9+Q@redis:6379/0``): urlsplit truncates the netloc at
-# the slash (hostname None), so the structured rebuild never fires and the
-# pair regex above cannot cross the slash. The colon must sit IMMEDIATELY
-# after ``://`` (empty username) — a host like ``host:6379/...`` does not
-# match, and ``?``/``#`` bound the password so a query ``@`` cannot.
-_EMPTY_USERINFO_SLASH_PW_RE = re.compile(r"(?<=://):[^@?#]*@")
+# AMBIGUOUS SLASH SHAPES: an unescaped ``/`` inside the password truncates
+# urlsplit's netloc (hostname None), so the structured rebuild never fires
+# and the pair regex above cannot cross the slash. ``user:pass/x...@`` and
+# ``:pass/x...@`` (empty username) are credential-bearing; ``host:6379/x...@``
+# is a host:PORT plus a path whose segment merely contains ``@``. The
+# disambiguator is the token between ``:`` and the first ``/``: all digits
+# means port (leave unchanged — ``redis://:9000/path@host``), anything else
+# is credential-shaped and masked fail-closed (``redis://user:Ab3/xYz9+Q@h``,
+# ``redis://:Ab3/xYz9+Q@h``). ``?``/``#`` bound the password span so a
+# query/fragment ``@`` cannot feed this arm.
+_AMBIGUOUS_SLASH_CREDENTIAL_RE = re.compile(
+    r"(?<=://)([^/@:?#]*):([^/@?#]*)/[^@?#]*@"
+)
 
 # Query-string credentials: redis-py parses the query with parse_qs (keys are
 # percent-DECODED before matching), so classification decodes the raw key
@@ -145,12 +154,20 @@ def redact_url(url: str) -> str:
 
     # Fallback: multi-host/cluster netlocs, schemes urlsplit doesn't fully
     # parse, or strings without a netloc. Regex-mask any ``user:pass@`` pair
-    # (password class bounded at ``/`` so a later path/query ``@`` cannot
-    # match), then the empty-username unescaped-slash password arm, then a
-    # colon-less username-only userinfo, then fail closed on a
-    # credential-shaped ``:<token>`` netloc; otherwise return as-is.
+    # (both classes bounded at ``/``, ``?``, ``#`` so a later path/query
+    # ``@`` cannot match), then the ambiguous-slash arm (unescaped ``/``
+    # inside the password, disambiguated from host:port/path by the
+    # digits-only test), then a colon-less username-only userinfo, then fail
+    # closed on a credential-shaped ``:<token>`` netloc; otherwise as-is.
     masked = _CREDENTIALS_RE.sub(r"\1:***@", url, count=1)
-    masked = _EMPTY_USERINFO_SLASH_PW_RE.sub(":***@", masked, count=1)
+
+    def _ambiguous_replacement(match: re.Match[str]) -> str:
+        username, token = match.group(1), match.group(2)
+        if token.isdigit():
+            return match.group(0)  # host:6379/path@x — port plus path, not a credential
+        return f"{username}:***@"
+
+    masked = _AMBIGUOUS_SLASH_CREDENTIAL_RE.sub(_ambiguous_replacement, masked, count=1)
     masked = _USERNAME_ONLY_RE.sub("***@", masked, count=1)
     if masked == url:
         # No userinfo matched at all. A netloc of exactly ``:<token>`` with a

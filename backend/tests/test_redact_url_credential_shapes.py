@@ -177,6 +177,35 @@ def test_ac1_malformed_credential_shapes_fail_closed():
     assert redact_url("redis://host:6379/path@x") == (
         "redis://host:6379/path@x"
     ), "AC1: an @ inside an unrelated path segment is not a credential"
+    # Implementation-review round 2: the same invariant with NO path
+    # separator before the query/fragment (the pair classes are bounded at
+    # "?"/"#" too), and the ambiguous-slash arm's port disambiguator.
+    assert redact_url("redis://host:6379?email=a@b") == (
+        "redis://host:6379?email=a@b"
+    ), "AC1: an @ inside a query value with no path separator is not a credential"
+    assert redact_url("redis://host:6379#f@x") == (
+        "redis://host:6379#f@x"
+    ), "AC1: an @ inside a fragment is not a credential"
+    assert redact_url("redis://:9000/path@host") == (
+        "redis://:9000/path@host"
+    ), "AC1: a digits-only token before a slash is a port, not a credential"
+
+
+def test_ac1_nonempty_username_slash_password_masked():
+    """AC1 amend (implementation-review round 2): a NON-EMPTY username with
+    an unescaped-``/`` password is the mirror of the frozen empty-username
+    shape — urlsplit truncates the netloc at the slash so only the
+    ambiguous-slash fallback can mask it. RED at the round-1-fix tree,
+    GREEN after the round-2 fix.
+    """
+    out = redact_url("redis://user:Ab3/xYz9+Q@redis:6379/0")
+    assert "Ab3/xYz9+Q" not in out, (
+        f"AC1-LEAK: redact_url returned a non-empty-username unescaped-/ "
+        f"password verbatim: {out!r}"
+    )
+    assert out == "redis://user:***@redis:6379/0", (
+        f"AC1: the username survives, the slash-password is masked: {out!r}"
+    )
 
 
 def test_ac1_malformed_shapes_off_the_boot_info_channel():
