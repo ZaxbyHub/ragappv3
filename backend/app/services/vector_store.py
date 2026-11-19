@@ -2225,19 +2225,24 @@ class VectorStore:
             if self.table is None:
                 return 0
             table = self.table
+        # Feedback FB-007: the old count-probe swallow turned a failing probe
+        # into a silent 0-row no-op while the caller reported a successful
+        # unwind. The scoped delete predicate is identical for the probe and
+        # the delete; if the probe fails, still attempt the bounded delete
+        # (a delete of zero rows is harmless). Never skip it on probe error.
         try:
             count_before = await table.count_rows(
                 f"file_id = '{safe_file_id}' AND id LIKE '{prefix}%'"
             )
         except (OSError, RuntimeError, ValueError):
-            count_before = 0
-        if count_before <= 0:
+            count_before = -1
+        if count_before == 0:
             return 0
         await table.delete(f"file_id = '{safe_file_id}' AND id LIKE '{prefix}%'")
         if target is None:
             self._index_mutation_generation += 1
-            await self._maybe_rebuild_or_drop_vector_index(count_before)
-        return count_before
+            await self._maybe_rebuild_or_drop_vector_index(max(count_before, 1))
+        return max(count_before, 1)
 
     async def _delete_by_file_unlocked(
         self, file_id: str, target: Optional[DimensionRebuildHandle] = None

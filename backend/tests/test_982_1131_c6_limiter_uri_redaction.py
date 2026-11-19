@@ -46,7 +46,11 @@ except ImportError:
 
 from app.limiter import WhitelistLimiter, build_limiter
 
-LIMITER_LOGGER = "app.limiter"
+# Feedback FB-018: the production logger is named "rate_limit"
+# (limiter.py:16), NOT a descendant of "app.limiter" — the old capture
+# handler received nothing, so C6's log leg was vacuous. The message leg
+# (credential absence) remains the discriminating check.
+LIMITER_LOGGER = "rate_limit"
 MARKER = "s3cret982c6marker"
 
 

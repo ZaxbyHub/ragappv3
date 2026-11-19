@@ -201,8 +201,8 @@ def build_limiter(redis_url: str) -> WhitelistLimiter:
             # for why this alone is not sufficient.
             headers_enabled=False,
         )
-    except ConfigurationError as exc:
-        # `from None` severs the chained original ConfigurationError from any
+    except (ConfigurationError, ValueError) as exc:
+        # `from None` severs the chained original exception from any
         # boot traceback: its message embeds the raw (credential-bearing)
         # storage URI verbatim.
         # Scheme-only diagnosis: redact_url covers the known redis://

@@ -658,6 +658,9 @@ class BackgroundProcessor:
         self._stall_cancel_flag: Optional[int] = None
         self._active_progress: Optional[tuple[int, str]] = None
         self._stall_retry_file_ids: list[int] = []
+        # Feedback FB-005: duplicate outcomes discovered by the cancelled
+        # attempt must survive the watchdog settle instead of being dropped.
+        self._stall_duplicate_ids: list[int] = []
 
     def set_llm_client(self, llm_client: Optional[LLMClient]) -> None:
         """Rebind the owned DocumentProcessor to a different ingestion LLM client."""
@@ -4485,6 +4488,12 @@ class BackgroundProcessor:
         A fenced-off settle (the janitor won the race) only logs.
         """
         retry_ids = list(getattr(self, "_stall_retry_file_ids", None) or [])
+        # FB-005: keep the discovering attempt's duplicate outcome in the
+        # terminal result instead of losing it when ABSORB removes the row
+        # from the next retry scope.
+        stall_duplicate_ids = sorted(
+            {int(i) for i in (getattr(self, "_stall_duplicate_ids", None) or [])}
+        )
 
         def _settle():
             with self.processor.pool.connection() as conn:
@@ -4495,15 +4504,48 @@ class BackgroundProcessor:
                     stall_timeout_seconds=self._reindex_stall_budget(),
                 )
                 row = conn.execute(
-                    "SELECT attempts FROM jobs WHERE id = ?", (job_id,)
+                    "SELECT attempts, payload_json FROM jobs WHERE id = ?", (job_id,)
                 ).fetchone()
                 attempts = int(row["attempts"]) if row is not None else 0
+                # Stage B: compute the cumulative duplicate ledger FIRST,
+                # independent of whether a retry scope was captured (a
+                # watchdog stall outside the per-file handler leaves
+                # retry_ids empty; the cap settlement must still work).
+                payload_before = (
+                    json.loads(row["payload_json"] or "{}") if row is not None else {}
+                )
+                prior_duplicates = {
+                    int(i) for i in payload_before.get("duplicate_file_ids", [])
+                }
+                all_duplicates = sorted(prior_duplicates | set(stall_duplicate_ids))
+                settled_result = (
+                    {
+                        "duplicate_file_ids": all_duplicates,
+                        "failed": len(all_duplicates),
+                    }
+                    if all_duplicates
+                    else None
+                )
+                # Stage B r5: persist the cumulative ledger on EVERY requeue,
+                # including a stall with no captured retry scope. Two FIXED
+                # fenced statements (no dynamic SQL) — each key is independent.
                 if retry_ids:
                     conn.execute(
                         "UPDATE jobs SET payload_json = json_set(payload_json,"
                         " '$.retry_file_ids', json(?)) "
                         "WHERE id = ? AND worker_id = ? AND status = 'running'",
-                        (json.dumps([int(i) for i in retry_ids]), job_id, worker_id),
+                        (
+                            json.dumps([int(i) for i in retry_ids]),
+                            job_id,
+                            worker_id,
+                        ),
+                    )
+                if all_duplicates:
+                    conn.execute(
+                        "UPDATE jobs SET payload_json = json_set(payload_json,"
+                        " '$.duplicate_file_ids', json(?)) "
+                        "WHERE id = ? AND worker_id = ? AND status = 'running'",
+                        (json.dumps(all_duplicates), job_id, worker_id),
                     )
                 if attempts >= int(settings.jobs_max_attempts):
                     settled = bool(
@@ -4511,6 +4553,7 @@ class BackgroundProcessor:
                             job_id,
                             worker_id,
                             f"attempt_cap_exceeded: {LEASE_STALL_REASON}"[:500],
+                            result=settled_result,
                         )
                     )
                 else:
@@ -4625,6 +4668,7 @@ class BackgroundProcessor:
         # exit is inert (watermark writes are fenced by id+worker+status).
         self._active_progress = (job_id, worker_id)
         self._stall_retry_file_ids = []
+        self._stall_duplicate_ids = []
         if not await self._stamp_progress_watermark():
             self._active_progress = None
             logger.warning(
@@ -4643,6 +4687,25 @@ class BackgroundProcessor:
             )
         else:
             status, result, exc = await self._reindex_embed_all(job_id, vault_id)
+        # FB-016 / Stage B r9: the producer captures externally discovered
+        # duplicate ids on self._stall_duplicate_ids at the point of discovery
+        # (including readiness/metadata/identity failure returns, whose result
+        # shapes must stay GLOBAL for retry semantics). Union them here BEFORE
+        # any settlement decision so the ledger survives every terminal arm.
+        discovered_duplicates = {
+            int(i) for i in (getattr(self, "_stall_duplicate_ids", None) or [])
+        }
+        if discovered_duplicates:
+            cumulative_duplicate_ids = sorted(
+                set(cumulative_duplicate_ids) | discovered_duplicates
+            )
+        # FB-016 / Stage B r10: distinguish a GLOBAL operator-guidance failure
+        # (empty result, full-scope retry) from a real staged compose, which
+        # carries these transport ledger keys even though its exception is
+        # ALSO ReindexOperatorGuidance. Capture BEFORE the pops below.
+        staged_compose = isinstance(result, dict) and (
+            "duplicate_file_ids" in result or "transient_failed_ids" in result
+        )
         # The retry-scope key is transport metadata, not a persisted result:
         # pop it before ANY persistence (issue #702 — sibling suites pin the
         # persisted result shapes by equality).
@@ -4841,6 +4904,11 @@ class BackgroundProcessor:
                     and cumulative_duplicate_ids
                     and isinstance(result, dict)
                     and result
+                    # FB-016 / Stage B r9: operator-guidance failures are
+                    # GLOBAL (retry-ladder) outcomes even when the producer
+                    # discovered a duplicate. Only a genuine duplicate-only
+                    # compose settles terminally below the cap.
+                    and (not isinstance(exc, ReindexOperatorGuidance) or staged_compose)
                 ):
                     composed = dict(result) if isinstance(result, dict) else {}
                     composed["duplicate_file_ids"] = list(cumulative_duplicate_ids)
@@ -4909,6 +4977,16 @@ class BackgroundProcessor:
                             job_id,
                             worker_id,
                         ),
+                    )
+                if cumulative_duplicate_ids:
+                    # FB-016: a GLOBAL guidance failure keeps its retry ladder
+                    # but the externally discovered duplicate ledger must
+                    # still be persisted for the next attempt / terminal arm.
+                    conn.execute(
+                        "UPDATE jobs SET payload_json = json_set(payload_json,"
+                        " '$.duplicate_file_ids', json(?)) "
+                        "WHERE id = ? AND worker_id = ? AND status = 'running'",
+                        (json.dumps(cumulative_duplicate_ids), job_id, worker_id),
                     )
                 # else: either per-file accounting ran and the narrowed scope
                 # is genuinely empty (every failure was a deterministic
@@ -5190,6 +5268,30 @@ class BackgroundProcessor:
             retry_scope_json = (
                 json.dumps([int(i) for i in retry_file_ids]) if retry_file_ids else None
             )
+
+            # FB-016 / Stage B r11: capture externally duplicate-settled
+            # retry-scope ids BEFORE the SELECT and every post-selection
+            # failure return (a narrowed retry with a changed model/identity
+            # can raise guidance before the old, late recount is reached).
+            if retry_scope_json is not None:
+                async with self.processor.pool.connection_async() as zconn:
+                    scope_sql = (
+                        "SELECT id FROM files WHERE status = 'error' "
+                        "AND error_message IS NOT NULL "
+                        "AND error_message LIKE 'DUPLICATE_FILE:%' "
+                        "AND id IN (SELECT value FROM json_each(?))"
+                    )
+                    scope_args: list = [retry_scope_json]
+                    if vault_id is not None:
+                        scope_sql += " AND vault_id = ?"
+                        scope_args.append(vault_id)
+                    settled = zconn.execute(scope_sql, scope_args).fetchall()
+                for srow in settled:
+                    sid = int(srow["id"] if hasattr(srow, "keys") else srow[0])
+                    if sid not in duplicate_ids:
+                        duplicate_ids.append(sid)
+                if duplicate_ids:
+                    self._stall_duplicate_ids = list(duplicate_ids)
             async with self.processor.pool.connection_async() as conn:
                 # Issue #963 (site 1): 'partial' is a content-available state
                 # (#693 producer contract; #793 widened the KMS twin to the
@@ -5538,6 +5640,11 @@ class BackgroundProcessor:
                                 # [2, 3], file 1 never retried). Order-stable
                                 # dedupe: failed first (oldest failure first),
                                 # then the interrupted + remaining tail.
+                                # FB-005: carry the discovering attempt's
+                                # duplicate ledger into the stall settle.
+                                self._stall_duplicate_ids = [
+                                    int(fid) for fid in duplicate_ids
+                                ]
                                 self._stall_retry_file_ids = list(
                                     dict.fromkeys(
                                         [int(fid) for fid in failed_ids]
@@ -5609,10 +5716,19 @@ class BackgroundProcessor:
                                 RuntimeError,
                                 Exception,
                             ) as exc:
-                                logger.exception(
+                                # Feedback FB-001: the exception text is a
+                                # user-derived path carrier — render only the
+                                # stable redacted code at default level, no
+                                # exc_info; full detail goes to DEBUG.
+                                logger.error(
                                     "Re-embed failed for file_id=%d in vault_id=%d: %s",
                                     file_id,
                                     vault_id_file,
+                                    _redact_reindex_error(exc),
+                                )
+                                logger.debug(
+                                    "Re-embed failure detail for file_id=%d: %r",
+                                    file_id,
                                     exc,
                                 )
                                 failed_files += 1
@@ -5633,6 +5749,13 @@ class BackgroundProcessor:
                                     == INGEST_ERROR_DUPLICATE_FILE
                                 ):
                                     duplicate_ids.append(file_id)
+                                    # FB-005 / Stage B final: capture at the
+                                    # moment of discovery. A later watchdog
+                                    # cancellation can land on the per-file
+                                    # lock awaits BEFORE the CancelledError
+                                    # handler copies the ledger; without this
+                                    # the settle would persist an empty one.
+                                    self._stall_duplicate_ids = list(duplicate_ids)
                                 failed_ids.append(file_id)
                                 if first_failure is None:
                                     first_failure = exc
@@ -5704,6 +5827,44 @@ class BackgroundProcessor:
             # anything). The embed loop above is a no-op with zero files
             # (probe_dim stays None, so the record uses settings.embedding_dim),
             # and the failed_files>0 path is unreachable with zero files.
+            # Feedback FB-016 (review 6985516412 F-008) / Stage B r4: a
+            # narrowed retry scope can be PARTLY or entirely duplicate-settled
+            # by an EXTERNAL writer between attempts; the four ABSORB
+            # predicates drop those rows. Recount the excluded terminal ids
+            # for the requested scope BEFORE the zero/nonzero decision (and
+            # keep the vault filter so a shared retry id in another vault is
+            # never attributed to this job).
+            if retry_scope_json is not None:
+                async with self.processor.pool.connection_async() as zconn:
+                    scope_sql = (
+                        "SELECT id FROM files WHERE status = 'error' "
+                        "AND error_message IS NOT NULL "
+                        "AND error_message LIKE 'DUPLICATE_FILE:%' "
+                        "AND id IN (SELECT value FROM json_each(?))"
+                    )
+                    scope_args: list = [retry_scope_json]
+                    if vault_id is not None:
+                        scope_sql += " AND vault_id = ?"
+                        scope_args.append(vault_id)
+                    settled = zconn.execute(scope_sql, scope_args).fetchall()
+                for srow in settled:
+                    sid = int(srow["id"] if hasattr(srow, "keys") else srow[0])
+                    if sid not in duplicate_ids:
+                        duplicate_ids.append(sid)
+                # FB-005: these were just discovered, so a later watchdog
+                # cancellation must find them in the stall state too.
+                if duplicate_ids:
+                    self._stall_duplicate_ids = list(duplicate_ids)
+
+            def _with_absorbed_ledger(payload_result: dict) -> dict:
+                """FB-016 / Stage B r5: every terminal return after the
+                recount must carry the externally duplicate-settled ids,
+                including the two readiness-skip early returns below."""
+                if duplicate_ids:
+                    payload_result["duplicate_file_ids"] = sorted(set(duplicate_ids))
+                    payload_result["failed"] = len(set(duplicate_ids))
+                return payload_result
+
             if total_files == 0:
                 logger.info(
                     "Reindex job %d has no files to reindex; running the "
@@ -5819,6 +5980,11 @@ class BackgroundProcessor:
                         # Issue #702: carry the operator guidance as the
                         # failure channel so jobs.error keeps the actionable
                         # text (verbatim guidance class) instead of None.
+                        # Identity failures keep their original GLOBAL shape
+                        # (full-scope retry). The externally recounted ledger
+                        # travels via self._stall_duplicate_ids, unioned by
+                        # the runner below — adding it to the result would
+                        # mis-trigger the duplicate-only terminal arm.
                         return (
                             "failed",
                             {"processed": processed_files, "failed": 0},
@@ -5862,16 +6028,18 @@ class BackgroundProcessor:
                         )
                         return (
                             "completed",
-                            {
-                                "processed": processed_files,
-                                "failed": 0,
-                                "readiness_lifted": False,
-                                "readiness_skip_reason": (
-                                    "vault_scoped_gate_down"
-                                    if vault_id is not None
-                                    else "retry_scope_gate_down"
-                                ),
-                            },
+                            _with_absorbed_ledger(
+                                {
+                                    "processed": processed_files,
+                                    "failed": 0,
+                                    "readiness_lifted": False,
+                                    "readiness_skip_reason": (
+                                        "vault_scoped_gate_down"
+                                        if vault_id is not None
+                                        else "retry_scope_gate_down"
+                                    ),
+                                }
+                            ),
                             None,
                         )
                     # [issue #706] Record the JOB-START identity, not the live
@@ -5914,14 +6082,16 @@ class BackgroundProcessor:
                         )
                         return (
                             "completed",
-                            {
-                                "processed": processed_files,
-                                "failed": 0,
-                                "readiness_lifted": False,
-                                "readiness_skip_reason": (
-                                    "invalidated_during_completion"
-                                ),
-                            },
+                            _with_absorbed_ledger(
+                                {
+                                    "processed": processed_files,
+                                    "failed": 0,
+                                    "readiness_lifted": False,
+                                    "readiness_skip_reason": (
+                                        "invalidated_during_completion"
+                                    ),
+                                }
+                            ),
                             None,
                         )
                     # Cutover complete: the draining snapshot that pinned
@@ -5992,9 +6162,18 @@ class BackgroundProcessor:
                 # caller so the lease settlement redacts at the persist
                 # boundary instead of receiving an already-stringified path
                 # that bypasses the #562 guard.
+                # GLOBAL failure (empty result => full-scope retry). The
+                # externally recounted ledger rides on _stall_duplicate_ids
+                # (unioned by the runner) instead of in this result, which
+                # would mis-trigger the duplicate-only terminal arm.
                 return "failed", {}, exc
 
             result = {"processed": processed_files, "failed": 0}
+            if duplicate_ids:
+                # FB-016: preserve the terminal duplicate outcome of a fully
+                # absorbed retry scope in the persisted result.
+                result["duplicate_file_ids"] = sorted(set(duplicate_ids))
+                result["failed"] = len(set(duplicate_ids))
             logger.info(
                 "Reindex job %d completed successfully for %d files.",
                 job_id,
@@ -6366,7 +6545,11 @@ class BackgroundProcessor:
                         "(retry backlog full); treating as permanent "
                         "failure: %s (path_len=%d)",
                         task.file_id,
-                        type(error).__name__,
+                        # FB-017: a system-generated string error renders
+                        # as the constant "str" under type(...).__name__.
+                        error
+                        if isinstance(error, str)
+                        else type(error).__name__,
                         len(str(task.file_path)),
                     )
                     logger.debug(
@@ -6426,7 +6609,11 @@ class BackgroundProcessor:
         logger.error(
             f"Task permanently failed for file_id={task.file_id} "
             f"at attempt {task.attempt}/{self.max_retries}: "
-            f"{type(error).__name__} (path_len={len(str(task.file_path))})"
+            # FB-017/Stage B: system-generated string errors render as the
+            # constant "str" under type(...).__name__; keep their text (it
+            # is leak-free) and use the class only for real exceptions.
+            f"{error if isinstance(error, str) else type(error).__name__} "
+            f"(path_len={len(str(task.file_path))})"
         )
         logger.debug(
             "Task permanently failed for %s: %s", task.file_path, error

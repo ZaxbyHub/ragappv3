@@ -19,9 +19,12 @@ vault_name, file_path (bare names too). Attr set (strict):
 only ``ast.Name`` / ``ast.Attribute`` nodes hit. ``len(...)`` subtrees are
 blessed (count-only is the pattern).
 
-Census run over the current tree (2026-11-17) found SIX hits; every one is
-dispositioned below and pinned fail-closed (a pin that stops matching
-because the line drifted makes this guard RED — drift forces re-review):
+Census at authoring time (2026-11-17) found SIX hits; every one was
+dispositioned below and pinned fail-closed. At the shipped head the live
+census expects ZERO hits (all six fixed or sanctioned as verified false
+positives) — a pin that stops matching because the line drifted makes this
+guard RED (drift forces re-review). Feedback FB-024 corrected the stale
+historical line references in the notes below; they are not live pins.
 
 - (2026-11-17 update) background_tasks.py:3787/:6295/:6306/:6361 were real
   sibling leaks pinned at guard-authoring time; the orchestrator fixed them
@@ -102,7 +105,20 @@ from app.services.document_processor import (
 # user-derived paths in this codebase. ``file_path`` stays IN the name set
 # (see module docstring for why the narrowing option was declined).
 _FAMILY_B_NAMES = frozenset(
-    {"file_name", "filename", "source_filename", "vault_name", "file_path"}
+    {
+        "file_name",
+        "filename",
+        "source_filename",
+        "vault_name",
+        "file_path",
+        # Feedback FB-011: these were documented blind shapes while the
+        # email sender-only sites had NO marker probe — a revert to the raw
+        # sender passed the entire suite. Adding the names closes that gap
+        # (bounded `len(name)` subtrees are skipped by _b_contains_family_b_text).
+        "sender",
+        "subject",
+        "directory",
+    }
 )
 
 # Attributes whose value is user-derived (``task.file_path``,
@@ -111,10 +127,11 @@ _FAMILY_B_NAMES = frozenset(
 # KNOWN BLIND SHAPES (review F-B7, pr1169-20261117): this census
 # matches only ast.Name/ast.Attribute forms of the sets above. It
 # cannot see Path `.name` attributes (f.name), bare renamed locals
-# (path, directory, artifact, sender, subject), or row["file_path"]-
-# style subscripts. Per-site marker probes (the frozen checks and the
-# curator probe below) are the PRIMARY enforcement; this census is a
-# supplementary rung only.
+# (path, artifact), or row["file_path"]-style subscripts. FB-011 added
+# `sender`, `subject`, and `directory` to the name set after a mutation
+# proved the email sender-only sites had no probe at all. Per-site marker
+# probes (the frozen checks and the curator probe below) remain the
+# PRIMARY enforcement; this census is a supplementary rung.
 _FAMILY_B_ATTRS = frozenset({"file_path", "file_name"})
 
 # Names a module can bind a logger to (mirror of the frozen #710 walker's
@@ -189,18 +206,24 @@ def _b_module_logger_names(tree: ast.AST) -> set:
     return names
 
 
-def _b_is_logger_receiver(node: ast.AST, tree: ast.AST | None = None) -> bool:
+def _b_is_logger_receiver(node: ast.AST, logger_names: set | None = None) -> bool:
     """True when ``node`` evaluates to a logger (bare name bound to
     ``logging.getLogger`` anywhere in the module, ``.logger`` attribute,
-    or the inline ``logging.getLogger(...).<level>(...)`` form)."""
+    or the inline ``logging.getLogger(...).<level>(...)`` form).
+
+    Feedback FB-004: the caller passes the module's logger-name set computed
+    once per file. Re-walking the whole AST for every logging call made the
+    census quadratic (232 s of a 300 s per-test CI timeout on back-
+    ground_tasks.py).
+    """
     if _b_is_get_logger_call(node):
         return True
     if isinstance(node, ast.Name):
-        return tree is not None and node.id in _b_module_logger_names(tree)
+        return logger_names is not None and node.id in logger_names
     if isinstance(node, ast.Attribute):
         if node.attr == "logger":
             return True
-        return tree is not None and node.attr in _b_module_logger_names(tree)
+        return logger_names is not None and node.attr in logger_names
     return False
 
 
@@ -287,7 +310,7 @@ def _scan_tree_hits(tree: ast.AST, rel: str):
         func = node.func
         if not isinstance(func, ast.Attribute):
             continue
-        if not _b_is_logger_receiver(func.value, tree):
+        if not _b_is_logger_receiver(func.value, module_logger_names):
             continue
         if func.attr in _DEFAULT_LEVEL_METHODS:
             pass  # always default-or-higher
@@ -622,9 +645,13 @@ async def test_lock_order_unwind_vs_commit_metadata(tmp_path):
         assert ev.index("holder_sqlite_write") < ev.index("probe_sqlite_write_ok")
         assert ev.index("probe_sqlite_write_ok") < ev.index("delete")
         enters = [i for i, name in enumerate(ev) if name == "lance_enter"]
-        assert len(enters) == 2, ev
-        assert max(i for i, name in enumerate(ev) if name == "lance_exit"
-                   ) not in enters[1:], ev
+        exits = [i for i, name in enumerate(ev) if name == "lance_exit"]
+        assert len(enters) == 2 and len(exits) == 2, ev
+        # Feedback FB-025/TF-3: the old `max(lance_exit indices) not in
+        # enters[1:]` was tautological (an exit index can never equal an
+        # enter index). Assert the real invariant: the unwind's second
+        # Lance entry happens strictly AFTER the peer's first exit.
+        assert exits[0] < enters[1], ev
         assert ev[enters[1] + 1] == "delete", ev
     finally:
         pool.close_all()
@@ -755,8 +782,11 @@ async def test_unwind_delete_failure_leaves_no_tombstone(tmp_path, caplog):
         collision = sqlite3.IntegrityError(
             "UNIQUE constraint failed: files.file_hash, files.vault_id"
         )
+        # Feedback FB-025/TF-6: the following sweep claims INFO+ absence,
+        # so capture at INFO (WARNING would drop INFO records before the
+        # handler sees them and make the assertion vacuous).
         with caplog.at_level(
-            logging.WARNING, logger="app.services.document_processor"
+            logging.INFO, logger="app.services.document_processor"
         ):
             with pytest.raises(sqlite3.IntegrityError):
                 # The settle's trailing bare ``raise`` requires an active
@@ -1148,6 +1178,763 @@ def test_limiter_boot_traceback_severed_from_credential_chain():
         )
 
 
+def test_limiter_non_configuration_errors_never_echo_password():
+    """Feedback FB-009 (reviews 6985516412 F-001 / 6984415094 F-09a):
+    redis-py raises a plain ValueError — NOT a limits ConfigurationError —
+    for a registered-scheme URL with a malformed netloc. Before the fix that
+    ValueError escaped the handler with the password in its message at
+    module-import/boot time (probed: 'redis://:sup3rs3cretpw' and
+    'redis://:Ab3/xYz9+Q@redis:6379/0'). The handler covers both exception
+    families now and re-raises the same scheme-only RuntimeError from None.
+    """
+    import traceback
+
+    from app.limiter import build_limiter
+
+    cases = [
+        ("redis://:sup3rs3cretpw", "sup3rs3cretpw"),
+        ("redis://:Ab3/xYz9+Q@redis:6379/0", "Ab3/xYz9+Q"),
+        ("redis://:s3cret#frag@redis:6379/0", "s3cret#frag"),
+    ]
+    for uri, secret in cases:
+        with pytest.raises(RuntimeError) as excinfo:
+            build_limiter(uri)
+        rendered = "".join(
+            traceback.format_exception(
+                type(excinfo.value),
+                excinfo.value,
+                excinfo.value.__traceback__,
+            )
+        )
+        assert secret not in str(excinfo.value), (
+            f"FB-009: the boot failure echoes the password for {uri!r}: "
+            f"{str(excinfo.value)!r}"
+        )
+        assert secret not in rendered, (
+            f"FB-009: the boot traceback renders the password for {uri!r}"
+        )
+        assert excinfo.value.__cause__ is None
+        assert "scheme=" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_mixed_retry_scope_reports_excluded_duplicate(tmp_path, monkeypatch):
+    """Stage B gate r4 (FB-016): a narrowed retry scope with BOTH a
+    duplicate-settled row (ABSORB-excluded) and a still-selectable row must
+    surface the excluded duplicate in the result ledger.
+    """
+    from app.services.background_tasks import BackgroundProcessor
+
+    db_path, conn = _seed(tmp_path, "mixed-scope.db")
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    try:
+        dup_fid, _dup_hash, _dup_path = _seed_terminal_duplicate(conn)
+        good_fid = _insert_file(
+            conn,
+            file_hash="b" * 64,
+            status="indexed",
+            path=str(tmp_path / "fb016-good.pdf"),
+        )
+        bp = BackgroundProcessor(pool=pool, retry_delay=0.05)
+
+        class _NoopStore:
+            async def init_table(self, *a, **k):
+                return None
+
+            async def get_live_embedding_dim(self, *a, **k):
+                return 2
+
+            async def add_chunks(self, *a, **k):
+                return {}
+
+            async def record_embedding_metadata(self, *a, **k):
+                return None
+
+            async def mark_ready(self, *a, **k):
+                return None
+
+        bp.processor.vector_store = _NoopStore()
+
+        class _EmbedStub:
+            async def embed_batch(self, texts, fail_fast=True, **kwargs):
+                return [[0.1, 0.2] for _ in texts]
+
+        bp.processor.embedding_service = _EmbedStub()
+
+        async def _noop_process(*a, **k):
+            return None
+
+        from unittest.mock import patch as _patch
+
+        with _patch.object(bp.processor, "process_existing_file", _noop_process):
+            status, result, error = await bp._reindex_embed_all(
+                1,
+                vault_id=1,
+                retry_file_ids=[dup_fid, good_fid],
+            )
+        assert status == "completed" and error is None, (status, result, error)
+        assert result.get("duplicate_file_ids") == [dup_fid], (
+            f"FB-016: excluded duplicate missing from mixed-scope result: {result!r}"
+        )
+        # Stage B r5: the readiness-skip early return must carry it too.
+        bp.processor.vector_store._ready = False  # noqa: SLF001
+        with _patch.object(bp.processor, "process_existing_file", _noop_process):
+            status2, result2, error2 = await bp._reindex_embed_all(
+                1,
+                vault_id=None,
+                retry_file_ids=[dup_fid, good_fid],
+            )
+        assert status2 == "completed" and error2 is None
+        assert result2.get("readiness_lifted") is False
+        assert result2.get("duplicate_file_ids") == [dup_fid], (
+            f"FB-016: readiness-skip return lost the ledger: {result2!r}"
+        )
+        # Stage B final: a metadata-write failure is a GLOBAL failure (no
+        # 'failed' count) but must still carry the recounted duplicates.
+        bp.processor.vector_store._ready = True  # noqa: SLF001
+
+        async def _boom_meta(*a, **k):
+            raise RuntimeError("metadata unavailable")
+
+        from unittest.mock import patch as _patch2
+
+        with _patch2.object(
+            bp.processor.vector_store, "record_embedding_metadata", _boom_meta
+        ), _patch2.object(bp.processor, "process_existing_file", _noop_process):
+            status3, result3, error3 = await bp._reindex_embed_all(
+                1,
+                vault_id=None,
+                retry_file_ids=[dup_fid, good_fid],
+            )
+        assert status3 == "failed" and error3 is not None
+        # Global failure keeps its empty result (full-scope retry); the
+        # ledger rides on the stall state and is unioned by the runner.
+        assert result3 == {}, (
+            f"FB-016: metadata failure must keep the GLOBAL empty shape: {result3!r}"
+        )
+        assert dup_fid in bp._stall_duplicate_ids  # noqa: SLF001
+        # Stage B r8: an in-flight embedding-identity change is another
+        # failure return after the recount — the externally settled ids must
+        # survive there too. Flip the model mid-run via the process stub.
+        from app.config import settings as _settings
+
+        async def _flip_identity(*a, **k):
+            monkeypatch.setattr(_settings, "embedding_model", "fb016-flip")
+
+        with _patch2.object(
+            bp.processor, "process_existing_file", _flip_identity
+        ):
+            status4, result4, error4 = await bp._reindex_embed_all(
+                1,
+                vault_id=None,
+                retry_file_ids=[dup_fid, good_fid],
+            )
+        assert status4 == "failed" and error4 is not None
+        assert "duplicate_file_ids" not in result4 and result4.get("failed") == 0, (
+            f"FB-016: identity failure must keep its GLOBAL result shape: {result4!r}"
+        )
+        assert dup_fid in bp._stall_duplicate_ids  # noqa: SLF001
+    finally:
+        pool.close_all()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_early_staged_guidance_carries_excluded_duplicate(tmp_path, monkeypatch):
+    """Stage B gate r12 (FB-016): a narrowed retry scope with an externally
+    duplicate-settled row and a changed embedding dimension raises operator
+    guidance BEFORE any file is processed. The early recount must still
+    capture the excluded id so the runner's requeue payload keeps the ledger.
+    """
+    import json as _json
+
+    from app.config import settings
+    from app.services.background_tasks import BackgroundProcessor
+    from app.services.job_lease import ensure_jobs_schema
+
+    monkeypatch.setattr(settings, "jobs_max_attempts", 3)
+    db_path, conn = _seed(tmp_path, "early-guidance.db")
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    try:
+        ensure_jobs_schema(conn)
+        dup_fid, _dh, _dp = _seed_terminal_duplicate(conn)
+        good_fid = _insert_file(
+            conn, file_hash="b" * 64, status="indexed",
+            path=str(tmp_path / "early-guidance-good.pdf"),
+        )
+        conn.execute(
+            "INSERT INTO jobs (queue, payload_json, status, worker_id, attempts)"
+            " VALUES ('reindex', ?, 'running', 'early-worker', 1)",
+            (
+                _json.dumps(
+                    {"vault_id": 1, "retry_file_ids": [dup_fid, good_fid]}
+                ),
+            ),
+        )
+        conn.commit()
+        job_id = conn.execute("SELECT max(id) FROM jobs").fetchone()[0]
+        bp = BackgroundProcessor(pool=pool, retry_delay=0.05)
+
+        class _Store:
+            _ready = True
+
+            async def init_table(self, *a, **k):
+                return None
+
+            async def get_live_embedding_dim(self, *a, **k):
+                return 2  # probe below returns 3 -> staged refusal
+
+            async def add_chunks(self, *a, **k):
+                return {}
+
+            async def record_embedding_metadata(self, *a, **k):
+                return None
+
+            async def mark_ready(self, *a, **k):
+                return None
+
+        bp.processor.vector_store = _Store()
+
+        class _ProbeEmbed:
+            async def embed_batch(self, texts, fail_fast=True, **kwargs):
+                if texts and texts[0] == "dimension_probe":
+                    return [[0.1, 0.2, 0.3]]
+                return [[0.1, 0.2, 0.3] for _ in texts]
+
+        bp.processor.embedding_service = _ProbeEmbed()
+
+        from unittest.mock import patch as _patch4
+
+        async def _real_producer(*a, **k):
+            return await _orig_producer(*a, **k)
+
+        _orig_producer = bp._reindex_embed_all.__func__.__get__(bp, BackgroundProcessor)
+        with _patch4.object(bp, "_reindex_embed_all", _real_producer):
+            await bp._run_reindex_job_row(
+                {
+                    "id": job_id,
+                    "attempts": 1,
+                    "payload_json": _json.dumps(
+                        {"vault_id": 1, "retry_file_ids": [dup_fid, good_fid]}
+                    ),
+                },
+                "early-worker",
+            )
+        row = conn.execute(
+            "SELECT status, payload_json FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        assert row["status"] == "pending", (
+            f"FB-016: global guidance must stay on the retry ladder: {row['status']!r}"
+        )
+        payload = _json.loads(row["payload_json"] or "{}")
+        assert dup_fid in (payload.get("duplicate_file_ids") or []), (
+            f"FB-016: excluded duplicate lost on early staged guidance: {payload!r}"
+        )
+    finally:
+        pool.close_all()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_unions_discovered_duplicates_on_global_failure(tmp_path, monkeypatch):
+    """Stage B gate r9 (FB-016): a GLOBAL identity-failure result must NOT
+    trip the duplicate-only terminal arm, but the duplicate id discovered by
+    the producer must still reach the requeued payload via the runner seam.
+    """
+    import json as _json
+
+    from app.config import settings
+    from app.services.background_tasks import (
+        BackgroundProcessor,
+        ReindexOperatorGuidance,
+    )
+    from app.services.job_lease import ensure_jobs_schema
+
+    monkeypatch.setattr(settings, "jobs_max_attempts", 3)
+    db_path, conn = _seed(tmp_path, "runner-global-failure.db")
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    try:
+        ensure_jobs_schema(conn)
+        conn.execute(
+            "INSERT INTO jobs (queue, payload_json, status, worker_id, attempts)"
+            " VALUES ('reindex', ?, 'running', 'global-worker', 1)",
+            (_json.dumps({"vault_id": 1}),),
+        )
+        conn.commit()
+        job_id = conn.execute("SELECT max(id) FROM jobs").fetchone()[0]
+        bp = BackgroundProcessor(pool=pool, retry_delay=0.05)
+
+        async def _producer(job_id, vault_id, retry_file_ids=None):  # noqa: ARG001
+            bp._stall_duplicate_ids = [42]  # noqa: SLF001 — discovered externally
+            return (
+                "failed",
+                {"processed": 0, "failed": 0},
+                ReindexOperatorGuidance("identity changed during the run"),
+            )
+
+        from unittest.mock import patch as _patch3
+
+        with _patch3.object(bp, "_reindex_embed_all", _producer):
+            await bp._run_reindex_job_row(
+                {"id": job_id, "attempts": 1, "payload_json": _json.dumps({"vault_id": 1})},
+                "global-worker",
+            )
+        row = conn.execute(
+            "SELECT status, payload_json FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        assert row["status"] == "pending", (
+            f"FB-016: a global identity failure must stay on the retry ladder: {row['status']!r}"
+        )
+        payload = _json.loads(row["payload_json"] or "{}")
+        assert payload.get("duplicate_file_ids") == [42], (
+            f"FB-016: discovered duplicate lost through the runner seam: {payload!r}"
+        )
+
+        # Stage B r10: a REAL staged compose uses the SAME guidance exception
+        # type but carries the transport ledger keys — it must still settle
+        # 'failed' terminally on the first attempt (not requeue).
+        conn.execute(
+            "UPDATE jobs SET status = 'running', worker_id = 'global-worker',"
+            " attempts = 1, payload_json = ? WHERE id = ?",
+            (_json.dumps({"vault_id": 1}), job_id),
+        )
+        conn.commit()
+
+        async def _staged_producer(job_id, vault_id, retry_file_ids=None):  # noqa: ARG001
+            return (
+                "failed",
+                {
+                    "processed": 0,
+                    "failed": 2,
+                    "duplicate_file_ids": [42],
+                    "transient_failed_ids": [43],
+                },
+                ReindexOperatorGuidance("staged abort with duplicate ledger"),
+            )
+
+        with _patch3.object(bp, "_reindex_embed_all", _staged_producer):
+            await bp._run_reindex_job_row(
+                {"id": job_id, "attempts": 1, "payload_json": _json.dumps({"vault_id": 1})},
+                "global-worker",
+            )
+        staged_row = conn.execute(
+            "SELECT status, result_json FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        assert staged_row["status"] == "failed", (
+            f"FB-016: staged guidance compose must settle terminally: {staged_row['status']!r}"
+        )
+        staged_result = _json.loads(staged_row["result_json"] or "{}")
+        assert set(staged_result.get("duplicate_file_ids") or []) == {42}, (
+            f"FB-016: staged ledger lost: {staged_result!r}"
+        )
+    finally:
+        pool.close_all()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_stall_settle_unions_prior_duplicates_with_empty_scope(tmp_path, monkeypatch):
+    """Stage B gate r3 (FB-005): a watchdog stall with NO captured retry
+    scope can still reach the cap. The cumulative ledger from the previous
+    payload AND the discovering attempt's ids must survive in the terminal
+    result; the cap settle must not reference an uninitialized local.
+    """
+    import json as _json
+
+    from app.config import settings
+    from app.services.background_tasks import BackgroundProcessor
+    from app.services.job_lease import ensure_jobs_schema
+
+    monkeypatch.setattr(settings, "jobs_max_attempts", 1)
+    db_path, conn = _seed(tmp_path, "stall-union.db")
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    try:
+        ensure_jobs_schema(conn)
+        conn.execute(
+            "INSERT INTO jobs (queue, payload_json, status, worker_id, attempts)"
+            " VALUES ('reindex', ?, 'running', 'stall-worker', 1)",
+            (_json.dumps({"vault_id": 1, "duplicate_file_ids": [7, 9]}),),
+        )
+        conn.commit()
+        job_id = conn.execute("SELECT max(id) FROM jobs").fetchone()[0]
+        processor = BackgroundProcessor(pool=pool, retry_delay=0.05)
+        processor._stall_retry_file_ids = []  # noqa: SLF001
+        processor._stall_duplicate_ids = [11]  # noqa: SLF001
+        await processor._settle_stalled_reindex(job_id, "stall-worker")  # noqa: SLF001
+        row = conn.execute(
+            "SELECT status, error, result_json FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        assert row["status"] == "failed", f"cap settle failed: {row['status']!r}"
+        assert (row["error"] or "").startswith("attempt_cap_exceeded")
+        result = _json.loads(row["result_json"] or "{}")
+        assert result.get("duplicate_file_ids") == [7, 9, 11], (
+            f"FB-005: earlier duplicates were dropped: {result!r}"
+        )
+        assert result.get("failed") == 3
+    finally:
+        pool.close_all()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_stall_requeue_persists_duplicates_with_empty_scope(tmp_path, monkeypatch):
+    """Stage B gate r5 (FB-005): below the cap, a watchdog stall with no
+    captured retry scope must still write the cumulative duplicate ledger
+    into the requeued payload.
+    """
+    import json as _json
+
+    from app.config import settings
+    from app.services.background_tasks import BackgroundProcessor
+    from app.services.job_lease import ensure_jobs_schema
+
+    monkeypatch.setattr(settings, "jobs_max_attempts", 3)
+    db_path, conn = _seed(tmp_path, "stall-requeue.db")
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    try:
+        ensure_jobs_schema(conn)
+        conn.execute(
+            "INSERT INTO jobs (queue, payload_json, status, worker_id, attempts)"
+            " VALUES ('reindex', ?, 'running', 'stall-worker', 1)",
+            (_json.dumps({"vault_id": 1, "duplicate_file_ids": [7]}),),
+        )
+        conn.commit()
+        job_id = conn.execute("SELECT max(id) FROM jobs").fetchone()[0]
+        processor = BackgroundProcessor(pool=pool, retry_delay=0.05)
+        processor._stall_retry_file_ids = []  # noqa: SLF001
+        processor._stall_duplicate_ids = [11]  # noqa: SLF001
+        await processor._settle_stalled_reindex(job_id, "stall-worker")  # noqa: SLF001
+        row = conn.execute(
+            "SELECT status, payload_json FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        assert row["status"] == "pending", f"below-cap requeue failed: {row['status']!r}"
+        payload = _json.loads(row["payload_json"] or "{}")
+        assert payload.get("duplicate_file_ids") == [7, 11], (
+            f"FB-005: requeue lost the cumulative ledger: {payload!r}"
+        )
+    finally:
+        pool.close_all()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_file_carrier_never_logs_user_path(tmp_path, caplog):
+    """Stage B gate r2 (FB-001): drive the REAL process_existing_file
+    missing-file path with a marker-bearing user filename and assert the
+    marker appears neither in the raised exception nor in any default-level
+    log record. The earlier source-shape pin alone was not execution proof.
+    """
+    import logging
+
+    from app.models.database import SQLiteConnectionPool
+    from app.services.document_processor import DocumentProcessor
+
+    db_path, conn = _seed(tmp_path, "carrier.db")
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    try:
+        fid, file_hash, _path = _seed_terminal_duplicate(conn)
+        marker = "FB001-secret-name.pdf"
+        missing = tmp_path / marker
+        assert not missing.exists()
+        processor = DocumentProcessor(pool=pool, vector_store=object())
+        with caplog.at_level(logging.INFO):
+            with pytest.raises(FileNotFoundError) as excinfo:
+                await processor.process_existing_file(
+                    fid, str(missing), 1, file_hash=file_hash
+                )
+        raised = str(excinfo.value)
+        assert marker not in raised, (
+            f"FB-001: the user path leaked into the raised carrier: {raised!r}"
+        )
+        leaks = [r.getMessage() for r in caplog.records if marker in r.getMessage()]
+        assert leaks == [], f"FB-001: default-level leak(s): {leaks}"
+    finally:
+        pool.close_all()
+        conn.close()
+
+
+def test_reindex_missing_file_carrier_is_bounded():
+    """Stage B gate for FB-001: the exception carrier must not embed a user
+    path, and the persist-boundary redaction must strip it from arbitrary
+    path-bearing exceptions (the log site renders that redacted code).
+    """
+    import inspect
+
+    from app.services import document_processor as dp
+    from app.services.background_tasks import _redact_reindex_error
+
+    marker = "/srv/uploads/vault_3/FB001-secret-name.pdf"
+    # Current raise shape: numeric id only, no path interpolation.
+    bounded = FileNotFoundError("File not found: file_id=7")
+    assert marker not in str(bounded)
+    src = inspect.getsource(dp.DocumentProcessor.process_existing_file)
+    assert 'FileNotFoundError(f"File not found: {file_path}")' not in src
+    assert 'FileNotFoundError(f"Path is not a file: {file_path}")' not in src
+    # Even if a third-party path-bearing exception reaches the reindex log
+    # site, the rendered default-level code carries no path.
+    assert marker not in _redact_reindex_error(FileNotFoundError(marker))
+
+
+@pytest.mark.asyncio
+async def test_fully_absorbed_retry_scope_keeps_duplicate_ledger(tmp_path):
+    """Stage B gate for FB-016: a narrowed retry scope whose rows all became
+    duplicate-settled externally must not complete with a bare zero-processed
+    result — the terminal duplicate outcome is recounted into the result.
+    """
+    from app.services.background_tasks import BackgroundProcessor
+
+    db_path, conn = _seed(tmp_path, "absorbed-retry.db")
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    try:
+        fid, _file_hash, _path = _seed_terminal_duplicate(conn)
+        # Force a nonempty retry scope whose only row is duplicate-settled.
+        bp = BackgroundProcessor(pool=pool, retry_delay=0.05)
+
+        class _NoopStore:
+            async def init_table(self, *a, **k):
+                return None
+
+            async def get_live_embedding_dim(self, *a, **k):
+                return 2
+
+            async def add_chunks(self, *a, **k):
+                return {}
+
+            async def record_embedding_metadata(self, *a, **k):
+                return None
+
+            async def mark_ready(self, *a, **k):
+                return None
+
+            async def delete_by_file(self, *a, **k):
+                return None
+
+            async def delete_old_generation_by_file(self, *a, **k):
+                return 0
+
+        bp.processor.vector_store = _NoopStore()
+
+        class _EmbedStub:
+            async def embed_batch(self, texts, fail_fast=True, **kwargs):
+                return [[0.1, 0.2] for _ in texts]
+
+        bp.processor.embedding_service = _EmbedStub()
+        status, result, error = await bp._reindex_embed_all(
+            1, vault_id=None, retry_file_ids=[fid]
+        )
+        assert status == "completed" and error is None, (status, result, error)
+        assert result.get("duplicate_file_ids") == [fid], (
+            f"FB-016: absorbed retry scope lost its duplicate ledger: {result!r}"
+        )
+        assert result.get("failed") == 1
+    finally:
+        pool.close_all()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_generation_probe_failure_still_attempts_delete(tmp_path):
+    """Stage B gate r4 (FB-007): the failure branch of count_rows used to
+    swallow to 0 and skip the delete entirely. Force the probe to fail and
+    assert the bounded generation delete still lands.
+    """
+    from app.config import settings
+    from app.services.vector_store import VectorStore
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(settings, "reupload_safe_order", True)
+    try:
+        store = VectorStore(db_path=tmp_path / "lance-countfail")
+        await store.connect()
+        await store.init_table(2)
+        hx = "a" * 64
+        await store.add_chunks(
+            [
+                {
+                    "id": f"7_{hx[:8]}_default_0",
+                    "text": "x",
+                    "file_id": "7",
+                    "vault_id": "1",
+                    "chunk_index": 0,
+                    "chunk_scale": "default",
+                    "metadata": "{}",
+                    "embedding": [0.1, 0.2],
+                }
+            ]
+        )
+
+        original_count = store.table.count_rows
+
+        async def _boom(*a, **k):
+            raise OSError("probe unavailable")
+
+        monkeypatch.setattr(store.table, "count_rows", _boom)
+        deleted = await store.delete_generation_by_file_locked("7", hx)
+        monkeypatch.setattr(store.table, "count_rows", original_count)
+        assert deleted >= 1, "FB-007: a failed probe must not skip the delete"
+        assert await store.table.count_rows("file_id = '7'") == 0
+    finally:
+        monkeypatch.undo()
+
+
+@pytest.mark.asyncio
+async def test_unwind_blocked_claim_keeps_event_loop_responsive(tmp_path):
+    """Stage B gate r4 (FB-008): while BEGIN IMMEDIATE blocks in its worker
+    thread, the event loop must keep running and cancellation must not hand
+    the pooled connection to another borrower before the thread finishes.
+    """
+    db_path, conn = _seed(tmp_path, "blocked-claim.db")
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    blocker = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+    try:
+        fid, _hash, _path = _seed_terminal_duplicate(conn)
+        # BEGIN IMMEDIATE alone takes the SQLite RESERVED write lock; no DML
+        # is needed to block the unwind's competing claim.
+        blocker.execute("BEGIN IMMEDIATE")
+
+        class _Store:
+            @asynccontextmanager
+            async def write_locked(self):
+                yield self
+
+            async def delete_generation_by_file_locked(self, *a, **k):
+                return 1
+
+        ticked = asyncio.Event()
+
+        async def _tick():
+            for _ in range(3):
+                await asyncio.sleep(0.01)
+            ticked.set()
+
+        ticker = asyncio.create_task(_tick())
+        unwind = asyncio.create_task(
+            _unwind_duplicate_loser_generation(_Store(), pool, fid)
+        )
+        # A responsive loop sets this well within the budget; if BEGIN were
+        # executed inline under the GIL it could not. No wall-clock threshold.
+        await asyncio.wait_for(ticked.wait(), 5)
+        await asyncio.sleep(0.05)
+        unwind.cancel()
+        # While the blocker holds the SQLite write lock the claim cannot
+        # finish; releasing it lets the shielded task unwind cleanly.
+        blocker.rollback()
+        with pytest.raises(asyncio.CancelledError):
+            await unwind
+        ticker.cancel()
+        row = conn.execute("SELECT status FROM files WHERE id = ?", (fid,)).fetchone()
+        assert row[0] == "error"  # status fence untouched by cancellation
+    finally:
+        try:
+            blocker.rollback()
+        except sqlite3.Error:
+            pass
+        blocker.close()
+        pool.close_all()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_unwind_deletes_written_generation_when_row_hash_is_stale(tmp_path):
+    """Feedback FB-015 (review 6985516412 F-007): reindex never refreshes
+    files.file_hash, so a locally recomputed generation can differ from the
+    persisted row hash. The unwind must delete the generation THIS attempt
+    wrote while still using the row read as the status fence.
+    """
+    db_path, conn = _seed(tmp_path, "stale-hash.db")
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    try:
+        fid, stale_hash, _path = _seed_terminal_duplicate(conn)
+        written_hash = "f" * 64
+        assert written_hash != stale_hash
+
+        class _RecordingHashStore:
+            deleted_hash = None
+
+            @asynccontextmanager
+            async def write_locked(self):
+                yield self
+
+            async def delete_generation_by_file_locked(
+                self, file_id, file_hash, target=None  # noqa: ARG002
+            ):
+                self.deleted_hash = file_hash
+                return 1
+
+        store = _RecordingHashStore()
+        assert (
+            await _unwind_duplicate_loser_generation(
+                store, pool, fid, generation_hash=written_hash
+            )
+            is True
+        )
+        assert store.deleted_hash == written_hash, (
+            "FB-015: the unwind deleted by the stale row hash instead of the "
+            f"generation the attempt wrote ({store.deleted_hash!r})"
+        )
+    finally:
+        pool.close_all()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_generation_by_file_locked_real_store(tmp_path, monkeypatch):
+    """Feedback FB-010: the real (public, destructive) primitive had ZERO
+    direct coverage — every guard leg used a stub of the same name. Drive the
+    actual VectorStore against a real LanceDB table: exactly one generation
+    of one file is deleted, prefix-neighbour file ids (17_/71_) survive, a
+    second call is a no-op, and legacy mode deletes the whole file.
+    """
+    from app.config import settings
+    from app.services.vector_store import VectorStore
+
+    monkeypatch.setattr(settings, "reupload_safe_order", True)
+    store = VectorStore(db_path=tmp_path / "lance-fb010")
+    await store.connect()
+    await store.init_table(2)
+    hx, hy = "a" * 64, "b" * 64
+
+    def _record(rid: str, fid: str) -> dict:
+        return {
+            "id": rid,
+            "text": "x",
+            "file_id": fid,
+            "vault_id": "1",
+            "chunk_index": 0,
+            "chunk_scale": "default",
+            "metadata": "{}",
+            "embedding": [0.1, 0.2],
+        }
+
+    await store.add_chunks(
+        [
+            _record(f"7_{hx[:8]}_default_0", "7"),
+            _record(f"7_{hx[:8]}_default_1", "7"),
+            _record(f"7_{hy[:8]}_default_0", "7"),
+            _record(f"17_{hx[:8]}_default_0", "17"),
+            _record(f"71_{hx[:8]}_default_0", "71"),
+        ]
+    )
+    assert await store.delete_generation_by_file_locked("7", hx) == 2
+    assert await store.table.count_rows(f"file_id = '7' AND id LIKE '7_{hy[:8]}_%'") == 1
+    assert await store.table.count_rows("file_id = '17'") == 1
+    assert await store.table.count_rows("file_id = '71'") == 1
+    assert await store.delete_generation_by_file_locked("7", hx) == 0
+    with pytest.raises(ValueError):
+        await store.delete_generation_by_file_locked("not-numeric", hx)
+    with pytest.raises(ValueError):
+        await store.delete_generation_by_file_locked("7", "zzzz")
+
+    # Legacy ids carry no generation prefix: the whole file is the orphan.
+    monkeypatch.setattr(settings, "reupload_safe_order", False)
+    await store.add_chunks(
+        [_record("9_0", "9"), _record("9_1", "9"), _record("19_0", "19")]
+    )
+    assert await store.delete_generation_by_file_locked("9", hx) >= 2
+    assert await store.table.count_rows("file_id = '9'") == 0
+    assert await store.table.count_rows("file_id = '19'") == 1
+
+
 def test_limiter_scheme_echo_is_structural_not_charset():
     """Delta-review round 2 (F-002 reopen): the scheme token echoed in the
     boot-failure diagnosis must be extracted STRUCTURALLY — everything
@@ -1460,6 +2247,32 @@ async def test_mixed_staged_abort_settles_terminally_no_requeue(tmp_path):
             "folded into the settled 'failed' count, never a retry input); "
             f"got {result!r}"
         )
+        # Feedback FB-003 (review 6984415094 F-03): a key-presence assertion
+        # let a forced-empty transient set pass 460 tests while the runner
+        # settled failed=1 instead of 2. Pin the VALUE and the disjointness.
+        transients = set(result["transient_failed_ids"])
+        duplicates = set(dup_ids)
+        # Which row the race guard trips first is scheduling-dependent; pin
+        # the VALUE invariants (non-empty, disjoint, exactly the two failed
+        # files) instead of a specific id assignment. A forced-empty
+        # transient set — the mutation that motivated FB-003 — goes RED here.
+        assert transients and duplicates, (
+            f"FB-003: both ledgers must be non-empty: {result!r}"
+        )
+        assert transients.isdisjoint(duplicates), (
+            f"FB-003: transient and duplicate ledgers overlap: {result!r}"
+        )
+        assert len(transients | duplicates) == 2, (
+            f"FB-003: the distinct failed set must have 2 members: {result!r}"
+        )
+        assert transients | duplicates <= {owner_id, transient_id, dup_loser_id}
+        # FB-005 / Stage B final: duplicate ids are captured at DISCOVERY,
+        # so a later watchdog cancellation at any per-file lock await keeps
+        # them (not only inside the process_existing_file CancelledError arm).
+        assert set(bp._stall_duplicate_ids) == duplicates, (
+            "FB-005: stall state did not capture the discovered duplicates "
+            f"at discovery time: {bp._stall_duplicate_ids!r} vs {duplicates!r}"
+        )
         assert result.get("failed") == 2, (
             f"982F001: 'failed' counts the distinct terminal files "
             f"(transient + duplicate); got {result.get('failed')!r}"
@@ -1673,7 +2486,44 @@ async def test_mixed_staged_abort_cap_settlement_keeps_transient_count(
         lease_conn.close()
 
 
-def test_limiter_info_log_channel_bounded_for_uncolonned_userinfo(caplog):
+def test_string_error_renders_text_not_constant_str():
+    """Feedback FB-017 / Stage B test gate: the three error-discriminator
+    sites must render a stable code (or the leak-free string error text),
+    never the constant "str" produced by type(str).__name__. Mutation of
+    any of the three hunks back to type(...).__name__ goes RED here.
+    """
+    import inspect
+
+    from app.services import background_tasks as bt
+    from app.services import document_processor as dp
+
+    image_src = inspect.getsource(dp.DocumentProcessor._process_image_file)
+    assert "image_result.error_code or \"unknown\"" in image_src
+    assert "type(image_result.error).__name__" not in image_src
+
+    # Pin EACH background-tasks site independently (closeout review): a
+    # class-level substring would stay present if only one twin regressed.
+    handle_src = inspect.getsource(bt.BackgroundProcessor._handle_failure)
+    # This method's ONLY isinstance occurrence is the backlog-full log
+    # discriminator; reverting that site alone drops it to zero.
+    assert handle_src.count("isinstance(error, str)") == 1, (
+        "FB-017: backlog-full log lost its string-error discriminator"
+    )
+    permanent_src = inspect.getsource(
+        bt.BackgroundProcessor._mark_task_permanently_failed
+    )
+    # This method also has an unrelated safe_error isinstance expression, so
+    # pin the LOG expression itself in addition to the two-occurrence count.
+    assert permanent_src.count("isinstance(error, str)") >= 2, (
+        "FB-017: permanent-failure log lost its string-error discriminator"
+    )
+    assert (
+        'f"{error if isinstance(error, str) else type(error).__name__} "'
+        in permanent_src
+    ), "FB-017: permanent-failure log lost its exact discriminator expression"
+
+
+def test_limiter_info_log_channel_pins_known_1171_leak(caplog):
     """Review F-003/A-1a (pr1169-20261117): the boot INFO line logs
     redact_url(storage_uri); redact_url does not mask username-only
     userinfo, so the guard must observe the REAL logger ('rate_limit')

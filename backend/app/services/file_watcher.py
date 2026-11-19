@@ -365,9 +365,13 @@ class FileWatcher:
                     )
                     logger.debug(f"Enqueued new file for processing: {file_path}")
             except Exception as e:
+                # Feedback FB-011/FB-025 (PO-4): the adjacent K-01 invariant
+                # requires a vault-relative form with no server path at
+                # default level; the full directory stays at DEBUG.
                 logger.error(
-                    f"Error scanning directory {directory}: "
-                    f"{type(e).__name__}"
+                    "Error scanning directory (dir_len=%d): %s",
+                    len(str(directory)),
+                    type(e).__name__,
                 )
                 logger.debug(
                     "Error scanning directory %s: %s", directory, e

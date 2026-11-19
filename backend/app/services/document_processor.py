@@ -488,6 +488,7 @@ async def _unwind_duplicate_loser_generation(
     pool: Any,
     file_id: int,
     vector_target: Optional[object] = None,
+    generation_hash: Optional[str] = None,
 ) -> bool:
     """issue #1131 CC-001: fenced unwind of a duplicate race-loser's vectors.
 
@@ -514,8 +515,26 @@ async def _unwind_duplicate_loser_generation(
             # Close any latent implicit transaction before the explicit
             # BEGIN (a bare COMMIT with no open tx is a no-op).
             conn.commit()
-            conn.execute("BEGIN IMMEDIATE")
+            # Feedback FB-008 / Stage B: the BEGIN can block up to
+            # busy_timeout (30 s) on a cross-process writer. Running it
+            # inline froze the event loop (critic probe: 32.31 s) with the
+            # Lance lock held; the pooled connection is
+            # check_same_thread=False, so hand the blocking call to a
+            # worker thread. Cancellation must NOT release the connection
+            # while the thread still owns it: shield the task and await it
+            # to completion on the cancellation path, then let the existing
+            # except BaseException roll back before the session finally
+            # releases the connection. Lock ORDER is unchanged (Lance
+            # write lock -> SQLite permit -> BEGIN IMMEDIATE).
             try:
+                claim = asyncio.ensure_future(
+                    asyncio.to_thread(conn.execute, "BEGIN IMMEDIATE")
+                )
+                try:
+                    await asyncio.shield(claim)
+                except asyncio.CancelledError:
+                    await claim
+                    raise
                 row = conn.execute(
                     "SELECT status, error_message, file_hash FROM files "
                     "WHERE id = ?",
@@ -526,7 +545,13 @@ async def _unwind_duplicate_loser_generation(
                     return False
                 status = row[0]
                 error_message = row[1] or ""
-                file_hash = row[2] or ""
+                row_hash = row[2] or ""
+                # Feedback FB-015: the row's persisted hash can be STALE
+                # (reindex re-derives from disk and never refreshes it), while
+                # the generation actually written by this attempt is keyed by
+                # the locally computed hash. Use the passed-in write-side
+                # hash for the delete; the row read stays the status fence.
+                file_hash = generation_hash or row_hash
                 if status != "error" or not error_message.startswith(
                     "DUPLICATE_FILE:"
                 ):
@@ -633,10 +658,15 @@ class DocumentParser:
         # Validate file exists
         path = Path(file_path)
         if not path.exists():
-            raise FileNotFoundError(f"Document file not found: {file_path}")
+            # FB-001:.exception carriers must not embed the user path.
+            raise FileNotFoundError(
+                f"Document file not found (path_len={len(str(path))})"
+            )
 
         if not path.is_file():
-            raise FileNotFoundError(f"Path is not a file: {file_path}")
+            raise FileNotFoundError(
+                f"Path is not a file (path_len={len(str(path))})"
+            )
 
         try:
             # Lazy import: unstructured can hang at module level when it
@@ -3971,9 +4001,10 @@ class DocumentProcessor:
                 "(issue #703: an image whose OCR could not run is a "
                 "degraded failure, not a clean success).",
                 len(str(file_path)),
-                type(image_result.error).__name__
-                if image_result.error
-                else "unknown",
+                # FB-017: image_result.error is a plain Optional[str], so
+                # type(...).__name__ rendered the constant "str" on every
+                # failure. The stable error_code is the real discriminator.
+                image_result.error_code or "unknown",
             )
             logger.debug(
                 "Image processing failed for %s: %s",
@@ -4473,6 +4504,7 @@ class DocumentProcessor:
         file_id: int,
         exc: sqlite3.IntegrityError,
         vector_target: Optional[object] = None,
+        generation_hash: Optional[str] = None,
     ) -> None:
         """issue #1112 finalization race backstop, shared by both ingest
         tails (review FB-008 — the tails converge per issue #513 W9/C26, so
@@ -4527,20 +4559,23 @@ class DocumentProcessor:
             # losing the race — unwind it under the fenced claim. Runs
             # AFTER the session exits (the write permit is non-reentrant,
             # same constraint as set_phase above). Best-effort: a failed
-            # delete leaves the orphan exactly as at base (operator
-            # vault reindex recovers it).
+            # delete leaves the orphan exactly as at base — a fresh upload
+            # or a staged dimension/identity rebuild recovers it; a
+            # same-dimension vault reindex cannot (see the release note).
             try:
                 await _unwind_duplicate_loser_generation(
                     self.vector_store,
                     self.pool,
                     file_id,
                     vector_target=vector_target,
+                    generation_hash=generation_hash,
                 )
             except Exception:
                 logger.warning(
                     "Duplicate race-loser vector unwind failed for "
                     "file_id=%d; the orphaned generation remains "
-                    "(operator vault reindex recovers it)",
+                    "(a fresh upload or a staged dimension/identity rebuild "
+                    "recovers it; a same-dimension vault reindex cannot)",
                     file_id,
                 )
                 logger.debug(
@@ -4585,10 +4620,17 @@ class DocumentProcessor:
         # Validate file exists
         path = Path(file_path)
         if not path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
+            # Feedback FB-001: the exception text is itself a default-level
+            # log carrier — carry only a bounded length here (this parse
+            # helper has no file_id); the full path is at DEBUG at callers.
+            raise FileNotFoundError(
+                f"File not found (path_len={len(str(path))})"
+            )
 
         if not path.is_file():
-            raise FileNotFoundError(f"Path is not a file: {file_path}")
+            raise FileNotFoundError(
+                f"Path is not a file (path_len={len(str(path))})"
+            )
 
         # Compute file hash
         file_hash = compute_file_hash(file_path)
@@ -5281,7 +5323,9 @@ class DocumentProcessor:
             # have task.file_id=None, whose transport failure path does NOT
             # settle the files row — without this arm a race loser could
             # strand in 'processing'.
-            await self._settle_duplicate_finalize_race(file_id, exc)
+            await self._settle_duplicate_finalize_race(
+                file_id, exc, generation_hash=file_hash
+            )
         if not finalized:
             logger.info(
                 "Ingest generation voided for file_id=%d: row settled "
@@ -5412,7 +5456,10 @@ class DocumentProcessor:
                 phase="error",
                 message=safe_error,
             )
-            raise FileNotFoundError(f"File not found: {file_path}")
+            # Feedback FB-001: the exception text is itself a default-level
+            # log carrier (the reindex caller renders it) — carry the numeric
+            # id only; the full path is at DEBUG in the warning above.
+            raise FileNotFoundError(f"File not found: file_id={file_id}")
         if not path.is_file():
             logger.warning(
                 "process_existing_file: path is not a file for file_id=%s (path_len=%d)",
@@ -5439,7 +5486,7 @@ class DocumentProcessor:
                 phase="error",
                 message=safe_error,
             )
-            raise FileNotFoundError(f"Path is not a file: {file_path}")
+            raise FileNotFoundError(f"Path is not a file: file_id={file_id}")
 
         # Transition status: pending -> processing. Duplicate check intentionally
         # skipped — the route already ran it before inserting the row.
@@ -6241,7 +6288,7 @@ class DocumentProcessor:
             # same fenced settlement its process_file twin applies). The
             # loser wrote to vector_target when one was carried (#1131).
             await self._settle_duplicate_finalize_race(
-                file_id, exc, vector_target=vector_target
+                file_id, exc, vector_target=vector_target, generation_hash=file_hash
             )
         if not finalized:
             logger.info(

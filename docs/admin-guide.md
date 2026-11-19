@@ -452,6 +452,14 @@ Configure in `.env`:
 LOG_LEVEL=INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
 ```
 
+> **Sensitive logs at DEBUG.** Default-level redaction bounds provider
+> bodies, user filenames/paths, vault names and email senders at INFO and
+> above. Enabling `DEBUG` deliberately restores the full values (including
+> provider response bodies that can echo prompt/document text) for
+> troubleshooting. Treat DEBUG logs as sensitive, restrict access and do not
+> retain them longer than needed — the same caution that applies to
+> re-enabled uvicorn access lines above.
+
 ### Log Rotation
 
 Docker automatically rotates logs. Configure in `docker-compose.yml`:
