@@ -2,8 +2,10 @@
 
 import hmac
 import logging
+import re
 from typing import Any, Callable, Optional
 
+from limits.errors import ConfigurationError
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from starlette.requests import Request
@@ -12,6 +14,14 @@ from app.config import settings
 from app.utils.secrets import redact_url
 
 logger = logging.getLogger("rate_limit")
+
+# A well-formed URI scheme token (RFC 3986 scheme charset, pragmatic
+# subset). A token is echoed in the boot-failure diagnosis ONLY when the
+# entire pre-"://" prefix of REDIS_URL matches it; every other shape gets
+# the literal 'unparseable' placeholder (review F-002 + delta-review
+# round 2: a charset-only guard still fullmatched and echoed colon-less
+# secrets like "hunter2golden").
+_SCHEME_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{0,31}")
 
 
 def get_client_ip(request: Request) -> str:
@@ -180,16 +190,47 @@ def build_limiter(redis_url: str) -> WhitelistLimiter:
             "Rate limiter wired to Redis for shared counters: %s",
             redact_url(storage_uri),
         )
-    limiter_instance = WhitelistLimiter(
-        key_func=get_client_ip,
-        storage_uri=storage_uri,
-        # Only meaningful with a real (non-memory) backend. With memory://
-        # (CI / empty REDIS_URL) no fallback limiter is constructed.
-        in_memory_fallback_enabled=storage_uri != "memory://",
-        # Passed here for documentation; see the force assignment below for why
-        # this alone is not sufficient.
-        headers_enabled=False,
-    )
+    try:
+        limiter_instance = WhitelistLimiter(
+            key_func=get_client_ip,
+            storage_uri=storage_uri,
+            # Only meaningful with a real (non-memory) backend. With memory://
+            # (CI / empty REDIS_URL) no fallback limiter is constructed.
+            in_memory_fallback_enabled=storage_uri != "memory://",
+            # Passed here for documentation; see the force assignment below
+            # for why this alone is not sufficient.
+            headers_enabled=False,
+        )
+    except (ConfigurationError, ValueError) as exc:
+        # `from None` severs the chained original exception from any
+        # boot traceback: its message embeds the raw (credential-bearing)
+        # storage URI verbatim.
+        # Scheme-only diagnosis: redact_url covers the known redis://
+        # shapes, but an UNREGISTERED scheme (the very thing that lands
+        # here) can carry the credential in positions its patterns do not
+        # match (final-critic B2 probe: bogus://<secret>@host renders
+        # verbatim). The raised message carries the scheme TOKEN only —
+        # and the token is echoed only when the value has a real URI
+        # shape: everything before the first "://" is a single scheme
+        # token. Every other shape emits the literal 'unparseable'
+        # placeholder so no part of the raw value reaches the boot
+        # traceback. This must be STRUCTURAL, not charset-only: a bare
+        # split(":", 1)[0] on a colon-less REDIS_URL returns the ENTIRE
+        # secret, which can itself be scheme-charset-conforming
+        # ("hunter2golden" fullmatches and echoes verbatim — delta-review
+        # round 2 probe), and a coloned non-URI ("pass:word") leaks its
+        # first segment the same way (review F-002/A-1b).
+        _scheme = ""
+        if "://" in storage_uri:
+            _candidate = storage_uri.split("://", 1)[0]
+            if ":" not in _candidate and _SCHEME_TOKEN_RE.fullmatch(_candidate):
+                _scheme = _candidate
+        if not _scheme:
+            _scheme = "unparseable (no :// scheme delimiter in REDIS_URL)"
+        raise RuntimeError(
+            "Invalid REDIS_URL for rate-limiter storage "
+            f"(scheme={_scheme!r}): {type(exc).__name__}"
+        ) from None
     # The rate-limited route handlers in this codebase do NOT declare a
     # ``response: Response`` parameter, so slowapi's ``_inject_headers``
     # post-response path would raise "parameter `response` must be an instance

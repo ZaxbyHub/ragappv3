@@ -3,6 +3,7 @@ OpenAI-compatible LLM chat client using httpx.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -28,6 +29,20 @@ from app.services.telemetry import start_span
 from app.utils.assistant_sanitizer import sanitize_assistant_content
 
 logger = logging.getLogger(__name__)
+
+
+def _summarize_provider_body(status: int, text: str) -> str:
+    """Bounded summary of a provider error body (issue #982 Family A).
+
+    Provider bodies can echo the request payload (token-overflow errors
+    quote the offending input), so raised messages that consumers may log
+    at default level carry only length + a hex fingerprint; the full body
+    is logged at DEBUG at the construction site (embeddings precedent,
+    PR #981).
+    """
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:10]
+    return f"HTTP error {status} (body_len={len(text)}, body_sha256={digest})"
+
 
 _MAX_THINKING_BUFFER = 1024 * 1024  # 1MB max thinking buffer
 
@@ -781,8 +796,9 @@ class LLMClient:
                 "status": "http_error",
                 "status_code": e.response.status_code,
             }
+            logger.debug("LLM provider error body: %s", e.response.text)
             raise LLMError(
-                f"HTTP error {e.response.status_code}: {e.response.text}"
+                _summarize_provider_body(e.response.status_code, e.response.text)
             ) from e
         except httpx.RequestError as e:
             self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "request_error"}
@@ -1127,8 +1143,12 @@ class LLMClient:
                                 "model": self.model,
                                 "status": "inband_error",
                             }
+                            logger.debug(
+                                "LLM in-band stream error payload: %s", error_msg
+                            )
                             raise LLMError(
-                                f"In-band stream error from provider: {error_msg}"
+                                f"in-band stream error (body_len={len(error_msg)}, "
+                                f"body_sha256={hashlib.sha256(error_msg.encode('utf-8', 'replace')).hexdigest()[:10]})"
                             )
 
                         # Extract content delta from choices
@@ -1415,8 +1435,9 @@ class LLMClient:
                 )
             except Exception:
                 response_text = "<unable to read response>"
+            logger.debug("LLM provider error body: %s", response_text)
             raise LLMError(
-                f"HTTP error {e.response.status_code}: {response_text}"
+                _summarize_provider_body(e.response.status_code, response_text)
             ) from e
         except httpx.RequestError as e:
             if done_seen:

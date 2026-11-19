@@ -480,8 +480,17 @@ class EmailIngestionService:
         subject = self._decode_header_value(msg.get('Subject', ''))
         sender = self._decode_header_value(msg.get('From', ''))
 
-        # Use sanitized values for logging to prevent log injection
-        logger.info(f"Processing email from {self._sanitize_log_value(sender)}: {self._sanitize_log_value(subject)}")
+        # #982: sender/subject are user-derived — only length-bounded forms
+        # at default level (sanitizing strips control chars, it is not
+        # redaction); full values at DEBUG.
+        logger.info(
+            f"Processing email from sender (sender_len={len(sender)}):"
+            f" subject (subject_len={len(subject)})"
+        )
+        logger.debug(
+            f"Processing email from {self._sanitize_log_value(sender)}:"
+            f" {self._sanitize_log_value(subject)}"
+        )
 
         # Extract vault name from subject tag [VaultName] or #vaultname
         vault_name = self._extract_vault_name(subject)
@@ -527,11 +536,25 @@ class EmailIngestionService:
             logger.info(f"Enqueued attachment for processing: {file_path}")
 
         if processed_attachments == 0:
-            logger.info(f"No valid document attachments found in email from {self._sanitize_log_value(sender)}")
+            # issue #982 Family B: the From address is user-derived PII —
+            # bounded form at default level (the sanitizer strips control
+            # chars only, it is not redaction), full value at DEBUG.
+            logger.info(
+                "No valid document attachments found in email "
+                f"(sender_len={len(self._sanitize_log_value(sender))})"
+            )
+            logger.debug(
+                "No valid document attachments in email from %s",
+                self._sanitize_log_value(sender),
+            )
         else:
             logger.info(
-                f"Processed {processed_attachments} attachment(s) from email from "
-                f"{self._sanitize_log_value(sender)}"
+                f"Processed {processed_attachments} attachment(s) from email "
+                f"(sender_len={len(self._sanitize_log_value(sender))})"
+            )
+            logger.debug(
+                "Processed attachments from email from %s",
+                self._sanitize_log_value(sender),
             )
 
     def _sanitize_log_value(self, value: str) -> str:
@@ -737,8 +760,16 @@ class EmailIngestionService:
                 logger.debug(f"Resolved vault '{self._sanitize_log_value(vault_name)}' to id={vault_id}")
                 return vault_id
 
+            # #982: the raised text is formatted by the caller's per-email
+            # ERROR (exc_info) at default level — keep the user-chosen name
+            # out of it; the full name travels at DEBUG only.
+            logger.debug(
+                f"Email references vault '{self._sanitize_log_value(vault_name)}'"
+                f" which does not exist in the database. Rejecting email."
+            )
             raise ValueError(
-                f"Email references vault '{self._sanitize_log_value(vault_name)}' which does not exist in the database. Rejecting email."
+                f"Email references vault which does not exist in the database "
+                f"(name_len={len(vault_name) if vault_name else 0}). Rejecting email."
             )
         finally:
             self.pool.release_connection(conn)

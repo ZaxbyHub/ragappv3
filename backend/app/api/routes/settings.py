@@ -2247,11 +2247,21 @@ async def test_curator_connection(
             resp = await client.post(endpoint, json=payload)
         latency_ms = int((_time.monotonic() - started) * 1000)
         if resp.status_code >= 300:
+            logger.debug(
+                "Curator probe error body (HTTP %d): %s",
+                resp.status_code,
+                resp.text,
+            )
             return {
                 "ok": False,
                 "model": model,
                 "latency_ms": latency_ms,
-                "error": f"Curator returned HTTP {resp.status_code}: {resp.text[:200]}",
+                # issue #982 Family A: bounded summary in the admin-channel
+                # error; full body at DEBUG.
+                "error": (
+                    f"Curator returned HTTP {resp.status_code} "
+                    f"(body_len={len(resp.text)})"
+                ),
             }
         # Parsing the response is best-effort — if the model returns plain
         # text instead of JSON, the test still passes (the curator client

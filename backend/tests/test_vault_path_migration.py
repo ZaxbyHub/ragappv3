@@ -369,8 +369,12 @@ class TestVaultPathMigration:
         assert (data["vaults_dir"] / "Good_Vault" / "file.txt").exists()
         assert not (data["vaults_dir"] / "1" / "file.txt").exists()
         assert (data["vaults_dir"] / "2" / "file2.txt").exists()
-        assert "Failed to migrate vault 'Good Vault' (ID 1)" in caplog.text
-        assert "simulated rename failure" in caplog.text
+        # #982 Family B: the default-level WARNING carries only bounded forms
+        # (vault id, name length, exception type) — the raw vault name and
+        # the raw exception text are DEBUG-only.
+        assert "Failed to migrate vault (ID 1, name_len=10): OSError" in caplog.text
+        assert "Good Vault" not in caplog.text
+        assert "simulated rename failure" not in caplog.text
 
     def test_name_id_collision_skips_foreign_dir(self, temp_db_and_vaults, caplog):
         """
@@ -416,7 +420,9 @@ class TestVaultPathMigration:
 
         # VERIFY: the guard SKIPPED vault 2's migration with a warning
         # (production behavior, see tests/test_b01_vault_path_collision.py).
+        # #982 Family B: bounded form only at WARNING — the quoted name is
+        # DEBUG-only now.
         assert (
-            "Vault 2 name '1' resolves to another vault's id-keyed"
+            "Vault 2 name resolves to another vault's id-keyed"
             in caplog.text
         )

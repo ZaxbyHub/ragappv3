@@ -736,6 +736,19 @@ class VectorStore:
             self._write_lock.release()
 
     @asynccontextmanager
+    async def write_locked(self):
+        """Public write-lock context (issue #1131 CC-001).
+
+        Thin alias over ``_acquire_write_lock`` for callers that must hold
+        the store's write lock across a SQLite claim — the Lance-first,
+        SQLite-second lock order ``commit_dimension_rebuild`` already
+        establishes. While held, call only ``*_locked`` primitives: the
+        self-locking public methods would wait on the non-reentrant lock.
+        """
+        async with self._acquire_write_lock():
+            yield
+
+    @asynccontextmanager
     async def _acquire_search_semaphore(self):
         """Acquire the search semaphore with a configurable timeout.
 
@@ -2137,6 +2150,99 @@ class VectorStore:
             if target is not None:
                 return await self._delete_by_file_unlocked(file_id, target=target)
             return await self._delete_by_file_unlocked(file_id)
+
+    async def delete_generation_by_file_locked(
+        self,
+        file_id: str,
+        file_hash: str,
+        target: Optional[DimensionRebuildHandle] = None,
+    ) -> int:
+        """Delete exactly one generation of a file's chunks (issue #1131 CC-001).
+
+        Caller MUST already hold ``write_locked()`` — this primitive never
+        acquires the store lock itself (the self-locking ``delete_by_file``
+        inside that context would deadlock on the non-reentrant lock).
+
+        Mode-aware (issue #1131): with ``REUPLOAD_SAFE_ORDER`` chunk ids are
+        ``{file_id}_{hash8}_{scale}_{idx}``, so the delete is scoped to the
+        named generation via the id prefix; without it ids are legacy
+        ``{file_id}_{idx}`` (whole-file delete-then-add semantics) and the
+        file's rows — all orphans once the files row is terminally
+        duplicate-settled — are removed via ``_delete_by_file_unlocked``.
+
+        Args:
+            file_id: Numeric files-row id (validated).
+            file_hash: Full hex sha256 of the generation (validated; the
+                first 8 characters form the id prefix).
+            target: Optional dimension-rebuild handle to delete from the
+                rebuild temp table instead of the live table.
+
+        Returns:
+            Number of generation records deleted.
+        """
+        file_id_str = str(file_id)
+        if not file_id_str.isdigit():
+            raise ValueError(
+                "delete_generation_by_file_locked: file_id must be numeric"
+            )
+        if not file_hash or any(
+            c not in "0123456789abcdefABCDEF" for c in file_hash
+        ):
+            raise ValueError(
+                "delete_generation_by_file_locked: file_hash must be hex"
+            )
+        safe_file_id = _lance_escape(file_id_str)
+        if not settings.reupload_safe_order:
+            # Legacy ids carry no generation prefix; the terminal row's
+            # whole-file rows are the orphans.
+            return await self._delete_by_file_unlocked(
+                file_id_str, target=target
+            )
+        safe_hash = _lance_escape(file_hash[:8])
+        prefix = f"{safe_file_id}_{safe_hash}_"
+        if target is not None:
+            if target.table is None:
+                return 0
+            table = target.table
+        else:
+            if self.db is None:
+                await self.connect()
+            if self.table is None:
+                try:
+                    table_names = await self.db.table_names()
+                except (OSError, RuntimeError, ValueError) as e:
+                    raise VectorStoreConnectionError(
+                        f"Failed to list table names: {e}"
+                    ) from e
+                if "chunks" not in table_names:
+                    return 0
+                try:
+                    self.table = await self.db.open_table("chunks")
+                except (OSError, RuntimeError, ValueError) as e:
+                    raise VectorStoreConnectionError(
+                        f"Failed to open 'chunks' table: {e}"
+                    ) from e
+            if self.table is None:
+                return 0
+            table = self.table
+        # Feedback FB-007: the old count-probe swallow turned a failing probe
+        # into a silent 0-row no-op while the caller reported a successful
+        # unwind. The scoped delete predicate is identical for the probe and
+        # the delete; if the probe fails, still attempt the bounded delete
+        # (a delete of zero rows is harmless). Never skip it on probe error.
+        try:
+            count_before = await table.count_rows(
+                f"file_id = '{safe_file_id}' AND id LIKE '{prefix}%'"
+            )
+        except (OSError, RuntimeError, ValueError):
+            count_before = -1
+        if count_before == 0:
+            return 0
+        await table.delete(f"file_id = '{safe_file_id}' AND id LIKE '{prefix}%'")
+        if target is None:
+            self._index_mutation_generation += 1
+            await self._maybe_rebuild_or_drop_vector_index(max(count_before, 1))
+        return max(count_before, 1)
 
     async def _delete_by_file_unlocked(
         self, file_id: str, target: Optional[DimensionRebuildHandle] = None

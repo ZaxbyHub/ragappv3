@@ -346,16 +346,36 @@ class FileWatcher:
                     if not ok:
                         logger.warning(
                             "Scan rejected file failing structural validation "
-                            "(%s); not enqueued: %s",
+                            "(%s); not enqueued (path_len=%d)",
+                            reason,
+                            len(str(file_path)),
+                        )
+                        logger.debug(
+                            "Scan rejected file failing structural validation"
+                            " (%s); not enqueued: %s",
                             reason,
                             file_path,
                         )
                         continue
                     await self.processor.enqueue(str(file_path), vault_id=vault_id)
                     result.files_enqueued += 1
-                    logger.info(f"Enqueued new file for processing: {file_path}")
+                    logger.info(
+                        f"Enqueued new file for processing"
+                        f" (path_len={len(str(file_path))})"
+                    )
+                    logger.debug(f"Enqueued new file for processing: {file_path}")
             except Exception as e:
-                logger.error(f"Error scanning directory {directory}: {e}")
+                # Feedback FB-011/FB-025 (PO-4): the adjacent K-01 invariant
+                # requires a vault-relative form with no server path at
+                # default level; the full directory stays at DEBUG.
+                logger.error(
+                    "Error scanning directory (dir_len=%d): %s",
+                    len(str(directory)),
+                    type(e).__name__,
+                )
+                logger.debug(
+                    "Error scanning directory %s: %s", directory, e
+                )
                 # K-01: vault-relative redaction — the operator knows which
                 # scan scope failed without the server's absolute filesystem
                 # layout or the raw exception text (logged above).

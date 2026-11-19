@@ -329,7 +329,7 @@ cd backend
 source venv/bin/activate  # or venv\Scripts\activate on Windows
 
 # Start backend server
-python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 9090
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 9090 --no-access-log
 
 # Should see: Application startup complete
 ```
@@ -852,7 +852,7 @@ cd ..
 
 # 6. Start Services
 # Terminal 1: ollama serve
-# Terminal 2: cd backend && source venv/bin/activate && uvicorn app.main:app --host 0.0.0.0 --port 9090
+# Terminal 2: cd backend && source venv/bin/activate && uvicorn app.main:app --host 0.0.0.0 --port 9090 --no-access-log
 # Terminal 3: cd frontend && npm run dev
 
 echo "RAGAPPv3 installation complete"

@@ -380,18 +380,30 @@ fi
 
 Access-log records (`http_request`) carry request_id, method, path,
 status_code, client_ip, duration_ms, and a redacted `query` field
-(free-text search values and credential parameters). The container disables
-uvicorn's duplicate access log (`--no-access-log`), so the middleware record
-is the container's access log for requests that reach the application stack,
-including maintenance-window 503s: the access-logging middleware sits outside
-the maintenance and rate-limit middleware, so a maintenance 503 still gets an
-application access line and an `X-Request-ID` header. Still outside its
-reach: CORS preflight OPTIONS responses (the CORS layer, outermost of the
-always-registered core, answers them itself), invalid-Host 400s (answered by
-the host-header validator, which registers outside CORS when allowed_hosts
-is configured), and unhandled 500s (converted by the server's error
-middleware outside the application stack) produce no application access
-line.
+(free-text search values and credential parameters). Every shipped launch
+path disables uvicorn's duplicate access log (`--no-access-log` — the
+Dockerfile, `start-services.ps1`, and the documented `uvicorn` commands), so
+the middleware record is the access log for requests that reach the
+application stack, including maintenance-window 503s: the access-logging
+middleware sits outside the maintenance and rate-limit middleware, so a
+maintenance 503 still gets an application access line and an `X-Request-ID`
+header. That is equally true for native (non-container) runs, which carry
+the same flag. Still outside the middleware's reach — on every launch path,
+so these requests produce no access line anywhere: CORS preflight OPTIONS
+responses (the CORS layer, outermost of the always-registered core, answers
+them itself), invalid-Host 400s (answered by the host-header validator,
+which registers outside CORS when allowed_hosts is configured), and
+unhandled 500s (converted by the server's error middleware outside the
+application stack).
+
+Operators who want uvicorn's own access lines back (for example to
+correlate raw connection behavior) can re-enable them by launching without
+`--no-access-log` (or with `--access-log`). Be aware that uvicorn-format
+access lines carry the raw request line — including the full query string
+(`GET /api/v1/search?q=...`), i.e. user free-text search values and
+credential parameters — unfiltered by the application's redaction. Treat
+any log produced that way as sensitive: restrict who can read it, and
+rotate or delete it promptly.
 
 ### Viewing Logs
 
@@ -439,6 +451,14 @@ Configure in `.env`:
 ```bash
 LOG_LEVEL=INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
 ```
+
+> **Sensitive logs at DEBUG.** Default-level redaction bounds provider
+> bodies, user filenames/paths, vault names and email senders at INFO and
+> above. Enabling `DEBUG` deliberately restores the full values (including
+> provider response bodies that can echo prompt/document text) for
+> troubleshooting. Treat DEBUG logs as sensitive, restrict access and do not
+> retain them longer than needed — the same caution that applies to
+> re-enabled uvicorn access lines above.
 
 ### Log Rotation
 

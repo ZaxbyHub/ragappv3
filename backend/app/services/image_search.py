@@ -186,14 +186,23 @@ async def prepare_image_for_indexing(
     try:
         embedding = await embed_image_content(result, filename, embedding_service)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Embedding failed for %s: %s", file_path, exc)
+        # #982: the path and the raw exception text (which names the path)
+        # are user-derived — only bounded forms at default level, in both
+        # the WARNING and the returned entry's error field; full detail at
+        # DEBUG.
+        logger.warning(
+            "Embedding failed (path_len=%d, exc=%s)",
+            len(str(file_path)),
+            type(exc).__name__,
+        )
+        logger.debug("Embedding failed for %s: %s", file_path, exc)
         return ImageIndexEntry(
             text_representation=text_representation,
             embedding=[],
             metadata=result.metadata,
             source_file_path=file_path,
             success=False,
-            error=f"Embedding failed: {exc}",
+            error=f"Embedding failed: {type(exc).__name__}",
         )
 
     # Step 5: return successful entry
