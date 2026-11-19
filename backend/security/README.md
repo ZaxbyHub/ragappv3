@@ -28,24 +28,27 @@ python scripts/run_bandit.py --update-baseline
 
 ## What the baseline currently suppresses
 
-Snapshot at the time this gate was introduced (issue #400 / #298):
+Snapshot refreshed against the committed `bandit-baseline.json` (issues
+#400 / #298 introduced the gate; #900/#947 refreshed the counts and added
+`backend/tests/test_readme_bandit_counts.py` to keep them honest — the
+committed baseline JSON is the source of truth, this table must match it):
 
 | Severity | Count |
 |----------|-------|
-| HIGH     | 9     |
-| MEDIUM   | 59    |
-| LOW      | 72    |
-| **Total**| **140** |
+| HIGH     | 6     |
+| MEDIUM   | 63    |
+| LOW      | 59    |
+| **Total**| **128** |
 
-across 35 files under `backend/app`. The dominant finding families are:
+across 30 files under `backend/app`. The dominant finding families are:
 
 | Bandit ID | Meaning | Count |
 |-----------|---------|-------|
-| B608 | Hardcoded SQL expressions (string-built queries) | 59 |
-| B105 | Hardcoded password / secret string | 33 |
-| B110 | `try/except/pass` (errors swallowed) | 33 |
-| B324 | Weak hashlib import/use | 9 |
-| others | misc | 6 |
+| B608 | Hardcoded SQL expressions (string-built queries) | 63 |
+| B105 | Hardcoded password / secret string | 31 |
+| B110 | `try/except/pass` (errors swallowed) | 23 |
+| B324 | Weak hashlib import/use | 6 |
+| others | misc | 5 |
 
 **These are tracked pre-existing debt, not accepted-as-safe findings.** Most B608
 hits are parameterized queries whose dynamic *placeholder string* trips the

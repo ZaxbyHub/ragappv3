@@ -486,10 +486,10 @@ curl -X POST http://localhost:9090/api/documents/reindex \
   -H "Content-Type: application/json" \
   -d '{}'
 
-# 3) Poll the job (same auth headers and cookie) until "status": "completed".
-# The job-status GET is read-only: no CSRF handshake is needed, the admin
-# bearer is sufficient.
-curl -H "Authorization: Bearer <admin token>" -b kv.cookies \
+# 3) Poll the job (the same bearer header) until "status": "completed".
+# The job-status GET is read-only: no CSRF handshake and no cookie are
+# needed, the admin bearer is sufficient.
+curl -H "Authorization: Bearer <admin token>" \
   http://localhost:9090/api/documents/reindex/jobs/<job_id>
 ```
 

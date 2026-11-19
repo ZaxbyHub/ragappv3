@@ -58,55 +58,62 @@ def seeded_env(monkeypatch):
     """
     temp_dir = tempfile.mkdtemp(prefix="issue645_routes_")
     db_path = str(Path(temp_dir) / "app.db")
+    try:
+        from app.models.database import _pool_cache, _pool_cache_lock
 
-    from app.models.database import _pool_cache, _pool_cache_lock
+        with _pool_cache_lock:
+            for _path, pool in list(_pool_cache.items()):
+                pool.close_all()
+            _pool_cache.clear()
 
-    with _pool_cache_lock:
-        for _path, pool in list(_pool_cache.items()):
-            pool.close_all()
-        _pool_cache.clear()
+        run_migrations(db_path)
 
-    run_migrations(db_path)
-
-    monkeypatch.setattr("app.config.settings.data_dir", Path(temp_dir))
-    monkeypatch.setattr(
-        "app.config.settings.jwt_secret_key",
-        "test-secret-key-for-testing-only-min-32-chars!!",
-    )
-    monkeypatch.setattr("app.config.settings.users_enabled", True)
-    # require_scope("admin:config") for the prompts router: a static admin
-    # token mapped to the scope server-side (test_prompt_ab_variants pattern).
-    monkeypatch.setattr("app.config.settings.admin_secret_token", "test-admin-secret")
-    monkeypatch.setattr(
-        "app.config.settings.admin_token_scopes",
-        {"test-admin-secret": ["admin:config"]},
-    )
-
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys = ON")
-    pw = hash_password("testpass")
-    users = [
-        (2, "admin1", "admin"),  # org owner / prompt admin via static token
-        (3, "member1@x.com", "member"),
-        (4, "member2@x.com", "member"),
-    ]
-    for uid, username, role in users:
-        conn.execute(
-            "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
-            "VALUES (?, ?, ?, ?, ?, 1)",
-            (uid, username, pw, username.title(), role),
+        monkeypatch.setattr("app.config.settings.data_dir", Path(temp_dir))
+        monkeypatch.setattr(
+            "app.config.settings.jwt_secret_key",
+            "test-secret-key-for-testing-only-min-32-chars!!",
         )
-    conn.commit()
-    conn.close()
+        monkeypatch.setattr("app.config.settings.users_enabled", True)
+        # require_scope("admin:config") for the prompts router: a static admin
+        # token mapped to the scope server-side (test_prompt_ab_variants pattern).
+        monkeypatch.setattr(
+            "app.config.settings.admin_secret_token", "test-admin-secret"
+        )
+        monkeypatch.setattr(
+            "app.config.settings.admin_token_scopes",
+            {"test-admin-secret": ["admin:config"]},
+        )
 
-    env = {"db_path": db_path, "temp_dir": temp_dir}
-    yield env
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        pw = hash_password("testpass")
+        users = [
+            (2, "admin1", "admin"),  # org owner / prompt admin via static token
+            (3, "member1@x.com", "member"),
+            (4, "member2@x.com", "member"),
+        ]
+        for uid, username, role in users:
+            conn.execute(
+                "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
+                "VALUES (?, ?, ?, ?, ?, 1)",
+                (uid, username, pw, username.title(), role),
+            )
+        conn.commit()
+        conn.close()
 
-    with _pool_cache_lock:
-        if db_path in _pool_cache:
-            _pool_cache[db_path].close_all()
-            del _pool_cache[db_path]
-    shutil.rmtree(temp_dir, ignore_errors=True)
+        env = {"db_path": db_path, "temp_dir": temp_dir}
+        yield env
+    finally:
+        # Issues #946/#900: teardown must be reachable when SETUP fails —
+        # wrap from mkdtemp through yield so a pre-yield raise still drains
+        # this run's pool entry and removes the temp directory.
+        from app.models.database import _pool_cache, _pool_cache_lock
+
+        with _pool_cache_lock:
+            if db_path in _pool_cache:
+                _pool_cache[db_path].close_all()
+                del _pool_cache[db_path]
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @pytest.fixture()

@@ -16,6 +16,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from c04_fixtures import fresh_db
 
 from app.models.database import run_migrations
 from app.services.ab_testing import ABExperiment, ABTestingService
@@ -24,29 +25,6 @@ from app.services.prompt_store import PromptVersionStore
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def fresh_db():
-    """Create a temporary DB with the full schema including A/B tables."""
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    try:
-        run_migrations(path)
-        conn = sqlite3.connect(path)
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.row_factory = sqlite3.Row
-        # Seed test org so FK constraints on prompt_ab_experiments pass.
-        conn.execute(
-            "INSERT INTO organizations (id, name, slug, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (10, "Test Org", "test-org", "2024-01-01T00:00:00Z"),
-        )
-        conn.commit()
-        yield conn
-    finally:
-        conn.close()
-        os.unlink(path)
 
 
 @pytest.fixture

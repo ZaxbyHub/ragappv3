@@ -29,6 +29,7 @@ def fresh_db():
     fd, path = tempfile.mkstemp(suffix=".db")
     # Close the file descriptor immediately; sqlite3.connect reopens it.
     os.close(fd)
+    conn = None
     try:
         run_migrations(path)
         conn = sqlite3.connect(path)
@@ -43,7 +44,10 @@ def fresh_db():
         conn.commit()
         yield conn
     finally:
-        conn.close()
+        # conn is bound only after run_migrations succeeds; guard so a schema
+        # failure surfaces its own traceback instead of an UnboundLocalError.
+        if conn is not None:
+            conn.close()
         os.unlink(path)
 
 
@@ -707,6 +711,7 @@ class TestMultiOrgPerQueryResolution:
         """DB with two orgs, each with its own override, plus vaults for per-vault resolution."""
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
+        conn = None
         try:
             run_migrations(path)
             conn = sqlite3.connect(path)
@@ -768,7 +773,10 @@ class TestMultiOrgPerQueryResolution:
             conn.commit()
             yield path
         finally:
-            conn.close()
+            # conn is bound only after run_migrations succeeds; guard so a schema
+            # failure surfaces its own traceback instead of an UnboundLocalError.
+            if conn is not None:
+                conn.close()
             os.unlink(path)
 
     def test_different_orgs_get_different_prompts(self, multi_org_db):

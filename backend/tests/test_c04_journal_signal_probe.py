@@ -1,8 +1,8 @@
-"""Probe (not a committed test — orchestrator verification script shape):
-journal rows for the redaction migration are visible to the #699 startup
-signal, and clean boots are journal-silent. Lives in tests/ only so the
-conftest env bootstrap applies; excluded from collection scope checks?
-No — it IS collected; keep it a real test so the probe stays honest."""
+"""Committed regression test (it IS collected — issue #900 item 3): journal
+rows for the redaction migration are visible to the #699 startup signal, and
+clean boots are journal-silent. The module began life as an orchestrator
+verification script and was promoted to a real test so the probe stays
+honest; the conftest env bootstrap applies to it like any other test."""
 import os
 import sqlite3
 
