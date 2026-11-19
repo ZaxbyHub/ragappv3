@@ -146,12 +146,45 @@ class LLMHealthChecker:
         except Exception:
             return False
 
+    async def check_editorial(self) -> Dict[str, Any]:
+        """Cheap reachability probe for the editorial desk endpoint.
+
+        Deliberately NOT a completion: the editorial model idles between
+        compiles and its host unloads it, and a first-token warm-up can take
+        many minutes when the model was unloaded. A health poll
+        must answer "is the server up", which GET /v1/models does even while
+        a model is loading. Warming is the compile preflight's job
+        (draft_room._preflight_providers), not the health check's.
+        """
+        if not settings.editorial_chat_url:
+            return {
+                "ok": False,
+                "status": "not_configured",
+                "error": "editorial endpoint not configured",
+            }
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout, follow_redirects=False
+            ) as probe:
+                resp = await probe.get(
+                    settings.editorial_chat_url.rstrip("/") + "/v1/models"
+                )
+            if resp.status_code < 500:
+                return {"ok": True, "error": None}
+            return {
+                "ok": False,
+                "error": f"editorial endpoint returned HTTP {resp.status_code}",
+            }
+        except Exception as e:
+            return {"ok": False, "error": f"editorial endpoint unreachable: {e}"}
+
     async def check_chat_modes(self) -> Dict[str, bool]:
         """Probe both the Thinking and Instant endpoints independently.
 
         Returns:
-            ``{"thinking": bool, "instant": bool}``. A missing client is
-            reported as ``False`` so the frontend fails closed.
+            ``{"thinking": bool, "instant": bool, "editorial": bool}``. A
+            missing client is reported as ``False`` so the frontend fails
+            closed; ``editorial`` is the Draft Room editorial lane.
         """
         thinking_ok = (
             await self._probe_client(self._thinking_client)
@@ -163,7 +196,14 @@ class LLMHealthChecker:
             if self._instant_client is not None
             else False
         )
-        return {"thinking": thinking_ok, "instant": instant_ok}
+        editorial_ok = (
+            (await self.check_editorial()).get("ok", False)
+        )
+        return {
+            "thinking": thinking_ok,
+            "instant": instant_ok,
+            "editorial": editorial_ok,
+        }
 
     async def check_all(self) -> Dict[str, Any]:
         """

@@ -112,7 +112,7 @@ class TestPasswordEpochInvalidatesTokens(unittest.TestCase):
         # The login/register handlers issue a fresh CSRF token in their body via
         # get_csrf_manager() + issue_csrf_token(), so the app needs a csrf_manager
         # on state (Redis-unavailable -> in-memory fallback).
-        self.csrf_manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        self.csrf_manager = CSRFManager(redis_url="", ttl=900)
         main_app.state.csrf_manager = self.csrf_manager
         main_app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
 

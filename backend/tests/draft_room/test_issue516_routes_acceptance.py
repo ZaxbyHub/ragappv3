@@ -215,7 +215,7 @@ class Issue516AcceptanceBase(unittest.TestCase):
         app.dependency_overrides[csrf_protect] = lambda: "test-csrf"
         app.state.db_pool = self._connection_pool
         app.state.csrf_manager = CSRFManager(
-            redis_url="redis://localhost:6379/0", ttl=900
+            redis_url="", ttl=900
         )
 
         self._mock_vector_store = MagicMock()

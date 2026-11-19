@@ -182,7 +182,7 @@ class DraftSecurityTestBase(unittest.TestCase):
         # by TestCSRFEnforcement, which removes the csrf_protect override to
         # exercise the real dependency.
         app.state.csrf_manager = CSRFManager(
-            redis_url="redis://localhost:6379/0", ttl=900
+            redis_url="", ttl=900
         )
 
         self._mock_vector_store = MagicMock()

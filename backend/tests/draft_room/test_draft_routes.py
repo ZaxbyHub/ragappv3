@@ -206,7 +206,7 @@ class DraftRoomTestBase(unittest.TestCase):
         # by tests that remove the csrf_protect override to exercise the real
         # dependency.
         app.state.csrf_manager = CSRFManager(
-            redis_url="redis://localhost:6379/0", ttl=900
+            redis_url="", ttl=900
         )
         # get_capabilities derives compile_available from the live worker
         # (#789); these tests never run lifespan, so stand in for a started
@@ -928,7 +928,12 @@ class TestSSE(DraftRoomTestBase):
             draft_room_events_stream(request=fake_request, draft_id=draft_id)
         )
         self.assertIsInstance(response, StreamingResponse)
-        self.assertEqual(response.headers["Cache-Control"], "no-cache")
+        # T5a: no-transform asks any intermediary not to buffer or
+        # re-encode the stream (the portal buffers SSE without it).
+        self.assertEqual(
+            response.headers["Cache-Control"], "no-cache, no-transform"
+        )
+        self.assertEqual(response.headers["X-Accel-Buffering"], "no")
 
         async def _first_chunk():
             async for chunk in response.body_iterator:

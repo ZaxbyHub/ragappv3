@@ -9,9 +9,12 @@ Test modules may declare an explicit CSRF test policy with a module-level
 ``_module_manages_csrf`` below.
 """
 
+import ipaddress
 import os
 import re
+import socket
 import sys
+import urllib.parse
 
 import pytest
 
@@ -365,6 +368,56 @@ def _cache_bcrypt_hash_for_test_passwords():
         _auth_module.pwd_context.verify = original_pwd_verify
     except Exception:
         pass
+_orig_from_url = None
+_orig_async_from_url = None
+
+
+def _reaches_a_real_redis(url) -> bool:
+    """True when the URL could reach a live Redis on this host.
+
+    Blocks loopback, the wildcard, the compose service names, and any
+    hostname resolving to a loopback address. An unresolvable host cannot
+    reach anything and is allowed, so tests can exercise a code path that
+    constructs a client without opening a socket.
+    """
+    try:
+        host = urllib.parse.urlsplit(str(url)).hostname or ""
+    except Exception:
+        return True
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "redis",
+                "knowledgevault_redis"):
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False  # unresolvable: cannot reach anything
+    return any(ipaddress.ip_address(i[4][0]).is_loopback for i in infos)
+
+
+def _refuse_real_redis(url) -> None:
+    if _reaches_a_real_redis(url) and not os.environ.get("TEST_ALLOW_REAL_REDIS"):
+        raise RuntimeError(
+            f"test attempted to connect to a real Redis at {url!r}; "
+            "use redis_url='' (no-Redis mode) or an unresolvable host"
+        )
+
+
+def _guarded_from_url(url, *args, **kwargs):
+    """redis.from_url wrapper that refuses production-shaped URLs."""
+    _refuse_real_redis(url)
+    if _orig_from_url is None:
+        raise RuntimeError("redis.from_url guard installed without an original")
+    return _orig_from_url(url, *args, **kwargs)
+
+
+def _guarded_async_from_url(url, *args, **kwargs):
+    """redis.asyncio.from_url wrapper that refuses production-shaped URLs."""
+    _refuse_real_redis(url)
+    if _orig_async_from_url is None:
+        raise RuntimeError("redis.asyncio.from_url guard installed without an original")
+    return _orig_async_from_url(url, *args, **kwargs)
+
+
 def pytest_configure(config):
     """Called before test collection.
 
@@ -428,6 +481,20 @@ def pytest_configure(config):
     # would make each autouse limiter.reset() block ~4s on a Redis connection
     # timeout. This matches CI, which sets REDIS_URL="" with no Redis service.
     os.environ["REDIS_URL"] = ""
+
+    # A test must never connect to a Redis instance it did not start.
+    # Guard redis.from_url for the whole session; opt out explicitly
+    # with TEST_ALLOW_REAL_REDIS=1 only when a fixture has started a
+    # throwaway instance.
+    import redis as _redis
+    import redis.asyncio as _redis_asyncio
+
+    global _orig_from_url, _orig_async_from_url
+    _orig_from_url = _redis.from_url
+    _redis.from_url = _guarded_from_url
+    _orig_async_from_url = _redis_asyncio.from_url
+    _redis_asyncio.from_url = _guarded_async_from_url
+
 
     app_keys = [
         k for k in list(sys.modules.keys()) if k == "app" or k.startswith("app.")

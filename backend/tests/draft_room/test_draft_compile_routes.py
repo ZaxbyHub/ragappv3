@@ -60,7 +60,9 @@ except ImportError:
 
 from fastapi.testclient import TestClient
 
+import app.api.routes.draft_room as draft_room
 from app.api.deps import get_db, get_vector_store
+from app.api.routes.draft_room import _preflight_providers as _dr_preflight
 from app.api.routes.draft_room import _sync_compile_fingerprint
 from app.config import settings
 from app.main import app
@@ -173,6 +175,17 @@ class CompileRouteTestBase(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
         self.client.headers["user-agent"] = ""
+        # Section 2 (: the compile/retry preflight probes
+        # real providers and would 503 every valid request in a test with no
+        # provider. Stub it, recording the tier it was called with.
+        self._preflight_calls = []
+
+        async def _fake_preflight(*, sensitive: bool):
+            self._preflight_calls.append(bool(sensitive))
+
+        self._orig_preflight = draft_room._preflight_providers
+        draft_room._preflight_providers = _fake_preflight
+
         self._temp_dir = tempfile.mkdtemp()
 
         self._original_jwt_secret = settings.jwt_secret_key
@@ -225,7 +238,7 @@ class CompileRouteTestBase(unittest.TestCase):
         app.dependency_overrides[csrf_protect] = lambda: "test-csrf"
         app.state.db_pool = self._connection_pool
         app.state.csrf_manager = CSRFManager(
-            redis_url="redis://localhost:6379/0", ttl=900
+            redis_url="", ttl=900
         )
 
         self._mock_vector_store = MagicMock()
@@ -294,6 +307,8 @@ class CompileRouteTestBase(unittest.TestCase):
             del app.state.background_processor
 
     def tearDown(self):
+        draft_room._preflight_providers = self._orig_preflight
+
         from app.models.database import _pool_cache, _pool_cache_lock
 
         with _pool_cache_lock:
@@ -647,6 +662,176 @@ class TestCompileIdempotency(CompileRouteTestBase):
         )
         self.assertEqual(resp.status_code, 422, resp.text)
         self.assertEqual(resp.json()["code"], "invalid_idempotency_key")
+
+
+class TestPreflightOrderingAndGuards(CompileRouteTestBase):
+    """Provider preflight must not gate an idempotent replay (it returns the
+    stored job), must still gate fresh enqueues before any row exists, and the
+    fail-closed enqueue guards must be wired into BOTH compile and retry."""
+
+    def _fail_preflight(self):
+        async def _unreachable(*, sensitive: bool):
+            raise draft_room.DraftRoomHTTPError(
+                503,
+                "the model provider for this draft is not reachable",
+                "provider_unreachable",
+            )
+
+        draft_room._preflight_providers = _unreachable
+
+    def _pass_preflight(self):
+        async def _ok(*, sensitive: bool):
+            self._preflight_calls.append(bool(sensitive))
+
+        draft_room._preflight_providers = _ok
+
+    def _job_count(self, draft_id):
+        conn = self._connection_pool.get_connection()
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM draft_jobs WHERE draft_id = ? "
+                "AND job_type = 'compile'",
+                (draft_id,),
+            ).fetchone()[0]
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def _seed_failed_parent(self, draft_id):
+        job_id = self._seed_completed_job(draft_id)
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.execute(
+                "UPDATE draft_jobs SET status = 'failed', "
+                "error_code = 'model_unavailable' WHERE id = ?",
+                (job_id,),
+            )
+            conn.execute("UPDATE drafts SET status = 'failed' WHERE id = ?", (draft_id,))
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+        return job_id
+
+    def _retry(self, draft_id, job_id, *, idempotency_key=None):
+        headers = dict(self._owner_headers())
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
+        return self.client.post(
+            f"/api/draft-room/drafts/{draft_id}/jobs/{job_id}/retry",
+            headers=headers,
+        )
+
+    # -- compile --
+
+    def test_compile_replay_returns_stored_job_when_preflight_would_fail(self):
+        draft_id = self._draft_with_ready_input()
+        first = self._compile(draft_id, idempotency_key="replay-1")
+        self.assertEqual(first.status_code, 202, first.text)
+        self._fail_preflight()
+        second = self._compile(draft_id, idempotency_key="replay-1")
+        self.assertEqual(second.status_code, 202, second.text)
+        self.assertEqual(second.json()["id"], first.json()["id"])
+        self.assertEqual(self._job_count(draft_id), 1)
+
+    def test_compile_fresh_request_with_failing_preflight_is_503_and_no_job(self):
+        draft_id = self._draft_with_ready_input()
+        self._fail_preflight()
+        resp = self._compile(draft_id, idempotency_key="fresh-1")
+        self.assertEqual(resp.status_code, 503, resp.text)
+        self.assertEqual(resp.json()["code"], "provider_unreachable")
+        self.assertEqual(self._job_count(draft_id), 0)
+
+    def test_compile_changed_fingerprint_key_reuse_still_conflicts(self):
+        draft_id = self._draft_with_ready_input()
+        first = self._compile(draft_id, idempotency_key="dup", base_revision_id=None)
+        self.assertEqual(first.status_code, 202, first.text)
+        self._fail_preflight()
+        # Not a genuine replay, so it is still preflighted (503 here) ...
+        blocked = self._compile(draft_id, idempotency_key="dup", base_revision_id=999999)
+        self.assertEqual(blocked.status_code, 503, blocked.text)
+        # ... and with a passing preflight it is the original 409 conflict.
+        self._pass_preflight()
+        conflict = self._compile(draft_id, idempotency_key="dup", base_revision_id=999999)
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+        self.assertEqual(conflict.json()["code"], "idempotency_key_conflict")
+        self.assertEqual(self._job_count(draft_id), 1)
+
+    # -- retry --
+
+    def test_retry_replay_returns_stored_job_when_preflight_would_fail(self):
+        draft_id = self._draft_with_ready_input()
+        parent_id = self._seed_failed_parent(draft_id)
+        first = self._retry(draft_id, parent_id, idempotency_key="retry-1")
+        self.assertEqual(first.status_code, 202, first.text)
+        self._fail_preflight()
+        second = self._retry(draft_id, parent_id, idempotency_key="retry-1")
+        self.assertEqual(second.status_code, 202, second.text)
+        self.assertEqual(second.json()["id"], first.json()["id"])
+        self.assertEqual(self._job_count(draft_id), 2)  # parent + one retry
+
+    def test_retry_fresh_request_with_failing_preflight_is_503_and_no_job(self):
+        draft_id = self._draft_with_ready_input()
+        parent_id = self._seed_failed_parent(draft_id)
+        self._fail_preflight()
+        resp = self._retry(draft_id, parent_id, idempotency_key="retry-fresh")
+        self.assertEqual(resp.status_code, 503, resp.text)
+        self.assertEqual(resp.json()["code"], "provider_unreachable")
+        self.assertEqual(self._job_count(draft_id), 1)  # only the seeded parent
+
+    # -- rewrite-requires-manuscript call sites --
+
+    def test_compile_rewrite_without_manuscript_is_422_and_creates_no_job(self):
+        draft_id = self._create_draft().json()["id"]
+        resp = self._compile(draft_id)
+        self.assertEqual(resp.status_code, 422, resp.text)
+        self.assertEqual(resp.json()["code"], "rewrite_requires_manuscript")
+        self.assertEqual(self._job_count(draft_id), 0)
+
+    def test_retry_rewrite_without_manuscript_is_422_and_creates_no_job(self):
+        draft_id = self._create_draft().json()["id"]
+        parent_id = self._seed_failed_parent(draft_id)
+        resp = self._retry(draft_id, parent_id)
+        self.assertEqual(resp.status_code, 422, resp.text)
+        self.assertEqual(resp.json()["code"], "rewrite_requires_manuscript")
+        self.assertEqual(self._job_count(draft_id), 1)  # only the seeded parent
+
+    # -- preflight call-site tier --
+
+    def test_compile_and_retry_preflight_with_standard_tier(self):
+        draft_id = self._draft_with_ready_input()
+        self.assertEqual(self._compile(draft_id).status_code, 202)
+        self.assertEqual(self._preflight_calls, [False])
+        retry_draft = self._draft_with_ready_input(title="Retry Draft")
+        parent_id = self._seed_failed_parent(retry_draft)
+        self._preflight_calls.clear()
+        self.assertEqual(self._retry(retry_draft, parent_id).status_code, 202)
+        self.assertEqual(self._preflight_calls, [False])
+
+    def _sensitive_draft_with_ready_input(self, title):
+        resp = self.client.post(
+            "/api/draft-room/drafts",
+            json={
+                "vault_id": self.READ_VAULT_ID,
+                "title": title,
+                "mode": "rewrite",
+                "tier": "sensitive",
+                "brief": _default_brief(),
+            },
+            headers=self._owner_headers(),
+        )
+        self.assertEqual(resp.status_code, 201, resp.text)
+        draft_id = resp.json()["id"]
+        self._mark_input_ready(self._upload_input(draft_id).json()["input"]["id"])
+        return draft_id
+
+    def test_compile_and_retry_preflight_with_sensitive_tier(self):
+        draft_id = self._sensitive_draft_with_ready_input("Sensitive compile")
+        self.assertEqual(self._compile(draft_id).status_code, 202)
+        self.assertEqual(self._preflight_calls, [True])
+        retry_draft = self._sensitive_draft_with_ready_input("Sensitive retry")
+        parent_id = self._seed_failed_parent(retry_draft)
+        self._preflight_calls.clear()
+        self.assertEqual(self._retry(retry_draft, parent_id).status_code, 202)
+        self.assertEqual(self._preflight_calls, [True])
 
 
 # ── start-stage acceptance ───────────────────────────────────────────────────
