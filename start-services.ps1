@@ -75,7 +75,22 @@ if (-not $SkipEmbedding) {
     # container exists in EXITED state — a running-only probe misses it and
     # `docker run --name` then fails on the name conflict. Probe ALL
     # containers by exact name and carry the state.
-    $embeddingState = docker ps -a --filter "name=^$EmbeddingContainerName$" --format "{{.State}}" 2>&1 | Select-Object -First 1
+    # Probe failure must not be mistaken for an absent container: a failed
+    # docker query would otherwise fall through to `docker run --name` (review
+    # ST-001/CS-002). Escape the configured name so a `.` in a valid Docker
+    # name is matched literally rather than as a regex wildcard. Check for
+    # the executable first: a missing docker must not leave $LASTEXITCODE
+    # stale and print an empty "(exit )" message (Stage B test probe).
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        Write-Output "ERROR: docker executable not found; cannot probe or start $EmbeddingContainerName."
+        exit 1
+    }
+    $embeddingState = docker ps -a --filter "name=^$([regex]::Escape($EmbeddingContainerName))$" --format "{{.State}}"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Output "ERROR: could not query docker for $EmbeddingContainerName (exit $LASTEXITCODE); is the docker daemon available?"
+        exit $LASTEXITCODE
+    }
+    $embeddingState = $embeddingState | Select-Object -First 1
     if ($embeddingState -eq "running") {
         Write-Output "$EmbeddingContainerName container already running"
     } elseif ($embeddingState -eq "paused") {

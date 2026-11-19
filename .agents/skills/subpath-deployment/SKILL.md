@@ -106,7 +106,7 @@ deployments silently break — the exact bug this system was built to fix.
 | `frontend/src/lib/api.ts` | `API_BASE_URL = VITE_API_URL \|\| appPath("/api")` |
 | `frontend/vite.paths.ts` | `normalizeViteBase()`, `createApiProxy()`, `rewriteApiProxyPath()` |
 | `frontend/vite.config.ts` | Sets Vite `base`, dev proxy |
-| `scripts/validate_vite_env.mjs` | Build-time validation of `VITE_APP_BASENAME` |
+| `Dockerfile` (root) + `frontend/Dockerfile` | Inlined build-time validation of `VITE_APP_BASENAME`; no standalone validator script (removed in #754) |
 | `scripts/check_config_contract.py` | CI contract check across all config surfaces |
 | `frontend/.env.example` | Documents build-time env vars |
 | `docs/admin-guide.md` | Full operator reference, prefix-change walkthrough, NGINX/Caddy examples |
