@@ -323,6 +323,22 @@ def test_ac2_query_param_credentials_redacted():
     assert redact_url("redis://host/#section?password=visible") == (
         "redis://host/#section?password=visible"
     ), "AC2: a ? inside the fragment is not a query parameter"
+    # Final-critic round 1: redis-py 8.x routes ssl_password to SSLConnection
+    # as the TLS private-key passphrase (parse_url probe) — a live credential
+    # that must be redacted; any other ...password key is masked fail-closed
+    # by the suffix rule.
+    assert redact_url("redis://host/0?ssl_password=KEYPW1") == (
+        "redis://host/0?ssl_password=***"
+    ), "AC2: ssl_password is a live redis-py TLS passphrase credential"
+    assert redact_url("redis://host/0?rediss_password=KEYPW1") == (
+        "redis://host/0?rediss_password=***"
+    ), "AC2: any ...password-suffixed key is masked fail-closed"
+    # Keys that merely CONTAIN "password" but do not end with it stay
+    # untouched: password_file is a PATH redis-py does not accept as a query
+    # key at all, and masking paths would corrupt a credential-free value.
+    assert redact_url("redis://host/0?password_file=%2Fetc%2Fpw") == (
+        "redis://host/0?password_file=%2Fetc%2Fpw"
+    ), "AC2: password_file is a path, not a password value — preserved"
     # A query on a multi-host sentinel URL (fallback path) is redacted too.
     assert redact_url(
         f"redis+sentinel://:pw@h1:26379,h2:26379/mymaster/0"

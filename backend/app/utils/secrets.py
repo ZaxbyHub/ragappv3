@@ -51,7 +51,17 @@ _AMBIGUOUS_SLASH_CREDENTIAL_RE = re.compile(
 # percent-DECODED before matching), so classification decodes the raw key
 # name while the redaction itself is a raw-span value replacement that
 # preserves key spelling, unrelated parameters, order, and duplicates.
-_CREDENTIAL_QUERY_KEYS = frozenset({"password", "username"})
+# ``password``/``username`` are the AUTH pair; ``ssl_password`` is the TLS
+# private-key passphrase redis-py 8.x routes to SSLConnection (verified by
+# parse_url probe), and any other ``...password`` key is masked fail-closed
+# by the suffix rule.
+_CREDENTIAL_QUERY_KEYS = frozenset({"username"})
+
+
+def _is_credential_query_key(decoded_key: str) -> bool:
+    return decoded_key in _CREDENTIAL_QUERY_KEYS or decoded_key.endswith(
+        "password"
+    )
 _QUERY_SPAN_RE = re.compile(r"([^=&#]+)=([^&#]*)")
 
 # A netloc of exactly ``:<token>`` with no ``@``: when the token is not all
@@ -86,7 +96,7 @@ def _redact_query_credentials(url: str) -> str:
     def _redact_value(match: re.Match[str]) -> str:
         raw_key = match.group(1)
         decoded_key = unquote(raw_key).strip().lower()
-        if decoded_key in _CREDENTIAL_QUERY_KEYS:
+        if _is_credential_query_key(decoded_key):
             return f"{raw_key}=***"
         return match.group(0)
 
