@@ -32,6 +32,7 @@ import pytest
 
 from app.config import settings
 from app.services.draft_pipeline import (
+    CompletionResult,
     PipelineDeps,
     _accepts_response_format,
     _default_complete,
@@ -152,6 +153,9 @@ async def test_stage_calls_stream_and_accumulate_all_modes(stub_server):
         result = await _default_complete(
             "probe prompt", logical_mode=mode, temperature=0.2, sensitive=False
         )
+        assert isinstance(result, CompletionResult), (
+            "_default_complete must return CompletionResult (issue #1149 telemetry contract)")
+        result = result.text
         assert result == EXPECTED_CONTENT, mode
     assert received_payloads, "stub saw no requests"
     assert all(p.get("stream") is True for p in received_payloads)
@@ -161,6 +165,9 @@ async def test_reasoning_deltas_never_enter_stage_result(stub_server):
     result = await _default_complete(
         "probe prompt", logical_mode="thinking", temperature=0.2, sensitive=False
     )
+    assert isinstance(result, CompletionResult), (
+        "_default_complete must return CompletionResult (issue #1149 telemetry contract)")
+    result = result.text
     assert result == EXPECTED_CONTENT
     assert "think" not in result
 
@@ -173,6 +180,9 @@ async def test_response_format_forwarded_on_streaming_request(stub_server):
         sensitive=False,
         response_format=DRAFT_SCHEMA,
     )
+    assert isinstance(result, CompletionResult), (
+        "_default_complete must return CompletionResult (issue #1149 telemetry contract)")
+    result = result.text
     assert result == SCHEMA_JSON
     assert any(p.get("response_format") == DRAFT_SCHEMA for p in received_payloads)
 
@@ -193,6 +203,9 @@ async def test_stream_outliving_client_read_timeout_completes(stub_server, monke
         result = await _default_complete(
             "probe prompt", logical_mode=mode, temperature=0.2, sensitive=False
         )
+        assert isinstance(result, CompletionResult), (
+            "_default_complete must return CompletionResult (issue #1149 telemetry contract)")
+        result = result.text
         elapsed = time.perf_counter() - started
         assert result == EXPECTED_CONTENT, mode
         assert elapsed > budget, (mode, elapsed, budget)
@@ -265,6 +278,9 @@ async def test_non_sse_provider_fallback_keeps_schema_contract(monkeypatch):
             sensitive=False,
             response_format=DRAFT_SCHEMA,
         )
+        assert isinstance(result, CompletionResult), (
+            "_default_complete must return CompletionResult (issue #1149 telemetry contract)")
+        result = result.text
         assert result == SCHEMA_JSON
         assert any(p.get("response_format") == DRAFT_SCHEMA for p in received_payloads)
     finally:
@@ -291,6 +307,9 @@ async def test_non_sse_provider_fallback_without_response_format(monkeypatch):
             temperature=0.2,
             sensitive=False,
         )
+        assert isinstance(result, CompletionResult), (
+            "_default_complete must return CompletionResult (issue #1149 telemetry contract)")
+        result = result.text
         assert result == EXPECTED_CONTENT
         assert received_payloads, "stub saw no requests"
         assert all(not p.get("response_format") for p in received_payloads)

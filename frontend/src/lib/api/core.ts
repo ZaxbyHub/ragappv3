@@ -1004,10 +1004,12 @@ export interface Source {
   // additionally carry its OWN score_type when its score diverges from the
   // global typing — currently only "fts", the per-source kind for a real
   // LanceDB BM25 `_score` on the no-`_distance` path (higher-is-better,
-  // uncalibrated: relevance labels are suppressed for it). The memory channel
+  // uncalibrated: relevance labels are suppressed for it), and "positional",
+  // the per-source kind for retrieval-window neighbours included by
+  // position (labels suppressed, issue #1150). The memory channel
   // carries its own score_type vocabulary (rrf/fts/dense) under
   // UsedMemory/WikiReference.
-  score_type?: "distance" | "rerank" | "fts";
+  score_type?: "distance" | "rerank" | "fts" | "positional";
   /**
    * Multi-modal artifact presentation (issue #462). These are first-class safe
    * fields: they NEVER carry paths, bytes, or base64 — artifact bytes are fetched

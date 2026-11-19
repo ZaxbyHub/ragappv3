@@ -142,9 +142,11 @@ class FakeModel:
         self._responses = list(responses)
         self.calls = 0
         self.prompts: list[str] = []
+        self.kinds: list[Optional[str]] = []
 
-    async def __call__(self, prompt, *, logical_mode, temperature):
+    async def __call__(self, prompt, *, logical_mode, temperature, **kwargs):
         self.prompts.append(prompt)
+        self.kinds.append(kwargs.get("attempt_kind"))
         index = min(self.calls, len(self._responses) - 1)
         self.calls += 1
         item = self._responses[index]
@@ -455,6 +457,12 @@ class TestStructuredOutputRepair(DraftResearchAsyncTestCase):
         )
 
         self.assertEqual(model.calls, 2)
+        self.assertEqual(
+            model.kinds,
+            [None, "repair"],
+            "the repair call must carry attempt_kind='repair' (issue #1149 "
+            "feedback: the repair attempt is ledgered with its own kind)",
+        )
         # S1 retrieved + the minted [D#] input snapshot (issue #517 DRAFT-016).
         self.assertEqual(len(outcome.evidence), 2)
 
@@ -472,6 +480,11 @@ class TestStructuredOutputRepair(DraftResearchAsyncTestCase):
 
         self.assertEqual(caught.exception.code, "invalid_stage_output")
         self.assertEqual(model.calls, 2, "exactly one original call plus one repair")
+        self.assertEqual(
+            model.kinds,
+            [None, "repair"],
+            "the failing repair call must also carry attempt_kind='repair'",
+        )
 
 
 # ── 6. Adversarial: fabricated evidence in a well-formed response is discarded ─

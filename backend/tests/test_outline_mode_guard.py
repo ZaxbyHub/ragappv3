@@ -92,6 +92,9 @@ def _bare_outline_run(*, outline: OutlineArtifact, reuse: bool):
     )
     run._source_snapshot_sha256 = "s"
     run._outline = None
+    run._open_rows = {}
+    run._stage_calls = []
+    run._current_stage = "outline"
     persisted = []
 
     async def _persist(*args, **kwargs):

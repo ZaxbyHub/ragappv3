@@ -999,8 +999,15 @@ Non-negotiable invariant:
 The Fact desk does not silently edit prose. A required correction is returned to Copy, then Standards, then Fact. The bounded loop is:
 
 ```text
-Fact finding -> targeted correction -> Copy -> Standards -> Fact
+Fact finding or open Lint blocker -> targeted correction -> Copy -> Standards -> Fact
 ```
+
+The loop triggers on any correctable claim verdict (`contradicted`, `stale` or
+`unsupported`) AND on any open blocker-severity Lint finding on the current
+candidate (issue #1150): a wrong-length, self-duplicating, mis-structured or
+process-commentary-carrying revision gets the same bounded repair pass an
+adverse claim verdict does. The desks see what triggered the pass (claim
+findings and Lint rule ids) in their correction feedback.
 
 The full correction loop may run at most `draft_qa_retry_limit` times. Residual issues become visible findings. An unresolved non-waivable blocker prevents Ready; it does not prevent storing the output as `needs_review`.
 
@@ -1115,9 +1122,10 @@ Before HTTP traffic and job processors start, run a bounded `reconcile_ready_evi
 `draft_quality.py` is dependency-light pure Python. It exposes a single function accepting Markdown plus exclusions and returning typed findings. Rules are versioned.
 
 1. `blocked_boilerplate`: exact, curated, multi-word constructions with sufficiently low ambiguity to block automatic completion. Initial candidates include `in today's rapidly evolving landscape`, `it is important to note that`, `in the ever-evolving world of`, and `this comprehensive guide will`. The final default list is approved against the Phase 0 corpus before release.
-2. `review_vocabulary`: context-sensitive words or short phrases such as `delve`, `tapestry`, `leverage`, or `game-changer`. Advisory only.
-3. `structure_signal`: repeated openers, repeated paragraph templates, triad overuse, uniform sentence lengths, and transition density. Advisory only.
-4. `readability_signal`: passive-voice heuristic, Flesch score, long sentences, and sentence/paragraph distribution. Advisory only.
+2. Deterministic quality gates (issue #1150), versioned together by `draft_quality_rule_version` independently of the boilerplate list: total length outside +/-25% of the brief's `target_words` (a `length.total_words_near` advisory fires outside +/-15% only when the blocker did not); a section above `max(1.5 x budget, budget + draft_quality_section_floor_words)`; duplicate paragraphs by normalized text and by word-set similarity (>=12-word paragraphs with Jaccard >=0.9); any sentence of >=8 words appearing in more than one section; more than one H1 beyond the section structure, or a heading repeating the draft's title; pipeline-instruction leakage (`process_commentary.*` patterns, e.g. "verification was not performed"); and a trailing `Source:`-attribution final line. Blocker severity; `must_preserve` spans (all occurrences) are exempt from the duplicate rules.
+3. `review_vocabulary`: context-sensitive words or short phrases such as `delve`, `tapestry`, `leverage`, or `game-changer`. Advisory only.
+4. `structure_signal`: repeated openers, repeated paragraph templates, triad overuse, uniform sentence lengths, and transition density. Advisory only.
+5. `readability_signal`: passive-voice heuristic, Flesch score, long sentences, and sentence/paragraph distribution. Advisory only.
 
 Do not block on a word merely because models often use it. Do not optimize to a detector score.
 
@@ -1139,9 +1147,9 @@ Tests cover adjacent/nested Markdown, escaped fences, apostrophes, quotation mar
 - An advisory finding never blocks compilation or Ready.
 - An open `blocked_boilerplate` finding triggers at most two targeted rewrites.
 - If still present, compilation completes to `needs_review` with a blocker.
-- A human owner may waive that specific rule/span with a non-empty reason. Store actor, time, rule version, text hash, and reason in `draft_events`/finding disposition.
+- A human owner may waive that specific rule/span with a non-empty reason. Store actor, time, rule version, text hash, and reason in `draft_events`/finding disposition. The recorded rule version is the finding's OWN rule-set identity (the quality-gate version for issue-#1150 rules, the boilerplate version for boilerplate), so a waiver dies with the rule set it was granted against.
 - Any edit that changes the matching span invalidates the waiver.
-- Non-waivable blockers are limited to factual/permission/security invariants; boilerplate is human-waivable.
+- Non-waivable blockers are limited to factual/permission/security invariants; boilerplate and the deterministic quality-gate blockers are human-waivable.
 
 ## 14. Prompts, structured output, and model routing
 
@@ -1203,6 +1211,10 @@ Add typed settings with conservative defaults and update every config-contract s
 | `draft_compile_rate_limit` | `5/minute` | compile and retry requests per user |
 | `draft_upload_rate_limit` | `20/minute` | input uploads per user |
 | `draft_poll_interval_seconds` | `2.0` | durable worker poll interval |
+| `draft_evidence_min_score` | `0.05` | Minimum normalized relevance for vault evidence entering the Draft registry (issue #1149); kinds with an absolute [0,1] scale gate here, raw-BM25 rows on `draft_evidence_min_fts_score`, unknown kinds never gate. |
+| `draft_evidence_min_fts_score` | `0.5` | Minimum raw BM25/FTS score for document full-text evidence rows (separate scale; default at the retrieval layer's own floor). |
+| `draft_quality_section_floor_words` | `40` | Absolute word floor for the per-section over-budget blocker (issue #1150). |
+| `draft_quality_rule_version` | `1` | Version of the deterministic quality-gate rule set; recorded on gate findings so waivers stay bound to their rule set. |
 
 The MVP has no automatic attachment TTL. Explicit deletion follows the two-phase tombstone contract in §6.1; archive retains inputs. Retention controls are PR 4.
 

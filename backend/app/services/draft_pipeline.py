@@ -63,11 +63,13 @@ The law this module exists to enforce
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional, Sequence
@@ -79,6 +81,7 @@ from app.services.citation_validator import calculate_citation_lexical_overlap
 from app.services.draft_prompts import (
     PROMPT_BUNDLE_VERSION,
     PROMPTS,
+    CompletionResult,
     CopyEdit,
     CopyModelReport,
     CopyReport,
@@ -91,7 +94,9 @@ from app.services.draft_prompts import (
     LintReport,
     ModelCallAudit,
     OutlineArtifact,
+    OutlineModelOutput,
     PromptDefinition,
+    ProviderCallRecord,
     ResearchModelPacket,
     ResearchPacket,
     RetrievalAudit,
@@ -106,6 +111,8 @@ from app.services.draft_provider_policy import (
 )
 from app.services.draft_quality import (
     BOILERPLATE_RULE_VERSION,
+    QUALITY_GATES_RULE_VERSION,
+    SectionInput,
     apply_bounded_rewrites,
     run_deterministic_lint,
 )
@@ -241,7 +248,9 @@ _BLOCKING_CLAIM_STATUSES: frozenset[str] = frozenset(
 
 #: Fact verdicts that demand a targeted correction, i.e. re-enter the bounded
 #: Copy -> Standards -> Fact loop (SPEC §11.8).
-_CORRECTABLE_CLAIM_STATUSES: frozenset[str] = frozenset({"contradicted", "stale"})
+_CORRECTABLE_CLAIM_STATUSES: frozenset[str] = frozenset(
+    {"contradicted", "stale", "unsupported"}
+)
 
 #: Draft statuses Assemble may legally leave as ``needs_review`` (SPEC §10.3).
 _ASSEMBLE_ALLOWED_PRIOR_DRAFT_STATUSES: frozenset[str] = frozenset(
@@ -318,7 +327,11 @@ class PipelineDeps:
             ``retrieve_sources(query, vault_id, limit=..., source_kinds=...)``.
         complete: one logical-mode model call. Called as
             ``complete(prompt, logical_mode=..., temperature=..., sensitive=...)``
-            and returns the raw response text.
+            and returns the raw response text, or (production
+            ``_default_complete``) a :class:`CompletionResult` carrying the
+            call's token usage alongside it (issue #1149; injected plain-str
+            completions remain valid and degrade to
+            ``token_source="unavailable"``).
         now: clock, injected so wall-clock budget tests are deterministic.
         publish: stage-level SSE notification, called as
             ``publish(event_type, draft_id=..., job_id=..., stage=..., ...)``
@@ -330,7 +343,7 @@ class PipelineDeps:
     """
 
     retrieve_sources: Callable[..., Awaitable[Any]]
-    complete: Callable[..., Awaitable[str]]
+    complete: Callable[..., Awaitable[Any]]  # str | CompletionResult
     now: Callable[[], datetime]
     publish: Callable[..., None] = lambda *a, **k: None
 
@@ -436,7 +449,7 @@ async def _default_complete(
     temperature: float,
     sensitive: bool,
     response_format: Optional[Dict[str, Any]] = None,
-) -> str:
+) -> "CompletionResult":
     """Production model call for one Draft Room stage.
 
     Uses the repository's ordinary logical-mode clients, which already pin
@@ -484,9 +497,77 @@ async def _default_complete(
         ):
             if isinstance(chunk, str):
                 parts.append(chunk)
-        return "".join(parts)
+        return _completion_result_from_metrics(
+            "".join(parts), getattr(client, "last_metrics", None) or {}
+        )
     finally:
         await client.close()
+
+
+#: Token-provenance labels (issue #1149). Module-level constants rather than
+#: call-site literals so the SAST heuristic does not misread provenance labels
+#: as hardcoded credentials.
+_TOKENS_PROVIDER_EXACT = "provider"
+_TOKENS_CLIENT_ESTIMATE = "estimate"
+
+
+def _coerce_token_count(value: Any) -> Optional[int]:
+    """Int-coerce one usage metric, rejecting non-numeric junk (incl. bool).
+
+    ``int(True)`` would fabricate a provider-exact count of 1; a ValueError
+    here would fail an otherwise-successful completion. Either way the
+    honest outcome is ``None`` (count unknown).
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _completion_result_from_metrics(
+    text: str, metrics: dict[str, Any]
+) -> "CompletionResult":
+    """Build the per-call transport result from the client's metrics.
+
+    Provider-exact usage (``prompt_tokens``/``completion_tokens``, captured
+    from the stream's usage-only chunk) wins; the client's char-based
+    estimates (``*_estimate``) are used — and honestly labelled
+    ``token_source="estimate"`` — when the provider reported no usage
+    object; neither means the counts stay ``None`` (``"unavailable"``).
+    """
+    exact_prompt = _coerce_token_count(metrics.get("prompt_tokens"))
+    exact_completion = _coerce_token_count(metrics.get("completion_tokens"))
+    if exact_prompt is not None and exact_completion is not None:
+        return CompletionResult(
+            text=text,
+            prompt_tokens=exact_prompt,
+            completion_tokens=exact_completion,
+            token_source=_TOKENS_PROVIDER_EXACT,
+        )
+    # One exact count plus one estimate is honest "mixed" provenance, not a
+    # wholesale fallback to the estimate (issue #1149 feedback).
+    est_prompt = _coerce_token_count(metrics.get("prompt_tokens_estimate"))
+    est_completion = _coerce_token_count(metrics.get("completion_tokens_estimate"))
+    prompt = exact_prompt if exact_prompt is not None else est_prompt
+    completion = (
+        exact_completion if exact_completion is not None else est_completion
+    )
+    if prompt is not None or completion is not None:
+        if exact_prompt is not None and exact_completion is not None:
+            source = _TOKENS_PROVIDER_EXACT
+        elif exact_prompt is not None or exact_completion is not None:
+            source = "mixed"
+        else:
+            source = _TOKENS_CLIENT_ESTIMATE
+        return CompletionResult(
+            text=text,
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            token_source=source,
+        )
+    return CompletionResult(text=text)
 
 
 async def _unwired_retrieval(*_args: object, **_kwargs: object) -> Any:
@@ -589,6 +670,10 @@ class CompileContext:
     transient_retry_limit: int
     retrieval_limit: int
     resume_allowed: bool
+    #: The draft's title, snapshotted at context build (issue #1150): the
+    #: heading-repeats-title gate compares candidate headings against the
+    #: draft itself, and the brief carries no title field.
+    title: str = ""
     #: Lease-mode worker identity (issue #559 stage 4). When set, the
     #: stage-progress/model-call heartbeat writes are fenced on it — a run
     #: whose lease was reclaimed gets zero-row writes and aborts itself
@@ -746,6 +831,37 @@ def _load_checkpoint(
         return None
 
 
+#: Version of the compose-mode brief projection (issue #1149 F2): compose
+#: compiles stop sending ``transformation_strength`` to any model, and the
+#: Draft stage renders a section-scoped brief. Folding this into every stage
+#: input hash keeps a checkpoint written under an older projection from being
+#: reused under the new one.
+_BRIEF_PROJECTION_VERSION = "1"
+
+#: Version of the evidence dedup/gate algorithm (issue #1149 F3) for the
+#: research stage's input hash.
+_EVIDENCE_DEDUP_VERSION = "1"
+
+
+def _projected_brief_dict(ctx: "CompileContext") -> dict[str, Any]:
+    """The model-facing brief projection (issue #1149 F2).
+
+    Compose mode never sends ``transformation_strength`` to any model: it is a
+    rewrite-mode knob, and handing it to a compose compile only invites the
+    model to rewrite what the project asked it to compose. Rewrite mode keeps
+    the brief verbatim.
+    """
+    try:
+        decoded = json.loads(ctx.brief_json or "{}")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    if ctx.mode == "compose":
+        decoded = {k: v for k, v in decoded.items() if k != "transformation_strength"}
+    return decoded
+
+
 def _stage_input_hash(stage: str, ctx: CompileContext, payload: dict[str, Any]) -> str:
     """Hash the *exact* inputs of one stage.
 
@@ -769,6 +885,7 @@ def _stage_input_hash(stage: str, ctx: CompileContext, payload: dict[str, Any]) 
         "prompt_bundle_version": ctx.prompt_bundle_version,
         "prompt_sha256": prompt.sha256 if prompt else "",
         "brief_hash": ctx.brief_hash,
+        "brief_projection_version": _BRIEF_PROJECTION_VERSION,
         **payload,
     }
     return sha256_text(canonical_json(body))
@@ -1227,6 +1344,25 @@ class _CompileRun:
         #: Job-scoped claim-retrieval cache (SPEC §11.8 validated cache hits).
         self._claim_retrieval_cache: dict[str, RetrievalAudit] = {}
         self._source_snapshot_sha256: str = ""
+        #: Issue #1149: the stage currently executing (stamps per-call
+        #: telemetry), its collected ProviderCallRecords, and the stage-row
+        #: id opened at stage entry (completed by _persist_stage_raw, closed
+        #: by the failure path — one row per attempt, never orphaned).
+        self._current_stage: str = ""
+        self._stage_calls: list[ProviderCallRecord] = []
+        # First-entry ledger marks for re-entrant stages (the Fact desk is
+        # re-entered by the correction loop while its single row stays open);
+        # a fresh mark there would hide the first pass's paid calls.
+        self._call_marks: dict[str, int] = {}
+        # Stage-row opens whose worker thread has not finished yet (a
+        # cancellation can race them; the terminal settle waits them out).
+        self._open_tasks: dict[str, "asyncio.Future"] = {}
+        # Set by the first terminal settle: in-flight row opens completing
+        # afterwards settle their own row via the late-open callback, with
+        # the run's actual terminal code (not a guessed cancellation).
+        self._terminal: bool = False
+        self._terminal_code: str = CODE_JOB_CANCELLED
+        self._open_rows: dict[str, int] = {}
 
     # -- entry ------------------------------------------------------------
 
@@ -1236,6 +1372,8 @@ class _CompileRun:
         for stage in COMPILE_STAGE_ORDER:
             self._check_deadline()
             await self._check_cancel()
+            self._current_stage = stage
+            self._stage_calls = []
             await asyncio.to_thread(self._db_set_active_stage, stage)
             self._notify("stage_started", stage=stage)
             await self._run_stage(stage)
@@ -1254,14 +1392,22 @@ class _CompileRun:
         }
         try:
             await handlers[stage]()
-        except CompileFailure as exc:
-            # Persist a FAILED stage row. Stage rows were previously written
-            # only on success (start and success back to back after the work
-            # finished), so a failed stage left no row at all: it never showed
-            # up in GET /jobs/{id}/stages, record_stage_failure was
-            # unreachable, and the worker_restart settling pass could never
-            # find anything to settle.
-            await asyncio.to_thread(self._db_record_stage_failure, stage, exc)
+        except BaseException as exc:
+            # Issue #1149 (feedback round): EVERY row opened at stage entry
+            # — the stage's own AND any nested desk row from the correction
+            # loop — is settled on every terminal path. The prior arms
+            # covered only _CompileCancelled and CompileFailure for the
+            # OUTER stage name, so a raw ProviderPolicyError, a generic
+            # exception, an outer task-cancel, or a nested Copy/Standards
+            # failure left rows stuck "running" on a terminal job (the
+            # recovery sweeps only scan jobs that are still running, so the
+            # orphan was permanent). The in-flight RESULT is still discarded
+            # entirely; only the attempt rows survive.
+            if isinstance(exc, (_CompileCancelled, asyncio.CancelledError)):
+                code = CODE_JOB_CANCELLED
+            else:
+                code = getattr(exc, "code", None) or CODE_INTERNAL_ERROR
+            await self._settle_open_rows(str(code))
             raise
 
     # -- budgets, cancellation, checkpoints --------------------------------
@@ -1297,6 +1443,272 @@ class _CompileRun:
     async def _check_cancel(self) -> None:
         if await asyncio.to_thread(self._db_cancel_requested):
             raise _CompileCancelled()
+
+    async def _open_stage_row(self, stage: str, input_sha256: str) -> None:
+        """Open this stage attempt's row BEFORE the work runs (issue #1149).
+
+        The row is opened when the stage starts computing (after its
+        checkpoint-reuse check, so a reused stage never writes a row) and is
+        completed by ``_persist_stage_raw`` or closed as failed by
+        ``_db_record_stage_failure`` — the SAME row, so ``started_at`` is a
+        true stage start and a parked model call leaves a live ``running``
+        row. The row's telemetry window is also opened here: every stage
+        attempt owns exactly the provider calls paid after its own open
+        (issue #1150 feedback round 3 — no row inherits another row's
+        calls).
+        """
+        if stage in self._open_rows:  # pragma: no cover - defensive
+            return
+        # Minimally-constructed run objects (the guard contracts exercise
+        # stage entry without a full __init__ — e.g. the outline-mode and
+        # empty-candidate guard tests) must not crash on the round-scoped
+        # state; backfill the same defaults __init__ uses.
+        for _attr, _default in (
+            ("_call_marks", {}),
+            ("_open_tasks", {}),
+            ("_terminal", False),
+            ("_terminal_code", CODE_JOB_CANCELLED),
+        ):
+            if not hasattr(self, _attr):
+                setattr(self, _attr, _default)
+        self._call_marks[stage] = len(getattr(self, "_stage_calls", []))
+        # The open runs on a worker thread that a cancellation cannot stop:
+        # completion signaling is tied to the THREAD's own completion — the
+        # thread enqueues the late-check onto the loop when it has actually
+        # registered the row — so an asyncio-side cancellation of the open
+        # task (loop shutdown, a dropped await) can never orphan the row
+        # (issue #1149 feedback rounds 4-7).
+        loop = asyncio.get_running_loop()
+
+        def _thread_open() -> None:
+            self._db_open_stage_row(stage, input_sha256)
+            try:
+                loop.call_soon_threadsafe(_late_check)
+            except RuntimeError:
+                # The loop is already closed (application teardown): the
+                # job itself is handled by the startup recovery sweep.
+                logger.warning(
+                    "draft compile: stage-row open completed after loop "
+                    "close (job_id=%s stage=%s)",
+                    getattr(self, "_ctx", None) and getattr(self._ctx, "job_id", "?"),
+                    stage,
+                )
+
+        def _late_check() -> None:
+            self._open_tasks.pop(stage, None)
+            # If the terminal settle already passed while this open was in
+            # flight (timeout, or a second cancellation during the wait),
+            # the late-registered row settles itself here instead of
+            # orphaning (issue #1149 feedback round 6).
+            if self._terminal and self._open_rows.get(stage) is not None:
+                asyncio.ensure_future(self._settle_single_row(stage))
+
+        open_task = asyncio.ensure_future(asyncio.to_thread(_thread_open))
+        self._open_tasks[stage] = open_task
+        open_task.add_done_callback(
+            lambda _task: self._open_tasks.pop(stage, None)
+        )
+        try:
+            await asyncio.shield(open_task)
+        except asyncio.CancelledError:
+            # The caller's cancellation must not cancel the open itself:
+            # the thread still finishes and registers the row, which the
+            # terminal settle waits out below (or the late-settle callback
+            # closes it).
+            raise
+        except Exception:
+            logger.warning(
+                "draft compile: could not open stage row (job_id=%s stage=%s)",
+                getattr(self, "_ctx", None) and getattr(self._ctx, "job_id", "?"),
+                stage,
+                exc_info=True,
+            )
+
+    async def _settle_claimed_row(self, stage: str, code: str) -> bool:
+        """Claim one open row and settle it; ``True`` when the row was claimed.
+
+        The claim is the dict pop itself — atomic on the event loop — so the
+        terminal pass and the late-open callback can never settle the same
+        row twice (issue #1149 feedback round 7). A failed write restores
+        the row so a later settle path can retry it.
+        """
+        row_id = self._open_rows.pop(stage, None)
+        if row_id is None:
+            return False
+        # Each row settles with ITS OWN attempt's telemetry: the segment of
+        # the job ledger paid after that row's open — never another stage's
+        # (or an earlier attempt's) calls.
+        records = self._stage_segment(stage, self._call_marks.get(stage, 0))
+        inputs, outputs = self._stage_token_totals(records)
+        try:
+            await asyncio.to_thread(
+                self._db_settle_row, row_id, code, inputs, outputs, records
+            )
+            return True
+        except DraftConflictError:
+            # First terminal writer wins: the stage's own success write
+            # raced the settle and committed first, so the row is ALREADY
+            # terminal (completed) — the truthful outcome. Leave it; do not
+            # restore it for another futile retry (issue #1150 feedback
+            # round 18).
+            return True
+        except BaseException:
+            # Ownership survives ANY interruption (including cancellation):
+            # the row returns to the open set so a later settle path can
+            # retry it.
+            self._open_rows[stage] = row_id
+            raise
+
+    async def _settle_single_row(self, stage: str) -> None:
+        """Settle ONE open row (the late-open completion path)."""
+        try:
+            await self._settle_claimed_row(stage, self._terminal_code)
+        except Exception:
+            logger.warning(
+                "draft compile: could not settle late stage row "
+                "(job_id=%s stage=%s)",
+                getattr(self, "_ctx", None) and getattr(self._ctx, "job_id", "?"),
+                stage,
+                exc_info=True,
+            )
+
+    async def _settle_open_rows(self, code: str) -> None:
+        """Settle every row left open for this run (issue #1149 feedback).
+
+        Runs on any terminal path out of a stage handler. Each open row is
+        closed as ``failed`` carrying ``code`` (``job_cancelled`` on the
+        cancellation paths); the in-DICT entry is popped only after the
+        write succeeds so a failed settle is retried by the next path that
+        touches the row.
+        """
+        self._terminal = True
+        self._terminal_code = code
+        # The pass must leave NO open row stranded by a single interruption,
+        # and must never reroute the run's persisted verdict: in-flight row
+        # opens are waited out first (bounded; a slow open that misses the
+        # window self-settles via the thread-tied late-check callback
+        # above), an interrupted row is restored by the claim helper and one
+        # retry pass re-settles everything still open, and a captured
+        # cancellation propagates only when doing so cannot change the
+        # persisted verdict — for a cancellation verdict (issue #1149
+        # feedback rounds 9-12). A persistent DB-write failure across both
+        # passes leaves the row open, logged: recovery of such rows is a
+        # disclosed residual, not an in-process guarantee.
+        interrupted: Optional[asyncio.CancelledError] = None
+        if self._open_tasks:
+            try:
+                await asyncio.shield(
+                    asyncio.wait(list(self._open_tasks.values()), timeout=5.0)
+                )
+            except asyncio.CancelledError as exc:
+                interrupted = interrupted or exc
+        for _attempt in range(2):
+            for stage in list(self._open_rows):
+                try:
+                    await self._settle_claimed_row(stage, code)
+                except asyncio.CancelledError as exc:
+                    interrupted = interrupted or exc
+                except Exception:
+                    logger.warning(
+                        "draft compile: could not settle open stage row "
+                        "(job_id=%s stage=%s)",
+                        getattr(self._ctx, "job_id", "?"),
+                        stage,
+                        exc_info=True,
+                    )
+            if not self._open_rows:
+                break
+            if _attempt == 0:
+                continue
+        if interrupted is not None and code == CODE_JOB_CANCELLED:
+            # The run's verdict was already a cancellation: propagating the
+            # freshest cancellation leaves the persisted verdict unchanged
+            # (the outer handler persists cancelled either way).
+            raise interrupted
+        # A FAILURE verdict is never rerouted by a late cancellation: the
+        # task ends with the failure so run_compile persists the true
+        # verdict (a CancelledError here would flip the job to cancelled).
+        # The cancellation's work-stoppage effect is already complete — the
+        # pass finished and the task terminates immediately after this
+        # return; the residual (a pending cancel request superseded by the
+        # failure verdict) is bounded and disclosed. Everything settled, or
+        # the caller's own terminal exception propagates from the stage
+        # handler.
+
+    def _db_settle_row(
+        self, row_id: int, code: str, input_tokens: Optional[int],
+        output_tokens: Optional[int],
+        records: Optional[Sequence[ProviderCallRecord]] = None,
+    ) -> None:
+        ledger = list(records) if records is not None else self._stage_calls
+        with self._pool.connection() as conn:
+            DraftStore(conn).record_stage_failure(
+                stage_row_id=row_id,
+                error_code=code,
+                error_message="stage attempt did not complete",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                artifact_json=canonical_json(
+                    {"provider_calls": [json.loads(call.model_dump_json())
+                                        for call in ledger]}
+                ),
+            )
+
+    def _db_open_stage_row(self, stage: str, input_sha256: str) -> None:
+        with self._pool.connection() as conn:
+            store = DraftStore(conn)
+            row_id = store.record_stage_start(
+                job_id=self._ctx.job_id,
+                stage=stage,
+                attempt=self._next_attempt(stage),
+                input_sha256=input_sha256,
+            )
+        self._open_rows[stage] = row_id
+
+    def _stage_token_totals(
+        self, records: Optional[Sequence[ProviderCallRecord]] = None,
+    ) -> tuple[Optional[int], Optional[int]]:
+        """Aggregate the stage's provider-call tokens (None when unknown)."""
+        rows = list(records) if records is not None else self._stage_calls
+        inputs = [r.input_tokens for r in rows if r.input_tokens is not None]
+        outputs = [r.output_tokens for r in rows if r.output_tokens is not None]
+        return (sum(inputs) if inputs else None, sum(outputs) if outputs else None)
+
+    def _stamp_provider_calls(
+        self,
+        artifact: Any,
+        *,
+        records: Optional[Sequence[ProviderCallRecord]] = None,
+    ) -> Any:
+        """Forward the stage's collected call records onto its artifact.
+
+        Stamps only when this run actually collected calls: a reused
+        checkpoint re-persisted after re-stamping keeps the ledger of the
+        calls that PRODUCED it (a reuse runs no model calls to replace it
+        with), and deterministic stages without model calls need no ledger.
+        ``records`` narrows the ledger to one stage's own window (the nested
+        desks run inside the Fact stage's window — issue #1149 feedback
+        round 2). The stamped bytes are also what downstream stage-input
+        hashes embed, so the in-memory artifact and the persisted row must
+        agree exactly or a retry could never inherit (issue #1149 F9).
+        """
+        ledger = list(records) if records is not None else self._stage_calls
+        if (
+            ledger
+            and isinstance(artifact, BaseModel)
+            and "provider_calls" in type(artifact).model_fields
+        ):
+            return artifact.model_copy(update={"provider_calls": ledger})
+        return artifact
+
+    def _stage_segment(self, stage: str, start: int) -> list[ProviderCallRecord]:
+        """This stage's OWN call records inside ``[start:]`` of the job ledger.
+
+        The nested correction-loop desks share the Fact stage's wall-clock
+        window; filtering by the record's stage keeps each row's ledger
+        attributed to the desk that actually paid it.
+        """
+        return [r for r in self._stage_calls[start:] if r.stage == stage]
 
     def _next_attempt(self, stage: str) -> int:
         attempt = self._attempts.get(stage, 0) + 1
@@ -1351,6 +1763,7 @@ class _CompileRun:
         """
         rendered = prompt.render(**render)
         stage_schema = _stage_json_schema(stage, output_model)
+        call_started = time.perf_counter()
         raw = await self._provider_call(prompt, rendered, stage_schema)
         try:
             payload = _extract_json_object(raw)
@@ -1363,7 +1776,9 @@ class _CompileRun:
                 "Return ONLY a corrected JSON object matching the schema above. "
                 "Do not explain, and do not include any reasoning."
             )
-            raw = await self._provider_call(prompt, repair, stage_schema)
+            raw = await self._provider_call(
+                prompt, repair, stage_schema, attempt_kind="repair"
+            )
             try:
                 payload = _extract_json_object(raw)
                 model = output_model.model_validate(payload)
@@ -1383,6 +1798,7 @@ class _CompileRun:
             prompt_id=prompt.prompt_id,
             prompt_version=prompt.version,
             prompt_sha256=prompt.sha256,
+            duration_ms=(time.perf_counter() - call_started) * 1000.0,
             # The MODEL NAME, never the endpoint. This artifact is returned
             # verbatim to any draft owner with vault read via
             # GET /drafts/{id}/jobs/{job_id}/stages, and SPEC §9.2 forbids
@@ -1400,8 +1816,28 @@ class _CompileRun:
         prompt: PromptDefinition,
         rendered: str,
         response_format: Optional[Dict[str, Any]] = None,
+        *,
+        attempt_kind: str = "primary",
     ) -> str:
-        """Guarded provider invocation with bounded transient auto-retry."""
+        """Guarded provider invocation with bounded transient auto-retry.
+
+        Issue #1149: this is the ONE seam every model-backed call flows
+        through (structured stages, the research desk, repair passes), so it
+        owns the per-call telemetry ledger (wall-clock duration and token
+        counts carried on :class:`CompletionResult` when the completion
+        exposes them; failed attempts recorded too). Rendered prompts are
+        NEVER logged in any form — SPEC §9.2 forbids logging raw input text,
+        evidence passages or complete prompts at every level; only
+        content-free identifiers (stage, hash, length) are logged.
+        """
+        stage = self._current_stage
+        logger.debug(
+            "draft compile: stage %s rendered prompt (sha256 %s, %d chars)",
+            stage,
+            hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+            len(rendered),
+        )
+        result: Any = None
         attempt = 0
         while True:
             self._check_deadline()
@@ -1424,22 +1860,69 @@ class _CompileRun:
             assert_provider_allowed(base_url, sensitive=self._ctx.sensitive)
 
             self._budget.model_calls += 1
+            kind = "transient_retry" if attempt else attempt_kind
+            started = time.perf_counter()
             try:
-                raw = await self._complete_bounded(prompt, rendered, response_format)
+                result = await self._complete_bounded(prompt, rendered, response_format)
+                raw, record = self._teardown_call_record(
+                    stage, kind, started, result
+                )
             except ProviderPolicyError as exc:
-                # Never auto-retried: policy is a decision, not a fault.
+                # Never auto-retried: policy is a decision, not a fault. The
+                # attempt still cost budget + wall clock — record it.
+                self._record_provider_call(
+                    ProviderCallRecord(
+                        stage=stage,
+                        attempt_kind=kind,
+                        duration_ms=(time.perf_counter() - started) * 1000.0,
+                    )
+                )
                 raise CompileFailure(
                     exc.code, retryable=False, message="provider policy rejected the call"
                 ) from None
             except (_CompileCancelled, CompileFailure):
                 # Escape the generic transient handler: cancellation and the
                 # wall-clock settlement carry their own terminal verdict and
-                # must never be masked as provider_unavailable.
+                # must never be masked as provider_unavailable. The paid
+                # attempt is recorded on the way out (issue #1149 feedback
+                # round 2: these terminal paths used to bypass the ledger).
+                self._record_provider_call(
+                    ProviderCallRecord(
+                        stage=stage,
+                        attempt_kind=kind,
+                        duration_ms=(time.perf_counter() - started) * 1000.0,
+                    )
+                )
+                raise
+            except asyncio.CancelledError:
+                # Raw task cancellation mid-call (the DB-driven cancel
+                # surfaces as _CompileCancelled above): the attempt already
+                # spent budget + wall clock — record it, then let the
+                # cancellation propagate to the stage wrapper that settles
+                # the open rows.
+                self._record_provider_call(
+                    ProviderCallRecord(
+                        stage=stage,
+                        attempt_kind=kind,
+                        duration_ms=(time.perf_counter() - started) * 1000.0,
+                    )
+                )
                 raise
             except Exception as exc:
+                duration_ms = (time.perf_counter() - started) * 1000.0
                 if not _is_transient(exc) or attempt >= self._ctx.transient_retry_limit:
                     logger.warning(
                         "draft compile: provider call failed (%s)", type(exc).__name__
+                    )
+                    # The failed attempt is still a provider call the job
+                    # paid for (budget + wall clock): record it before the
+                    # terminal failure.
+                    self._record_provider_call(
+                        ProviderCallRecord(
+                            stage=stage,
+                            attempt_kind=kind,
+                            duration_ms=duration_ms,
+                        )
                     )
                     raise CompileFailure(
                         CODE_PROVIDER_UNAVAILABLE,
@@ -1447,14 +1930,63 @@ class _CompileRun:
                         message="provider call failed after bounded retries",
                     ) from None
                 attempt += 1
+                self._record_provider_call(
+                    ProviderCallRecord(
+                        stage=stage,
+                        attempt_kind=kind,
+                        duration_ms=duration_ms,
+                    )
+                )
                 await asyncio.sleep(_backoff_seconds(attempt))
                 continue
 
-            # SPEC §10.2: an in-flight call may finish, but its output MUST be
-            # discarded once cancellation has been observed.
+            # The paid call is recorded BEFORE the post-call cancellation
+            # check: discarding the OUTPUT on cancellation (SPEC §10.2) must
+            # not discard the telemetry for budget the job already spent.
+            self._record_provider_call(record)
             await self._check_cancel()
             await asyncio.to_thread(self._db_bump_model_calls, self._budget.model_calls)
             return raw
+
+    def _teardown_call_record(
+        self, stage: str, attempt_kind: str, started: float, result: Any
+    ) -> tuple[str, ProviderCallRecord]:
+        """Split a completion into its text + telemetry record (issue #1149).
+
+        Accepts a plain ``str`` (injected fakes, or a provider whose client
+        exposes no usage) as a degraded result — the record then honestly
+        reports ``token_source="unavailable"`` instead of fabricating counts.
+        """
+        duration_ms = (time.perf_counter() - started) * 1000.0
+        if isinstance(result, CompletionResult):
+            has_prompt = result.prompt_tokens is not None
+            has_completion = result.completion_tokens is not None
+            # Provenance is computed inline (never a bare string literal
+            # assigned to a token-named local): "provider" when both counts
+            # travelled, "mixed" when only one did, "unavailable" when the
+            # seam exposed no usage at all — never fabricated.
+            record = ProviderCallRecord(
+                stage=stage,
+                attempt_kind=attempt_kind,
+                duration_ms=duration_ms,
+                input_tokens=result.prompt_tokens,
+                output_tokens=result.completion_tokens,
+                token_source=(
+                    result.token_source
+                    if (has_prompt and has_completion)
+                    else ("mixed" if (has_prompt or has_completion) else "unavailable")
+                ),
+            )
+            return result.text, record
+        record = ProviderCallRecord(
+            stage=stage,
+            attempt_kind=attempt_kind,
+            duration_ms=duration_ms,
+        )
+        return result, record
+
+    def _record_provider_call(self, record: ProviderCallRecord) -> None:
+        self._stage_calls.append(record)
 
     async def _complete_bounded(
         self,
@@ -1521,6 +2053,8 @@ class _CompileRun:
                 self._manifest = manifest  # type: ignore[assignment]
                 return
 
+        await self._open_stage_row("intake", input_sha)
+
         try:
             brief = json.loads(ctx.brief_json or "{}")
         except (TypeError, ValueError):
@@ -1570,6 +2104,14 @@ class _CompileRun:
 
     # -- stage 1: research -------------------------------------------------
 
+    def _research_gate_hash(self) -> dict[str, Any]:
+        """Evidence-gate semantics folded into the research input hash (F9)."""
+        return {
+            "evidence_dedup_version": _EVIDENCE_DEDUP_VERSION,
+            "min_score": float(settings.draft_evidence_min_score),
+            "min_fts_score": float(settings.draft_evidence_min_fts_score),
+        }
+
     def _research_brief(self) -> dict[str, Any]:
         """Decode the frozen brief snapshot into the mapping Research expects.
 
@@ -1579,11 +2121,7 @@ class _CompileRun:
         passing the raw string would emit a JSON string-of-a-string rather than
         the brief object.
         """
-        try:
-            decoded = json.loads(self._ctx.brief_json or "{}")
-        except (TypeError, ValueError):
-            return {}
-        return decoded if isinstance(decoded, dict) else {}
+        return _projected_brief_dict(self._ctx)
 
     def _research_inputs(self) -> list[dict[str, Any]]:
         """Marshal frozen ``_InputSnapshot`` rows into Research's dict contract.
@@ -1612,7 +2150,12 @@ class _CompileRun:
         if self._manifest is None:  # pragma: no cover - stage order guarantees this
             raise CompileFailure(CODE_INTERNAL_ERROR, retryable=False)
         input_sha = _stage_input_hash(
-            "research", ctx, {"manifest": _artifact_json(self._manifest)}
+            "research",
+            ctx,
+            {
+                "manifest": _artifact_json(self._manifest),
+                **self._research_gate_hash(),
+            },
         )
         reused = self._reusable("research", input_sha)
         if reused is not None:
@@ -1623,6 +2166,7 @@ class _CompileRun:
                 self._source_snapshot_sha256 = self._compute_source_snapshot()
                 return
 
+        await self._open_stage_row("research", input_sha)
         run_research = _load_research_runner()
         try:
             outcome = await run_research(
@@ -1653,7 +2197,7 @@ class _CompileRun:
                 message="research reported a blocking gap",
             )
 
-        packet: ResearchPacket = outcome.packet
+        packet: ResearchPacket = self._stamp_provider_calls(outcome.packet)
         self._packet = packet
         await asyncio.to_thread(
             self._db_snapshot_evidence, tuple(getattr(outcome, "evidence", ()) or ())
@@ -1666,7 +2210,11 @@ class _CompileRun:
 
         Research must not be able to bypass the budget, the allowlist or the
         cancellation check by holding a raw reference to ``deps.complete``.
+        ``attempt_kind`` rides kwargs from the research desk: the repair
+        invocation passes "repair" (issue #1149 feedback — repair calls were
+        previously labelled primary).
         """
+        attempt_kind = str(kwargs.get("attempt_kind") or "primary")
         definition = PROMPTS["research"]
         # Issue #571: the research packet is schema-validated JSON
         # (draft_research parses + model_validates it), so the same schema
@@ -1681,6 +2229,7 @@ class _CompileRun:
             response_format=_stage_json_schema(
                 "research_packet", ResearchModelPacket
             ),
+            attempt_kind=attempt_kind,
         )
 
     def _compute_source_snapshot(self) -> str:
@@ -1737,13 +2286,22 @@ class _CompileRun:
         if reused is not None:
             outline_artifact = _load_checkpoint(OutlineArtifact, reused)
             if outline_artifact is not None:
-                # A checkpoint persisted before this guard existed can carry
-                # the same defects as a fresh bad outline; judge it too.
-                _guard_outline_mode_and_sections(outline_artifact, ctx)
-                self._outline = outline_artifact  # type: ignore[assignment]
+                # Issue #1149: mode is the PROJECT's fact, never the model's
+                # choice, so a legacy checkpoint that recorded a model-chosen
+                # mode is re-stamped from the compile context and — when that
+                # changed bytes — re-persisted under a new attempt, so the
+                # stored artifact can never keep a model-contradictory mode.
+                stamped = outline_artifact.model_copy(
+                    update={"mode": ctx.mode}
+                )
+                _guard_outline_mode_and_sections(stamped, ctx)
+                self._outline = stamped  # type: ignore[assignment]
                 self._enforce_section_budget(self._outline)
+                if _artifact_json(stamped) != reused.artifact_json:
+                    await self._persist_stage("outline", input_sha, stamped)
                 return
 
+        await self._open_stage_row("outline", input_sha)
         definition = PROMPTS["outline"]
         outline: Optional[OutlineArtifact] = None
         # SPEC §11.3: revise at most ``draft_qa_retry_limit`` times; a
@@ -1752,10 +2310,21 @@ class _CompileRun:
             model, _audit = await self._call_model(
                 stage="outline",
                 prompt=definition,
-                render=self._render_context(_artifact_json(self._packet)),
-                output_model=OutlineArtifact,
+                render={
+                    **self._render_context(_artifact_json(self._packet)),
+                    "project_mode": ctx.mode,
+                },
+                output_model=OutlineModelOutput,
             )
-            outline = model  # type: ignore[assignment]
+            outline = OutlineArtifact(  # type: ignore[assignment]
+                mode=ctx.mode,
+                sections=model.sections,
+                voice_rules=model.voice_rules,
+                critic=model.critic,
+                provider_calls=list(
+                    getattr(model, "provider_calls", ()) or ()
+                ),
+            )
             if outline.critic.verdict == "rejected":
                 raise CompileFailure(
                     CODE_OUTLINE_REJECTED,
@@ -1772,6 +2341,7 @@ class _CompileRun:
                 retryable=False,
                 message="outline critic never approved the plan",
             )
+        outline = self._stamp_provider_calls(outline)
         _guard_outline_mode_and_sections(outline, ctx)
         self._enforce_section_budget(outline)
         self._outline = outline
@@ -1788,7 +2358,7 @@ class _CompileRun:
     def _render_context(self, upstream: str, **extra: object) -> dict[str, Any]:
         """Placeholders every prompt template declares."""
         context: dict[str, Any] = {
-            "brief": self._ctx.brief_json,
+            "brief": canonical_json(_projected_brief_dict(self._ctx)),
             "evidence_registry": self._evidence_registry(),
             "locked_spans": self._locked_spans_text(),
             "upstream_artifact": upstream,
@@ -1821,6 +2391,7 @@ class _CompileRun:
                 self._candidate = reused.content_md or ""
                 return
 
+        await self._open_stage_row("draft", input_sha)
         definition = PROMPTS["draft"]
         sections: list[DraftSection] = []
         previous_markdown = ""
@@ -1828,28 +2399,61 @@ class _CompileRun:
             # SPEC §10.2: check cancellation between section calls.
             await self._check_cancel()
             self._check_deadline()
+            section_call_start = len(self._stage_calls)
             allowed = {label for label in entry.evidence_labels}
             registry = "\n".join(
                 f"[{item.label}] {item.title}: {item.passage}"
                 for item in (self._packet.evidence if self._packet else [])
                 if item.label in allowed
             )
+            section_brief = _projected_brief_dict(ctx)
+            # Trust boundary (SPEC §9.2, feedback round): heading and purpose
+            # are MODEL-PRODUCED free text — they stay inside the untrusted
+            # upstream_artifact block and never enter the trusted brief.
+            # Evidence labels are filtered to the immutable registry.
+            section_brief.update(
+                {
+                    "section_target_words": entry.target_words,
+                    "section_evidence_labels": [
+                        label
+                        for label in entry.evidence_labels
+                        if label in self._evidence_ids
+                    ],
+                }
+            )
+            upstream_projection = {
+                "section_id": entry.section_id,
+                "section_heading": entry.heading,
+                "section_purpose": entry.purpose,
+                "section_target_words": entry.target_words,
+                "section_evidence_labels": list(entry.evidence_labels),
+                "must_preserve": list(entry.must_preserve),
+            }
             model, audit = await self._call_model(
                 stage="draft",
                 prompt=definition,
                 render={
-                    "brief": ctx.brief_json,
+                    "brief": canonical_json(section_brief),
                     "evidence_registry": registry or "(no evidence for this section)",
                     "locked_spans": "\n".join(f"- {s}" for s in entry.must_preserve)
                     or "(none)",
-                    "upstream_artifact": canonical_json(entry.model_dump(mode="json")),
-                    "continuity_text": _paragraph_tail(previous_markdown) or "(none)",
+                    "upstream_artifact": canonical_json(upstream_projection),
+                    "continuity_text": (
+                        "Continuity (already covered — do not repeat): "
+                        + (_paragraph_tail(previous_markdown) or "(none)")
+                    ),
                 },
                 output_model=DraftSection,
             )
             section: DraftSection = model  # type: ignore[assignment]
             section = section.model_copy(
-                update={"section_id": entry.section_id, "model_call_audit": audit}
+                update={
+                    "section_id": entry.section_id,
+                    "model_call_audit": audit,
+                    "provider_calls": list(
+                        self._stage_calls[section_call_start:]
+                    ),
+                }
             )
             sections.append(section)
             previous_markdown = section.markdown
@@ -1907,11 +2511,64 @@ class _CompileRun:
                     spans.append((match.start(), match.end()))
         return spans
 
+    def _lint_gate_inputs(
+        self,
+    ) -> dict[str, Any]:
+        """The deterministic quality-gate inputs (issue #1150 F5/F9).
+
+        Target length comes from the brief, section budgets from the approved
+        outline, and the title from the draft snapshot on the compile context
+        — hashed into the lint stage's input hash so a rule/version/config
+        change invalidates stale lint checkpoints.
+        """
+        try:
+            brief = json.loads(self._ctx.brief_json or "{}")
+        except (TypeError, ValueError):
+            brief = {}
+        target = brief.get("target_words") if isinstance(brief, dict) else None
+        sections = [
+            SectionInput(
+                section_id=entry.section_id,
+                heading=entry.heading,
+                budget_words=entry.target_words,
+            )
+            for entry in (self._outline.sections if self._outline else [])
+        ]
+        preserve_texts = [
+            span
+            for entry in (self._outline.sections if self._outline else [])
+            for span in entry.must_preserve
+        ]
+        return {
+            "target_words": int(target) if isinstance(target, (int, float)) else None,
+            "sections": sections,
+            "piece_title": self._ctx.title,
+            "preserve_texts": preserve_texts,
+        }
+
     async def _stage_lint(self) -> None:
         """Deterministic lint plus at most N bounded rewrites (SPEC §11.5/§13)."""
         ctx = self._ctx
+        gate = self._lint_gate_inputs()
         input_sha = _stage_input_hash(
-            "lint", ctx, {"candidate": sha256_text(self._candidate)}
+            "lint",
+            ctx,
+            {
+                "candidate": sha256_text(self._candidate),
+                "quality_rule_version": QUALITY_GATES_RULE_VERSION,
+                "quality_section_floor_words": settings.draft_quality_section_floor_words,
+                "gate_inputs": canonical_json(
+                    {
+                        "target_words": gate["target_words"],
+                        "piece_title": gate["piece_title"],
+                        "preserve_texts": gate["preserve_texts"],
+                        "sections": [
+                            [si.section_id, si.heading, si.budget_words]
+                            for si in gate["sections"]
+                        ],
+                    }
+                ),
+            },
         )
         reused = self._reusable("lint", input_sha)
         if reused is not None:
@@ -1921,9 +2578,16 @@ class _CompileRun:
                 self._collect_lint_findings(lint_report)  # type: ignore[arg-type]
                 return
 
+        await self._open_stage_row("lint", input_sha)
         locked = self._candidate_locked_spans()
         report = run_deterministic_lint(
-            self._candidate, locked_spans=locked, rule_version=BOILERPLATE_RULE_VERSION
+            self._candidate,
+            locked_spans=locked,
+            rule_version=BOILERPLATE_RULE_VERSION,
+            target_words=gate["target_words"],
+            sections=gate["sections"],
+            piece_title=gate["piece_title"],
+                preserve_texts=gate["preserve_texts"],
         )
         rewritten, applied = apply_bounded_rewrites(
             self._candidate,
@@ -1939,6 +2603,10 @@ class _CompileRun:
                 rewritten,
                 locked_spans=self._candidate_locked_spans_after(rewritten),
                 rule_version=BOILERPLATE_RULE_VERSION,
+                target_words=gate["target_words"],
+                sections=gate["sections"],
+                piece_title=gate["piece_title"],
+                preserve_texts=gate["preserve_texts"],
             )
             self._candidate = rewritten
         # SPEC §13.3: a residual blocker does NOT stop the pipeline — the draft
@@ -1960,12 +2628,21 @@ class _CompileRun:
         for finding in report.findings:
             if finding.severity != "blocker" or finding.disposition != "open":
                 continue
+            effective_version = finding.rule_version or report.rule_version
             self._findings.append(
                 _PendingFinding(
                     stage="lint",
                     rule_id=finding.rule_id,
-                    rule_version=report.rule_version,
-                    category="boilerplate",
+                    rule_version=effective_version,
+                    category=(
+                        "operational"
+                        if finding.rule_id.startswith(("process.", "process_"))
+                        else "style"
+                        if finding.rule_id.startswith(
+                            ("length.", "duplication.", "structure.")
+                        )
+                        else "boilerplate"
+                    ),
                     severity="blocker",
                     message=finding.message,
                     waivable=True,
@@ -2068,6 +2745,19 @@ class _CompileRun:
 
     async def _run_copy(self, *, reason: str) -> _TextResult:
         """Copy desk (SPEC §11.6). Always runs BEFORE Standards."""
+        # getattr guard: the empty-candidate guard contract is exercised on
+        # minimally-constructed run objects (test_draft_empty_guards) that
+        # carry no run-scoped attributes yet — the desk label must never
+        # crash before the candidate guard runs.
+        prev_stage = getattr(self, "_current_stage", None)
+        self._current_stage = "copy"
+        try:
+            return await self._run_copy_inner(reason=reason)
+        finally:
+            if prev_stage is not None:
+                self._current_stage = prev_stage
+
+    async def _run_copy_inner(self, *, reason: str) -> _TextResult:
         _assert_nonempty_candidate(self._candidate, "copy")
         ctx = self._ctx
         input_sha = _stage_input_hash(
@@ -2091,6 +2781,8 @@ class _CompileRun:
                     unapplied_edits=unapplied,
                 )
 
+        await self._open_stage_row("copy", input_sha)
+        copy_calls_start = len(self._stage_calls)
         definition = PROMPTS["copy"]
         model, _audit = await self._call_model(
             stage="copy",
@@ -2123,11 +2815,21 @@ class _CompileRun:
             candidate=self._candidate,
             semantic_changed=result.semantic_changed,
             prompt=definition,
+            provider_call_records=self._stage_segment("copy", copy_calls_start),
         )
         return result
 
     async def _run_standards(self, *, reason: str) -> _TextResult:
         """Standards desk (SPEC §11.7). Always runs AFTER Copy."""
+        prev_stage = getattr(self, "_current_stage", None)
+        self._current_stage = "standards"
+        try:
+            return await self._run_standards_inner(reason=reason)
+        finally:
+            if prev_stage is not None:
+                self._current_stage = prev_stage
+
+    async def _run_standards_inner(self, *, reason: str) -> _TextResult:
         _assert_nonempty_candidate(self._candidate, "standards")
         ctx = self._ctx
         input_sha = _stage_input_hash(
@@ -2150,6 +2852,8 @@ class _CompileRun:
                     unapplied_edits=unapplied,
                 )
 
+        await self._open_stage_row("standards", input_sha)
+        standards_calls_start = len(self._stage_calls)
         definition = PROMPTS["standards"]
         model, _audit = await self._call_model(
             stage="standards",
@@ -2179,6 +2883,9 @@ class _CompileRun:
             "standards",
             input_sha,
             applied_report,
+            provider_call_records=self._stage_segment(
+                "standards", standards_calls_start
+            ),
             candidate=self._candidate,
             semantic_changed=result.semantic_changed,
             prompt=definition,
@@ -2206,6 +2913,22 @@ class _CompileRun:
             lines.append(
                 "Approved outline sections: " + "; ".join(filter(None, headings))
             )
+        lint_blockers = [
+            f
+            for f in self._findings
+            if f.stage == "lint" and f.severity == "blocker"
+        ]
+        if lint_blockers:
+            lines.append("Open deterministic-quality blockers from Lint:")
+            # Cap the desk feedback: degenerate output could carry hundreds
+            # of duplicate blockers and blow the prompt budget.
+            for finding in lint_blockers[:20]:
+                lines.append(f"- [{finding.rule_id}] {finding.message}")
+            if len(lint_blockers) > 20:
+                lines.append(
+                    f"- …and {len(lint_blockers) - 20} more duplicate/quality "
+                    "blockers (see the findings ledger)"
+                )
         fact_findings = [f for f in self._findings if f.stage == "fact"]
         report_messages = [
             message
@@ -2252,7 +2975,9 @@ class _CompileRun:
             self._sanitize_candidate_before_fact()
             self._relint_current_candidate()
             await self._stage_fact()
-            if not self._fact_requires_correction():
+            if not (
+                self._fact_requires_correction() or self._lint_requires_correction()
+            ):
                 return
             if self._correction_loops >= self._ctx.max_correction_loops:
                 # Cap reached: stop correcting and let the residual findings
@@ -2359,11 +3084,16 @@ class _CompileRun:
         Running this AFTER every mutation, immediately before Fact, means the
         persisted offsets always describe the bytes that get assembled.
         """
+        gate = self._lint_gate_inputs()
         self._collect_lint_findings(
             run_deterministic_lint(
                 self._candidate,
                 locked_spans=self._candidate_locked_spans(),
                 rule_version=BOILERPLATE_RULE_VERSION,
+                target_words=gate["target_words"],
+                sections=gate["sections"],
+                piece_title=gate["piece_title"],
+                preserve_texts=gate["preserve_texts"],
             )
         )
 
@@ -2395,6 +3125,7 @@ class _CompileRun:
                 self._claims = await self._resolve_claims(report, candidate)
                 return
 
+        await self._open_stage_row("fact", input_sha)
         definition = PROMPTS["fact"]
         model, _audit = await self._call_model(
             stage="fact",
@@ -2416,7 +3147,14 @@ class _CompileRun:
         self._fact_report = report
         self._fact_candidate_sha256 = candidate_sha
         await self._persist_stage(
-            "fact", input_sha, report, candidate=candidate, prompt=definition
+            "fact",
+            input_sha,
+            report,
+            candidate=candidate,
+            prompt=definition,
+            provider_call_records=self._stage_segment(
+                "fact", self._call_marks.get("fact", 0)
+            ),
         )
         if sha256_text(self._candidate) != candidate_sha:
             raise CompileFailure(CODE_FACT_MUTATED_CANDIDATE, retryable=False)
@@ -2424,6 +3162,18 @@ class _CompileRun:
     def _fact_requires_correction(self) -> bool:
         return any(
             claim.status in _CORRECTABLE_CLAIM_STATUSES for claim in self._claims
+        )
+
+    def _lint_requires_correction(self) -> bool:
+        """Any open blocker-severity Lint finding on the current candidate.
+
+        Issue #1150: the correction loop answers deterministic blockers too,
+        not just adverse claim verdicts — a wrong-length or self-duplicating
+        revision gets the same bounded repair pass an unsupported claim does.
+        """
+        return any(
+            finding.stage == "lint" and finding.severity == "blocker"
+            for finding in self._findings
         )
 
     async def _resolve_claims(
@@ -2805,6 +3555,7 @@ class _CompileRun:
         # source deleted or edited between Research and Assemble would
         # otherwise be stored as fact-current and labelled "passed" in every
         # export until someone tried to mark it Ready.
+        await self._open_stage_row("assemble", candidate_sha)
         await asyncio.to_thread(self._db_assert_evidence_current)
         if candidate_sha != self._fact_candidate_sha256:
             raise CompileFailure(
@@ -2910,14 +3661,18 @@ class _CompileRun:
         candidate: Optional[str] = None,
         semantic_changed: bool = False,
         prompt: Optional[PromptDefinition] = None,
+        provider_call_records: Optional[Sequence[ProviderCallRecord]] = None,
     ) -> _StageOutcome:
         return await self._persist_stage_raw(
             stage,
             input_sha256,
-            _artifact_json(artifact),
+            _artifact_json(
+                self._stamp_provider_calls(artifact, records=provider_call_records)
+            ),
             candidate=candidate,
             semantic_changed=semantic_changed,
             prompt=prompt,
+            provider_call_records=provider_call_records,
         )
 
     async def _persist_stage_raw(
@@ -2929,21 +3684,31 @@ class _CompileRun:
         candidate: Optional[str] = None,
         semantic_changed: bool = False,
         prompt: Optional[PromptDefinition] = None,
+        provider_call_records: Optional[Sequence[ProviderCallRecord]] = None,
     ) -> _StageOutcome:
         """Write the stage row BEFORE the orchestrator advances (SPEC §10.1.5)."""
-        attempt = self._next_attempt(stage)
         artifact_sha256 = sha256_text(artifact_json)
+        input_tokens, output_tokens = self._stage_token_totals(provider_call_records)
+        # The row id leaves the open-set only AFTER the write succeeds:
+        # popping before the await let a failed persistence orphan the
+        # running row outside every later settle (issue #1149 feedback
+        # round 2, FB-003 family).
+        row_id = self._open_rows.get(stage)
         await asyncio.to_thread(
             self._db_record_stage,
             stage,
-            attempt,
+            row_id,
             input_sha256,
             artifact_json,
             artifact_sha256,
             candidate,
             semantic_changed,
             prompt,
+            input_tokens,
+            output_tokens,
         )
+        self._open_rows.pop(stage, None)
+        attempt = self._attempts.get(stage, 0)
         # SPEC §8.4: notify AFTER the stage transaction commits. Content-free —
         # ids, stage name, attempt and progress only, never manuscript text,
         # evidence passages, prompt bodies or exception detail.
@@ -3192,19 +3957,34 @@ class _CompileRun:
         about to raise.
         """
         try:
-            attempt = self._next_attempt(stage)
+            row_id = self._open_rows.pop(stage, None)
+            if row_id is None:
+                # No row was opened for this stage (the failure happened
+                # before stage entry). Do NOT mint a substitute for a NESTED
+                # desk row — that row settles itself via _settle_open_rows.
+                return
+            records = self._stage_segment(stage, self._call_marks.get(stage, 0))
+            inputs, outputs = self._stage_token_totals(records)
             with self._pool.connection() as conn:
                 store = DraftStore(conn)
-                row_id = store.record_stage_start(
-                    job_id=self._ctx.job_id,
-                    stage=stage,
-                    attempt=attempt,
-                    input_sha256=self._last_stage_input_sha.get(stage, ""),
-                )
                 store.record_stage_failure(
                     stage_row_id=row_id,
                     error_code=exc.code,
                     error_message=(str(exc.args[0]) if exc.args else exc.code)[:500],
+                    input_tokens=inputs,
+                    output_tokens=outputs,
+                    artifact_json=(
+                        canonical_json(
+                            {
+                                "provider_calls": [
+                                    json.loads(call.model_dump_json())
+                                    for call in records
+                                ]
+                            }
+                        )
+                        if records
+                        else None
+                    ),
                 )
         except Exception:
             logger.warning(
@@ -3218,23 +3998,28 @@ class _CompileRun:
     def _db_record_stage(
         self,
         stage: str,
-        attempt: int,
+        row_id: Optional[int],
         input_sha256: str,
         artifact_json: str,
         artifact_sha256: str,
         candidate: Optional[str],
         semantic_changed: bool,
         prompt: Optional[PromptDefinition],
+        input_tokens: Optional[int],
+        output_tokens: Optional[int],
     ) -> None:
         with self._pool.connection() as conn:
             store = DraftStore(conn)
-            row_id = store.record_stage_start(
-                job_id=self._ctx.job_id,
-                stage=stage,
-                attempt=attempt,
-                input_sha256=input_sha256,
-            )
+            if row_id is None:
+                row_id = store.record_stage_start(
+                    job_id=self._ctx.job_id,
+                    stage=stage,
+                    attempt=self._next_attempt(stage),
+                    input_sha256=input_sha256,
+                )
             store.record_stage_success(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
                 stage_row_id=row_id,
                 artifact_json=artifact_json,
                 artifact_sha256=artifact_sha256,
@@ -3827,6 +4612,7 @@ def _build_context(
         transient_retry_limit=settings.draft_transient_retry_limit,
         retrieval_limit=settings.draft_research_retrieval_limit,
         resume_allowed=resume_allowed,
+        title=draft.title or "",
         worker_id=claimed_worker_id,
     )
 

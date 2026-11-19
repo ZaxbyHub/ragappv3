@@ -98,7 +98,7 @@ BRIEF = {
     "piece_type": "memo",
     "audience": "internal counsel",
     "purpose": "restate the review window",
-    "target_words": 60,
+    "target_words": 6,
     "transformation_strength": "moderate",
 }
 

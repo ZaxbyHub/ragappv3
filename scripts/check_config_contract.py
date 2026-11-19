@@ -316,6 +316,7 @@ def main() -> int:
         "DRAFT_RESEARCH_RETRIEVAL_LIMIT": "draft_research_retrieval_limit",
         "DRAFT_TRANSIENT_RETRY_LIMIT": "draft_transient_retry_limit",
         "DRAFT_LINT_REWRITE_LIMIT": "draft_lint_rewrite_limit",
+        "DRAFT_QUALITY_SECTION_FLOOR_WORDS": "draft_quality_section_floor_words",
         # Ingestion/worker limits. These were previously unguarded, so a drift
         # between config.py, .env.example and docker-compose.yml would not have
         # failed contract CI.
@@ -348,6 +349,16 @@ def main() -> int:
             "draft_poll_interval_seconds",
             backend_float_default,
         ),
+        (
+            "DRAFT_EVIDENCE_MIN_SCORE",
+            "draft_evidence_min_score",
+            backend_float_default,
+        ),
+        (
+            "DRAFT_EVIDENCE_MIN_FTS_SCORE",
+            "draft_evidence_min_fts_score",
+            backend_float_default,
+        ),
     ):
         backend_val = reader(backend_config, field_name)
         env_val = env_value(env_text, env_name)
@@ -371,6 +382,7 @@ def main() -> int:
         "DRAFT_COMPILE_RATE_LIMIT": "draft_compile_rate_limit",
         "DRAFT_UPLOAD_RATE_LIMIT": "draft_upload_rate_limit",
         "DRAFT_BOILERPLATE_RULE_VERSION": "draft_boilerplate_rule_version",
+        "DRAFT_QUALITY_RULE_VERSION": "draft_quality_rule_version",
         "DRAFT_DEFAULT_LOGICAL_MODE": "draft_default_logical_mode",
     }
     for env_name, field_name in draft_str_settings.items():

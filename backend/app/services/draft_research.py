@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Sequence
 
 from pydantic import ValidationError
 
+from app.config import settings
+
 from .draft_prompts import (
     PROMPTS,
     ResearchEvidenceItem,
@@ -244,10 +246,53 @@ def _aggregate_kinds(
     return requested, successful, failed
 
 
+#: Score kinds with an absolute higher-is-better [0, 1] meaning after
+#: normalization; ``fts`` (raw BM25 magnitudes) gates on its own raw scale,
+#: and any other kind is never gated (fail-open) rather than guessed at.
+_DISTANCE_KIND_DIVISORS: dict[str, float] = {
+    "cosine_distance": 1.0,
+    "dot_distance": 1.0,
+    "l2_distance": 2.0,
+}
+_BOUNDED_KINDS: frozenset[str] = frozenset(
+    {"rerank", "exact_entity", "relation", "claim_fts", "page_fts", "kms_fts",
+     "positional", "hybrid"}
+)
+
+
+def _normalized_relevance(score_kind: str, score: float) -> float | None:
+    """Typed per-kind relevance in [0, 1], higher is better (issue #1149).
+
+    Raw retrieval scores are NOT a uniform scale: document rows mix cosine
+    DISTANCE (lower better) with FTS/BM25 magnitudes, wiki scores carry
+    per-row ``score_type`` decays, KMS uses positional constants. This maps
+    every kind with a well-defined absolute meaning onto [0, 1]; ``fts``
+    returns ``None`` (the caller gates it on its own raw threshold) and
+    unknown kinds return ``None`` (never gated — a wrong polarity guess would
+    drop the BEST matches, so an untyped score is passed through honestly).
+    """
+    divisor = _DISTANCE_KIND_DIVISORS.get(score_kind)
+    if divisor is not None:
+        value = 1.0 - (score / divisor)
+    elif score_kind in _BOUNDED_KINDS:
+        value = score
+    else:
+        return None
+    return max(0.0, min(1.0, value))
+
+
 def _label_evidence(
     facet_results: Sequence[_FacetRetrieval],
 ) -> list[EvidenceSnapshot]:
     """Assign stable S#/W#/K# labels in facet order (SPEC §12.2).
+
+    Issue #1149 gates this registry: a source below the configured minimum
+    relevance for its typed score kind is excluded BEFORE a label is
+    assigned, and a source whose content hash was already registered by an
+    earlier ELIGIBLE source is deduplicated (filter-before-mark ordering, so
+    a low-scoring first duplicate can never consume the hash and suppress a
+    later eligible copy). Project inputs are minted separately by
+    :func:`mint_input_evidence` and are exempt by construction.
 
     ``[D#]`` project-input labels are minted separately by
     :func:`mint_input_evidence` and appended by :func:`run_research` AFTER the
@@ -268,8 +313,24 @@ def _label_evidence(
     """
     doc_n = wiki_n = kms_n = 0
     evidence: list[EvidenceSnapshot] = []
+    min_relevance = float(settings.draft_evidence_min_score)
+    min_fts = float(settings.draft_evidence_min_fts_score)
+    seen_hashes: set[str] = set()
     for result in facet_results:
         for source in result.sources:
+            score_kind = getattr(source, "score_kind", "unknown") or "unknown"
+            if score_kind == "fts":
+                # Raw BM25 magnitudes: no absolute [0, 1] meaning, so the kind
+                # gates on its own configured raw threshold.
+                if float(source.score) < min_fts:
+                    continue
+            else:
+                relevance = _normalized_relevance(score_kind, source.score)
+                if relevance is not None and relevance < min_relevance:
+                    continue
+            if source.content_sha256 in seen_hashes:
+                continue
+            seen_hashes.add(source.content_sha256)
             if source.kind == "document":
                 doc_n += 1
                 label = f"S{doc_n}"
@@ -421,6 +482,7 @@ async def _complete_packet(
             repair_prompt,
             logical_mode=prompt_def.logical_mode,
             temperature=prompt_def.temperature,
+            attempt_kind="repair",
         )
         try:
             return _parse_packet(raw2)

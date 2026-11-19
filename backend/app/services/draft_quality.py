@@ -8,12 +8,19 @@ access, and no database access. It implements the exact contract in
   (quotes, code, blockquotes, Markdown citation labels/link targets, URLs,
   and caller-supplied locked spans) are replaced with same-length filler so
   every downstream offset still refers to the *original* text.
-* **Rule classes** (§13.1) — exactly one class is hard-fail/blocking:
-  ``blocked_boilerplate``, an exact, curated, versioned phrase list matched
-  with word-boundary awareness. The other three classes —
-  ``review_vocabulary``, ``structure_signal``, ``readability_signal`` — are
-  always ``severity="advisory"`` and can never block compilation or Ready
-  (SPEC §13.1/§13.3, issue §20: broad style vocabulary must never be a hard
+* **Rule classes** (§13.1, amended by issue #1150) — two blocker families.
+  ``blocked_boilerplate`` is an exact, curated, versioned phrase list matched
+  with word-boundary awareness (versioned by
+  ``settings.draft_boilerplate_rule_version`` as before). The deterministic
+  quality-gate family — total and per-section length tolerance, paragraph
+  duplication (hash and similarity), cross-section duplicate sentences,
+  heading structure, process-commentary leakage, and a trailing source line —
+  emits ``severity="blocker"`` findings versioned by
+  ``settings.draft_quality_rule_version`` (recorded per finding so waivers
+  stay bound to the rule set they were granted against). The advisory classes
+  — ``review_vocabulary``, ``structure_signal``, ``readability_signal`` and
+  the length near-band warning — can never block compilation or Ready (SPEC
+  §13.1/§13.3, issue §20: broad style vocabulary must never be a hard
   blocker, and this module must never optimize for or reference an AI
   detector).
 * **Bounded rewrite** (§13.3) — at most ``settings.draft_lint_rewrite_limit``
@@ -40,8 +47,10 @@ from app.services.draft_prompts import LintFinding, LintReport
 
 __all__ = [
     "BOILERPLATE_RULE_VERSION",
+    "QUALITY_GATES_RULE_VERSION",
     "BLOCKED_BOILERPLATE",
     "REVIEW_VOCABULARY",
+    "SectionInput",
     "MaskedText",
     "mask_excluded_spans",
     "run_deterministic_lint",
@@ -655,6 +664,684 @@ def _lint_readability_signal(masked_text: str, *, section_id: str) -> list[LintF
 
 
 # ---------------------------------------------------------------------------
+# Deterministic quality gates (issue #1150, SPEC §13.1 as amended)
+# ---------------------------------------------------------------------------
+
+#: Version of the gate rule set (length/duplication/heading/process rules).
+#: Tracks ``settings.draft_quality_rule_version`` exactly; a change to a
+#: gate rule below should bump that setting so NEW findings carry the new
+#: identity. (Waivers bind to the version stored on their finding row;
+#: nothing enforces the bump at runtime.)
+QUALITY_GATES_RULE_VERSION: str = settings.draft_quality_rule_version
+
+#: Relative total-length bands: a blocker outside +/-25 percent of the brief's
+#: target, an advisory warning outside +/-15 percent (only when the blocker
+#: did not fire; exactly-at-band always passes).
+_LENGTH_BLOCKER_BAND = 0.25
+_LENGTH_NEAR_BAND = 0.15
+
+#: A section blocks only above max(1.5 x budget, budget + floor words); the
+#: absolute floor keeps tiny sections from tripping the relative arm alone.
+_SECTION_OVER_BUDGET_RATIO = 1.5
+
+#: Paragraphs shorter than this (word basis) are exempt from the similarity
+#: rule: near-identical short paragraphs are usually legitimate constructions,
+#: and word-set Jaccard is unstable on small sets.
+_SIMILARITY_MIN_WORDS = 12
+
+#: Word-set Jaccard at or above this counts as a duplicate paragraph.
+_SIMILARITY_THRESHOLD = 0.9
+
+#: A sentence of this many words or more appearing in more than one section
+#: is a cross-section duplicate.
+_CROSS_SECTION_MIN_WORDS = 8
+
+#: Degenerate-output caps for the duplicate rules (issue #1150 feedback):
+#: at most this many paragraphs enter the pairwise similarity comparison,
+#: and each duplicate rule emits at most this many findings (document
+#: order, deterministic). Repetition-loop model output otherwise produced
+#: hundreds of thousands of blockers in one lint pass.
+_MAX_SIMILARITY_PARAGRAPHS = 400
+_MAX_DUPLICATE_FINDINGS = 100
+
+#: Curated, versioned pipeline-instruction leakage patterns (QUALITY_GATES_
+#: RULE_VERSION). The 2026-11-15 deployment audit watched outline acceptance
+#: checks and verification instructions come back as prose ("verification was
+#: not performed" statements); these patterns catch that transcription class.
+PROCESS_COMMENTARY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (phrase, re.compile(pattern, re.IGNORECASE))
+    for phrase, pattern in (
+        ("verification_was_not_performed", r"verification (?:was|is) not performed"),
+        # Anchored to pipeline vocabulary: a bare "acceptance check" blocked
+        # ordinary QA prose ("Each release passes an acceptance check before
+        # it ships"), so the pattern must name the draft's own checks.
+        (
+            "acceptance_check",
+            r"acceptance checks? (?:for|of) th(?:is|e) "
+            r"(?:section|draft|outline|piece)",
+        ),
+        # Self-reference required: "As an AI researcher, she ..." is prose.
+        ("as_an_ai", r"\bI(?:'m| am) an? AI\b|\b(?:as|being) an AI\b[,.]?(?:\s+I\b)"),
+        # Anchored to pipeline artifacts (the acceptance_check noun family):
+        # a bare "I cannot verify ..." blocked ordinary first-person prose
+        # ("I could not verify the figures with the registrar").
+        (
+            "cannot_verify",
+            r"I (?:cannot|can't|could not|couldn't) verify "
+            r"(?:this|that|the) (?:section|draft|outline|piece)\b",
+        ),
+        (
+            "no_access",
+            r"I (?:don't|do not) have access to (?:this|that|the) "
+            r"(?:section|draft|outline|piece)\b",
+        ),
+        ("outline_instructs", r"the outline (?:instructs|says|requires)"),
+        ("per_the_brief", r"per the brief's instructions"),
+        ("not_fact_checked", r"was not fact[- ]checked"),
+        ("evidence_labels_placeholder", r"evidence_labels\[\]"),
+        ("must_preserve_placeholder", r"must_preserve\[\]"),
+    )
+)
+
+#: The raw final non-empty line is a trailing source attribution when it
+#: matches this shape (per-element bracket handling: `Source: [D1]`,
+#: `Source: D12`, `Source: [S1], [W2].`). Checked on the RAW line because
+#: citation masking blanks the label text inside it.
+_TRAILING_SOURCE_RE = re.compile(
+    r"^Source:\s*(?:\[?[A-Za-z][0-9]{0,3}\]?)"
+    r"(?:\s*,\s*\[?[A-Za-z][0-9]{0,3}\]?)*\s*\.?$"
+)
+
+_ATX_HEADING_RE = re.compile(r"^#{1,6} .*$", re.MULTILINE)
+_H1_RE = re.compile(r"^# .*$", re.MULTILINE)
+# Unicode letters and digits (any script), joined on apostrophes so
+# contractions ("don't") count as one word. Digits are kept deliberately:
+# dropping them made paragraphs differing only in a number read as
+# duplicates, and a digits-only token such as "2021" still counts toward
+# the length rules (issue #1150 feedback round: ASCII-only tokenizer
+# silently disabled every word-based rule for non-Latin drafts).
+_WORD_RE = re.compile(r"[^\W_']+(?:['\u2019][^\W_']+)*", re.UNICODE)
+
+
+@dataclass(frozen=True)
+class SectionInput:
+    """One outline section's deterministic identity for the gate rules.
+
+    ``section_id``/``heading`` come from the outline entry and
+    ``budget_words`` is the entry's ``target_words``. Candidate heading
+    blocks map to these descriptors IN ORDER (heading text is a tiebreak
+    when the desks reworded or duplicated a heading); a candidate with no
+    ATX headings disables the section-scoped rules entirely.
+    """
+
+    section_id: str
+    heading: str
+    budget_words: int
+
+
+def _count_words(text: str) -> int:
+    """Length-rule word basis: letter/apostrophe runs over masked text.
+
+    Shares the standard exclusion masking (code, quotes, citations, front
+    matter) so markup never counts as prose.
+    """
+    return len(_WORD_RE.findall(mask_excluded_spans(text).masked))
+
+
+def _normalize_words(text: str) -> str:
+    """Case-folded, whitespace-collapsed, punctuation-stripped match key."""
+    return " ".join(word.casefold() for word in _WORD_RE.findall(text))
+
+
+@dataclass(frozen=True)
+class _TextBlock:
+    start: int
+    end: int
+    text: str
+
+
+def _split_blocks(masked_text: str) -> list[_TextBlock]:
+    """Non-empty blank-line-separated blocks with original offsets."""
+    blocks: list[_TextBlock] = []
+    for match in re.finditer(r"[^\n\s][^\n]*(?:\n(?!\s*\n)[^\n]*)*", masked_text):
+        raw = match.group(0)
+        if raw.strip():
+            blocks.append(_TextBlock(match.start(), match.end(), raw))
+    return blocks
+
+
+def _mask_texts_everywhere(text: str, texts: Sequence[str]) -> str:
+    """Blank EVERY occurrence of each protected text, same length.
+
+    SPEC §13.1 exempts must-preserve spans at ALL occurrences from the
+    duplicate rules, so the duplicate view is built from a locked-free
+    masked base and then blanks every occurrence of each protected text
+    (exact and whitespace-normalized matching).
+    """
+    if not texts:
+        return text
+    chars = list(text)
+    for protected in texts:
+        if not (protected and protected.strip()):
+            continue
+        exact = protected.strip()
+        pattern = re.compile(
+            r"\s+".join(re.escape(part) for part in exact.split())
+        )
+        for match in pattern.finditer(text):
+            for i in range(match.start(), match.end()):
+                chars[i] = " "
+    return "".join(chars)
+
+
+def _section_blocks(
+    masked_text: str, sections: Sequence[SectionInput]
+) -> list[tuple[SectionInput, _TextBlock]]:
+    """Map heading-delimited blocks to section inputs.
+
+    Mapping is by HEADING ORDINAL — the index over heading blocks only,
+    never the index over all blocks (a body paragraph between headings
+    would otherwise shift every later section onto the wrong budget).
+    Boundaries are discovered from ATX heading LINES, not blank-line
+    blocks: valid Markdown does not require a blank line before a heading,
+    and a heading glued to the preceding body must still start its own
+    section (issue #1150 feedback round 18). Heading text is matched first
+    so a document-level H1 title or sub-headings do not consume a section
+    slot; when no heading text matches, the first ``len(sections)``
+    heading lines map in order.
+    """
+    if not sections:
+        return []
+    heading_spans: list[tuple[int, str]] = [
+        (m.start(), m.group(1))
+        for m in re.finditer(r"^[ \t]*(#{1,6} .+)$", masked_text, re.MULTILINE)
+    ]
+    if not heading_spans:
+        return []
+
+    normalized_sections = {
+        _normalize_words(section.heading): section
+        for section in sections
+        if _normalize_words(section.heading)
+    }
+    boundaries: list[tuple[int, SectionInput]] = []
+    matched: list[tuple[int, SectionInput]] = []
+    used: set[str] = set()
+    for start, line in heading_spans:
+        section = normalized_sections.get(_normalize_words(_heading_text(line)))
+        if section is not None and section.section_id not in used:
+            matched.append((start, section))
+            used.add(section.section_id)
+    if matched:
+        # Text-match base: headings whose text names a planned section start
+        # that section. Reworded section headings must NOT lose their
+        # boundary (issue #1150 feedback round 2 — a partial text match used
+        # to discard every unmatched planned section, merging its body into
+        # the previous section's budget), so each remaining planned section
+        # is mapped from carrier candidates inside its OWN document segment:
+        # the span between the matched boundaries of its planned neighbours.
+        # Carrier candidates are at the matched heading level and never name
+        # a planned section: deeper levels are sub-headings, and a repeated
+        # heading text is a reference, not a new section. A document title
+        # before the first matched heading therefore belongs only to the
+        # segment of a section planned BEFORE that first match; unmatched
+        # sections cannot steal carriers across an exact match, and extra
+        # candidates inside a segment (sub-headings at the matched level)
+        # leave the first candidate carrying the section — a deterministic
+        # choice, with the residual that a front-matter heading inside the
+        # segment is indistinguishable from a reworded section heading.
+        matched_sorted = sorted(matched, key=lambda item: item[0])
+        first_start = matched_sorted[0][0]
+        matched_level = _heading_level(
+            next(line for start, line in heading_spans if start == first_start)
+        )
+        taken_starts = {start for start, _ in matched}
+        planned_pos = {
+            section.section_id: idx for idx, section in enumerate(sections)
+        }
+        matched_pos = {
+            section.section_id: planned_pos[section.section_id]
+            for _, section in matched
+        }
+        candidates = [
+            (start, line)
+            for start, line in heading_spans
+            if start not in taken_starts
+            and _heading_level(line) == matched_level
+            and _normalize_words(_heading_text(line)) not in normalized_sections
+        ]
+        boundaries.extend(matched)
+        for section in sections:
+            if section.section_id in used:
+                continue
+            pos = planned_pos[section.section_id]
+            before = [
+                start
+                for start, sec in matched_sorted
+                if matched_pos[sec.section_id] < pos
+            ]
+            after = [
+                start
+                for start, sec in matched_sorted
+                if matched_pos[sec.section_id] > pos
+            ]
+            seg_lo = max(before) if before else 0
+            seg_hi = min(after) if after else len(masked_text)
+            in_segment = [
+                (start, line)
+                for start, line in candidates
+                if seg_lo <= start < seg_hi
+            ]
+            if in_segment:
+                carrier_start, _carrier_line = in_segment[0]
+                candidates.remove(in_segment[0])
+                boundaries.append((carrier_start, section))
+        # Carriers may sit between matched boundaries; extents are built
+        # from neighbours, so boundaries must be in document order.
+        boundaries.sort(key=lambda item: item[0])
+    else:
+        for ordinal, (start, _line) in enumerate(heading_spans):
+            if ordinal < len(sections):
+                boundaries.append((start, sections[ordinal]))
+            else:
+                boundaries.append((start, sections[-1]))
+
+    out: list[tuple[SectionInput, _TextBlock]] = []
+    for i, (start, section_input) in enumerate(boundaries):
+        end = boundaries[i + 1][0] if i + 1 < len(boundaries) else len(masked_text)
+        out.append((section_input, _TextBlock(start, end, masked_text[start:end])))
+    return out
+
+
+def _heading_text(line: str) -> str:
+    """The heading words of an ATX heading line, ``#`` markers stripped."""
+    return line.strip().lstrip("#").strip()
+
+
+def _heading_level(line: str) -> int:
+    """The ATX level (number of leading ``#``) of a heading line."""
+    stripped = line.strip()
+    return len(stripped) - len(stripped.lstrip("#"))
+
+
+def _split_sentences(block_text: str) -> list[tuple[int, int, str]]:
+    """Sentence spans within one block (offsets relative to the block)."""
+    spans: list[tuple[int, int, str]] = []
+    for match in re.finditer(r"[^.!?\n]+[.!?]?", block_text):
+        sentence = match.group(0)
+        if sentence.strip():
+            spans.append((match.start(), match.end(), sentence))
+    return spans
+
+
+def _finding(
+    *,
+    rule_id: str,
+    severity: str,
+    section_id: str,
+    start: int,
+    end: int,
+    masked_text: str,
+    message: str,
+) -> LintFinding:
+    return LintFinding(
+        rule_id=rule_id,
+        severity=severity,  # type: ignore[arg-type]
+        disposition="open",
+        section_id=section_id,
+        start=start,
+        end=max(end, start + 1),
+        excerpt=masked_text[start : max(end, start + 1)],
+        message=message,
+        rule_version=QUALITY_GATES_RULE_VERSION,
+    )
+
+
+def _lint_quality_gates(
+    text: str,
+    masked: MaskedText,
+    *,
+    dup_masked: MaskedText,
+    section_id: str,
+    target_words: Optional[int],
+    sections: Sequence[SectionInput],
+    piece_title: str,
+) -> list[LintFinding]:
+    """The issue-#1150 blocker family (SPEC §13.1 as amended).
+
+    Length/heading/commentary rules read ``masked`` (all exclusions); the
+    duplicate and cross-section rules read ``dup_masked``, where
+    must-preserve spans are blanked at ALL occurrences (SPEC §13.1).
+    """
+    findings: list[LintFinding] = []
+    masked_text = masked.masked
+    dup_text = dup_masked.masked
+
+    # -- total length ----------------------------------------------------
+    # Band edges use scaled-integer comparisons (total * 100 vs target * band
+    # percent) so an exactly-at-band count is exact in binary floating point:
+    # 125 words against 100 is exactly +25 percent and passes BOTH rules.
+    if target_words is not None and target_words > 0:
+        total = _count_words(text)
+        scaled = total * 100
+        blocker_low = int(target_words * (100 - _LENGTH_BLOCKER_BAND * 100))
+        blocker_high = int(target_words * (100 + _LENGTH_BLOCKER_BAND * 100))
+        near_low = int(target_words * (100 - _LENGTH_NEAR_BAND * 100))
+        near_high = int(target_words * (100 + _LENGTH_NEAR_BAND * 100))
+        if scaled < blocker_low or scaled > blocker_high:
+            findings.append(
+                _finding(
+                    rule_id="length.total_words",
+                    severity="blocker",
+                    section_id=section_id,
+                    start=0,
+                    end=len(masked_text),
+                    masked_text=masked_text,
+                    message=(
+                        f"candidate is {total} words against a {target_words}-word "
+                        f"target (outside +/-{_LENGTH_BLOCKER_BAND:.0%})"
+                    ),
+                )
+            )
+        elif (
+            (scaled < near_low or scaled > near_high)
+            and blocker_low < scaled < blocker_high
+        ):
+                findings.append(
+                    _finding(
+                        rule_id="length.total_words_near",
+                        severity="advisory",
+                        section_id=section_id,
+                        start=0,
+                        end=len(masked_text),
+                        masked_text=masked_text,
+                        message=(
+                            f"candidate is {total} words against a "
+                            f"{target_words}-word target (outside +/-"
+                            f"{_LENGTH_NEAR_BAND:.0%})"
+                        ),
+                    )
+                )
+
+    # -- section budgets -------------------------------------------------
+    # Budgets read the STANDARD masked view: the duplicate view blanks every
+    # must-preserve occurrence, which would shrink section word counts and
+    # suppress legitimate over-budget blockers (issue #1150 feedback round 2).
+    # The duplicate view is reserved for the duplicate rules below.
+    budget_section_map = _section_blocks(masked_text, sections)
+    if budget_section_map:
+        floor = max(int(settings.draft_quality_section_floor_words), 0)
+        for section_input, block in budget_section_map:
+            budget = section_input.budget_words
+            if budget <= 0:
+                continue
+            words = len(_WORD_RE.findall(block.text))
+            threshold = max(
+                _SECTION_OVER_BUDGET_RATIO * budget, budget + floor
+            )
+            if words > threshold:
+                findings.append(
+                    _finding(
+                        rule_id="length.section_over_budget",
+                        severity="blocker",
+                        section_id=section_input.section_id,
+                        start=block.start,
+                        end=block.end,
+                        masked_text=masked_text,
+                        message=(
+                            f"section {section_input.section_id!r} is {words} "
+                            f"words against a {budget}-word budget (over "
+                            f"max(1.5x budget, budget + {floor}))"
+                        ),
+                    )
+                )
+
+    # -- duplication (hash + similarity) on the duplicate view ------------
+    paragraphs: list[_TextBlock] = []
+    for block in _split_blocks(dup_text):
+        first_line, sep, remainder = block.text.partition("\n")
+        if _ATX_HEADING_RE.match(first_line.strip()):
+            # A heading block participates only with its non-heading
+            # remainder (a heading glued to its body is one block, and the
+            # heading line itself is not prose). The paragraph anchor is the
+            # REMAINDER's own offset: a finding span or waiver bound must
+            # cover the duplicated prose, never the unrelated heading line.
+            if remainder.strip():
+                paragraphs.append(
+                    _TextBlock(
+                        block.start + len(first_line) + len(sep),
+                        block.end,
+                        remainder,
+                    )
+                )
+            continue
+        paragraphs.append(block)
+    seen_hash: dict[str, _TextBlock] = {}
+    hash_emitted = 0
+    for block in paragraphs:
+        if hash_emitted >= _MAX_DUPLICATE_FINDINGS:
+            break
+        key = _normalize_words(block.text)
+        if len(key.split()) < 2:
+            continue
+        if key in seen_hash:
+            hash_emitted += 1
+            first = seen_hash[key]
+            findings.append(
+                _finding(
+                    rule_id="duplication.paragraph_hash",
+                    severity="blocker",
+                    section_id=section_id,
+                    start=block.start,
+                    end=block.end,
+                    masked_text=masked_text,
+                    message=(
+                        "paragraph repeats the paragraph starting at offset "
+                        f"{first.start} verbatim (normalized)"
+                    ),
+                )
+            )
+        else:
+            seen_hash[key] = block
+    # Degenerate repetition-loop output can be huge; cap the pairwise
+    # comparisons and the emitted findings so one pathological candidate
+    # cannot produce hundreds of thousands of blockers in one lint pass
+    # (issue #1150 feedback round). Caps are deterministic (document order).
+    if len(paragraphs) > _MAX_SIMILARITY_PARAGRAPHS:
+        # Fail closed (issue #1150 feedback round 4): the bounded comparison
+        # below cannot cover paragraphs beyond the cap, and the SPEC §13.1
+        # duplicate contract has no size cutoff — a candidate too large to
+        # fully evaluate blocks instead of silently passing its unchecked
+        # tail.
+        unchecked = paragraphs[_MAX_SIMILARITY_PARAGRAPHS]
+        findings.append(
+            _finding(
+                rule_id="duplication.similarity_beyond_cap",
+                severity="blocker",
+                section_id=section_id,
+                start=unchecked.start,
+                end=unchecked.end,
+                masked_text=masked_text,
+                message=(
+                    f"candidate has {len(paragraphs)} paragraphs; the "
+                    "similarity gate compares at most the first "
+                    f"{_MAX_SIMILARITY_PARAGRAPHS}, so the duplicate "
+                    "contract cannot be evaluated whole — split or shorten "
+                    "the draft"
+                ),
+            )
+        )
+    similarity_candidates = [
+        (block, key)
+        for block in paragraphs[:_MAX_SIMILARITY_PARAGRAPHS]
+        for key in [_normalize_words(block.text)]
+        if len(_WORD_RE.findall(block.text)) >= _SIMILARITY_MIN_WORDS
+    ]
+    similarity_emitted = 0
+    for i in range(len(similarity_candidates)):
+        for j in range(i + 1, len(similarity_candidates)):
+            if similarity_emitted >= _MAX_DUPLICATE_FINDINGS:
+                break
+            a_block, a_key = similarity_candidates[i]
+            b_block, b_key = similarity_candidates[j]
+            if a_key == b_key:
+                continue  # already reported by the hash rule (same words)
+            a_words = frozenset(a_key.split())
+            b_words = frozenset(b_key.split())
+            if not a_words or not b_words:
+                continue
+            union = a_words | b_words
+            jaccard = len(a_words & b_words) / len(union) if union else 0.0
+            if jaccard >= _SIMILARITY_THRESHOLD and a_block.text.strip() != b_block.text.strip():
+                similarity_emitted += 1
+                findings.append(
+                    _finding(
+                        rule_id="duplication.paragraph_similarity",
+                        severity="blocker",
+                        section_id=section_id,
+                        start=b_block.start,
+                        end=b_block.end,
+                        masked_text=masked_text,
+                        message=(
+                            f"paragraph is {jaccard:.2f} similar by word set to "
+                            f"the paragraph starting at offset {a_block.start}"
+                        ),
+                    )
+                )
+
+    # -- cross-section duplicate sentences -------------------------------
+    # Runs on the duplicate view: must-preserve sentences are exempt at ALL
+    # occurrences (SPEC §13.1), so a preserved sentence repeated across
+    # sections never blocks.
+    cross_section_map = _section_blocks(dup_text, sections)
+    if cross_section_map:
+        occurrences: dict[str, tuple[str, int, int]] = {}
+        cross_emitted = 0
+        for section_input, block in cross_section_map:
+            if cross_emitted >= _MAX_DUPLICATE_FINDINGS:
+                break
+            body_start = block.start
+            for s_start, s_end, sentence in _split_sentences(block.text):
+                if cross_emitted >= _MAX_DUPLICATE_FINDINGS:
+                    break
+                if _ATX_HEADING_RE.match(sentence.strip()):
+                    continue
+                key = _normalize_words(sentence)
+                if len(key.split()) < _CROSS_SECTION_MIN_WORDS:
+                    continue
+                absolute = (body_start + s_start, body_start + s_end)
+                if key in occurrences:
+                    first_section = occurrences[key][0]
+                    if first_section != section_input.section_id:
+                        cross_emitted += 1
+                        findings.append(
+                            _finding(
+                                rule_id="duplication.cross_section_sentence",
+                                severity="blocker",
+                                section_id=section_input.section_id,
+                                start=absolute[0],
+                                end=absolute[1],
+                                masked_text=masked_text,
+                                message=(
+                                    "sentence of "
+                                    f"{len(key.split())} words repeats section "
+                                    f"{first_section!r} verbatim"
+                                ),
+                            )
+                        )
+                else:
+                    occurrences[key] = (
+                        section_input.section_id, absolute[0], absolute[1]
+                    )
+
+    # -- heading structure -----------------------------------------------
+    h1_matches = [m for m in _H1_RE.finditer(masked_text) if m.group(0).strip()]
+    # Section inputs justify their own headings: an outline that plans N
+    # sections may carry N H1 section headings, so the document-level defect
+    # is H1s beyond the expected structure (or any second H1 when the caller
+    # supplied no section model).
+    expected_h1 = max(len(tuple(sections)), 1)
+    if len(h1_matches) > expected_h1:
+        # Anchor the FIRST heading beyond the allowance: with N planned
+        # sections, h1_matches[1] is an allowed section heading, and binding
+        # the waiver span to it would invalidate the wrong heading.
+        extra = h1_matches[expected_h1]
+        findings.append(
+            _finding(
+                rule_id="structure.multiple_h1",
+                severity="blocker",
+                section_id=section_id,
+                start=extra.start(),
+                end=extra.end(),
+                masked_text=masked_text,
+                message=f"candidate carries {len(h1_matches)} H1 headings",
+            )
+        )
+    if piece_title.strip():
+        title_key = _normalize_words(piece_title)
+        if title_key:
+            for match in _ATX_HEADING_RE.finditer(masked_text):
+                heading = match.group(0).lstrip("#").strip()
+                if heading and _normalize_words(heading) == title_key:
+                    findings.append(
+                        _finding(
+                            rule_id="structure.heading_repeats_title",
+                            severity="blocker",
+                            section_id=section_id,
+                            start=match.start(),
+                            end=match.end(),
+                            masked_text=masked_text,
+                            message=(
+                                "heading repeats the piece title "
+                                f"{piece_title!r}"
+                            ),
+                        )
+                    )
+
+    # -- process commentary ------------------------------------------------
+    for phrase, pattern in PROCESS_COMMENTARY_PATTERNS:
+        for match in pattern.finditer(masked_text):
+            findings.append(
+                _finding(
+                    rule_id=f"process_commentary.{phrase}",
+                    severity="blocker",
+                    section_id=section_id,
+                    start=match.start(),
+                    end=match.end(),
+                    masked_text=masked_text,
+                    message=(
+                        "pipeline-instruction text leaked into the candidate: "
+                        f"{match.group(0)!r}"
+                    ),
+                )
+            )
+
+    # -- trailing source line (RAW final non-empty line) -------------------
+    stripped_tail = text.rstrip()
+    if stripped_tail:
+        final_start = stripped_tail.rfind("\n") + 1
+        final_line = stripped_tail[final_start:]
+        if _TRAILING_SOURCE_RE.match(final_line.strip()):
+            findings.append(
+                LintFinding(
+                    rule_id="process.trailing_source_line",
+                    severity="blocker",
+                    disposition="open",
+                    section_id=section_id,
+                    start=final_start,
+                    end=len(stripped_tail),
+                    excerpt=final_line,
+                    message=(
+                        "final line is a source attribution the prompts never "
+                        f"asked for: {final_line.strip()!r}"
+                    ),
+                    rule_version=QUALITY_GATES_RULE_VERSION,
+                )
+            )
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Entry point + offset restoration
 # ---------------------------------------------------------------------------
 
@@ -665,6 +1352,10 @@ def run_deterministic_lint(
     locked_spans: Sequence[tuple[int, int]] = (),
     rule_version: str = BOILERPLATE_RULE_VERSION,
     section_id: str = "",
+    target_words: Optional[int] = None,
+    sections: Sequence[SectionInput] = (),
+    piece_title: str = "",
+    preserve_texts: Sequence[str] = (),
 ) -> LintReport:
     """Run the full SPEC §13 deterministic lint contract over ``text``.
 
@@ -701,11 +1392,35 @@ def run_deterministic_lint(
         rule classes, in section/document order.
     """
     masked = mask_excluded_spans(text, locked_spans=locked_spans)
+    # Duplicate view: exclusion masking WITHOUT locked spans, then every
+    # occurrence of each protected text (locked-span texts + the outline's
+    # must_preserve texts) blanked — SPEC §13.1 exempts must_preserve spans
+    # at ALL occurrences from the duplicate rules. Same length as the
+    # candidate, so finding offsets stay valid against the original text.
+    dup_base = mask_excluded_spans(text, locked_spans=())
+    protected_texts = list(preserve_texts) + [
+        text[start:end] for start, end in locked_spans
+    ]
+    dup_masked = MaskedText(
+        masked=_mask_texts_everywhere(dup_base.masked, protected_texts),
+        spans=dup_base.spans,
+    )
     findings: list[LintFinding] = []
     findings.extend(_lint_boilerplate(masked.masked, section_id=section_id))
     findings.extend(_lint_review_vocabulary(masked.masked, section_id=section_id))
     findings.extend(_lint_structure_signal(masked.masked, section_id=section_id))
     findings.extend(_lint_readability_signal(masked.masked, section_id=section_id))
+    findings.extend(
+        _lint_quality_gates(
+            text,
+            masked,
+            dup_masked=dup_masked,
+            section_id=section_id,
+            target_words=target_words,
+            sections=tuple(sections),
+            piece_title=piece_title,
+        )
+    )
     findings.sort(key=lambda f: (f.start, f.end))
     report = LintReport(rule_version=rule_version, findings=findings)
     return restore_offsets(report, masked)
