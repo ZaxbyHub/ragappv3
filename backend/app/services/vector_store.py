@@ -2237,7 +2237,7 @@ class VectorStore:
                 await self.connect()
             if self.table is None:
                 try:
-                    table_names = await self.db.table_names()
+                    table_names = await _list_table_names(self.db)
                 except (OSError, RuntimeError, ValueError) as e:
                     raise VectorStoreConnectionError(
                         f"Failed to list table names: {e}"
