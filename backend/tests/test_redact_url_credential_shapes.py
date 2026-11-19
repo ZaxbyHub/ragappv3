@@ -316,6 +316,13 @@ def test_ac2_query_param_credentials_redacted():
     assert redact_url(
         f"redis://host.invalid:6379/0?password={MARKER_QUERY}#frag"
     ) == "redis://host.invalid:6379/0?password=***#frag"
+    # Implementation-review round 3: a "?" INSIDE the fragment is fragment
+    # text, not a query start (urlparse gives .query == "" here, and redis-py
+    # honors only the real query) — the whole URL must pass through
+    # unchanged.
+    assert redact_url("redis://host/#section?password=visible") == (
+        "redis://host/#section?password=visible"
+    ), "AC2: a ? inside the fragment is not a query parameter"
     # A query on a multi-host sentinel URL (fallback path) is redacted too.
     assert redact_url(
         f"redis+sentinel://:pw@h1:26379,h2:26379/mymaster/0"

@@ -67,7 +67,13 @@ def _redact_query_credentials(url: str) -> str:
     percent-encoding), unrelated parameters, their order, duplicate
     parameters, and any ``#fragment`` are preserved byte-for-byte.
     """
-    qpos = url.find("?")
+    # The query starts at the first "?" ONLY IF it precedes the fragment:
+    # a "?" after the "#" is fragment text (urlparse gives .query == "" for
+    # ``scheme://host/#section?password=x``), and redis-py honors only the
+    # real query — fragment bytes are preserved untouched.
+    fpos = url.find("#")
+    scope = url if fpos < 0 else url[:fpos]
+    qpos = scope.find("?")
     if qpos < 0:
         return url
     head, query = url[: qpos + 1], url[qpos + 1 :]
