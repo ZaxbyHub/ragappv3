@@ -560,6 +560,66 @@ class QualityReportReplayIdentityTest(unittest.TestCase):
             second = service.to_source_metadata(chunk, source_index=1)
             self.assertEqual(second.get("file_hash"), original_hash)
 
+        # Final-critic round-1 finding: the enrichment must actually RUN
+        # inside a running event loop. The earlier executor dispatch
+        # (run_in_executor(...).result() inside a live loop) always raised
+        # InvalidStateError, silently stamping the permanent None
+        # missing-marker in production. This leg drives the REAL
+        # RAGEngine._serialize_source_candidates — the production seam both
+        # the candidates and done serializations flow through — under a
+        # running loop and asserts the emitted source carries the
+        # files-table hash (behavioral, not structural).
+        with self.subTest(leg="running-loop-behavioral"):
+            import asyncio as _asyncio
+            import types
+
+            from app.services.rag_engine import RAGEngine
+            # Reset the replaced row so the behavioral leg observes the
+            # table hash independent of the write-once leg above.
+            loop_hash = "d" * 63 + "7"
+            self.conn.execute(
+                "UPDATE files SET file_hash = ? WHERE id = ?",
+                (loop_hash, self.c17_writetonce_file_id),
+            )
+            self.conn.commit()
+
+            loop_chunk = RAGSource(
+                text="Behavioral running-loop body.",
+                file_id=str(self.c17_writetonce_file_id),
+                score=0.4,
+                metadata={
+                    "source_file": "pinned.txt",
+                    "_chunk_id": "%d_5" % self.c17_writetonce_file_id,
+                },
+            )
+
+            async def _serialize_under_loop():
+                import contextlib
+
+                import app.services.rag_engine as rag_engine_mod
+
+                engine = types.SimpleNamespace(
+                    document_retrieval=service
+                )
+                real_get_pool = rag_engine_mod._get_pool
+
+                @contextlib.contextmanager
+                def _pool_yielding_test_conn():
+                    yield self.conn
+
+                rag_engine_mod._get_pool = lambda: types.SimpleNamespace(
+                    connection=_pool_yielding_test_conn
+                )
+                try:
+                    return RAGEngine._serialize_source_candidates(
+                        engine, [loop_chunk]
+                    )
+                finally:
+                    rag_engine_mod._get_pool = real_get_pool
+
+            emitted = _asyncio.run(_serialize_under_loop())
+            self.assertEqual(emitted[0].get("file_hash"), loop_hash)
+
 
 if __name__ == "__main__":
     unittest.main()

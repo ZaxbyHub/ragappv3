@@ -3931,7 +3931,7 @@ class RAGEngine:
     ) -> List[Dict[str, Any]]:
         """Serialize chunks exactly as done.sources does: to_source_metadata
         with 1-based source labels. evidence_type is NOT set here; it is a
-        done-time distinction assigned only to final sources.
+        done-time distinction assigned only for final sources.
 
         Issue #800 AC8 (F13d/F13e): the answer-time ``files.file_hash``
         snapshot is attached HERE — the final-source serialization seam both
@@ -3939,21 +3939,21 @@ class RAGEngine:
         filtering/window expansion by construction. ``attach_file_hashes``
         is write-once per chunk, so the second serialization (done sources)
         can never refresh a snapshot the first (candidates) took before a
-        files-table replacement. ONE batched SELECT, dispatched through the
-        default executor — never per-chunk queries on the event loop.
+        files-table replacement.
+
+        The enrichment is ONE batched SELECT (an IN clause over the final
+        chunk list's distinct file ids), executed synchronously. An earlier
+        revision dispatched it via ``run_in_executor(...).result()`` when a
+        loop was running — that returns an asyncio Future whose ``.result()``
+        raises ``InvalidStateError`` inside a running loop, silently stamping
+        every chunk with the permanent None missing-marker (final-critic
+        round 1); a synchronous bounded query is correct in every context
+        this sync method is invoked from.
         """
         try:
             pool = _get_pool()
-
-            def _attach() -> None:
-                with pool.connection() as conn:
-                    attach_file_hashes(relevant_chunks, conn)
-
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.get_running_loop().run_in_executor(None, _attach).result()
-            else:
-                _attach()
+            with pool.connection() as conn:
+                attach_file_hashes(relevant_chunks, conn)
         except Exception as exc:  # noqa: BLE001 — defensive
             # Enrichment must never break serialization: unenriched chunks
             # keep the explicit missing-marker (None) instead.
