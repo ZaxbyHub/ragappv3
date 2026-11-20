@@ -22,6 +22,8 @@ challenger), a vault for the org, and a RAGEngine over the temp DB with
 fake collaborators.
 """
 
+import sqlite3
+
 import pytest
 from c04_fixtures import fresh_db
 

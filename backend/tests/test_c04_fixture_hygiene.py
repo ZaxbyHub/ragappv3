@@ -9,40 +9,49 @@ Root cause (04-root-cause.md RC2): the A/B ``fresh_db`` fixtures bind
 (a pre-yield raise exits the fixture without any teardown).
 
 Method: drive the REAL fixture generator functions directly with a forced
-``run_migrations`` failure (the module-level name each fixture module
-imported is clobbered wherever it is bound), then assert (a) the ORIGINAL
-RuntimeError is the reported error and (b) no temp .db / temp dir remains
-(snapshot ``tempfile.gettempdir()`` before/after). The fixture is located
-via the test module first and, once AC6's dedup moves it into a shared
-home (conftest or a helper module — never another test module), via that
-home, so this check survives the dedup refactor.
+setup failure (the failure context clobbers the module-level name the
+fixture calls at the intended failure point), then assert (a) the ORIGINAL
+RuntimeError is the reported error and (b) every temp artifact the fixture
+itself created (recorded via the tempfile-constructor wrapper below) is
+removed. The fixture is located via the test module first and, once AC6's
+dedup moved the fixtures into the shared home, via that home.
 
-Frozen Phase 2.5 checks (arm's-length author; no fix code existed when
-these were written):
+Feedback FB-001 (PR-review run pr1174-review-202611191037, critic-merged
+IA-001+CC-001+TF-001+RP-001): leftover assertions scoped by RECORDING the
+exact tempfile.mkstemp/mkdtemp paths the fixture creates — never a
+before/after glob of the shared system tempdir. The PR's own CI round 1
+proved the glob-diff class is xdist-unsafe (foreign temp files flag as
+phantom leaks; the unscoped scrub deletes other workers' live artifacts);
+the recording pattern was already proven in this file for two probes and is
+now the ONLY pattern here — the glob snapshot helpers are gone, and every
+scrub deletes exactly the recorded paths.
 
-- AC4 — A/B ``fresh_db`` setup failure: original error + no temp DB.
-  RED at base (UnboundLocalError masks the error, temp DB left behind),
-  GREEN after the fix. ``test_c03b_prompt_resolution_edges`` is the
-  already-guarded control param (GREEN at base — it proves the probe
-  passes on a correct fixture, so the RED params are real).
-- AC5 — ``seeded_env`` setup failure: original error + no temp dir.
-  RED at base (temp dir left behind), GREEN after the fix. Covers the
-  frozen module test_c04_prompt_created_by.py (teardown-guard-only edit)
-  and the non-frozen test_c04_prompt_warning_contract.py.
+Frozen Phase 2.5 checks (arm's-length author; amendment waves recorded in
+repro/checkpoint.manifest):
+
+- AC4 — A/B ``fresh_db`` setup failure (run_migrations and
+  sqlite3.connect legs, sweep sites, class fixture): original error + no
+  recorded artifact left. RED at base (UnboundLocalError masks the error,
+  temp DB left behind), GREEN after the fix.
+  ``test_c03b_prompt_resolution_edges`` is the already-guarded control
+  param (GREEN at base — it proves the probe passes on a correct fixture).
+- AC5 — ``seeded_env`` setup failure (migration, pre-migration pool-cache,
+  issue645 ancestor, setup_db migration AND seed legs): original error +
+  no recorded dir left. RED at base, GREEN after the fix.
 - AC6 — the duplicated fixtures no longer have local definitions in the
-  non-frozen c04 modules (dedup into one shared place).
-  RED at base, GREEN after the fix.
+  non-frozen c04 modules (dedup into one shared home). RED at base, GREEN
+  after the fix.
 
 Standalone twin: .agents/issue-traces/1171-900-946-947-residuals-
-hygiene-sweep/repro/check_fixture_teardown.py drives the A/B shape
-without pytest for cheap replay.
+hygiene-sweep/repro/check_fixture_teardown.py drives the A/B shape without
+pytest for cheap replay.
 """
 
-import glob
 import importlib
 import inspect
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -52,20 +61,16 @@ import pytest
 
 PROBE_MARKER = "forced-setup-failure-946"
 
-# A/B fresh_db shape (AC4). The first three carry the defect the issues
-# name; the next four are the plan-critic round-1 sweep sites (same class,
-# executed-reproduced by the critic and folded into this PR's scope); the
-# c03b sibling is the already-guarded control (proves the probe passes on
-# a correct fixture).
+# A/B fresh_db shape (AC4). The first five carry the defect the issues name
+# or the plan-critic sweep found; the c03b sibling is the already-guarded
+# control (proves the probe passes on a correct fixture).
 AB_FRESH_DB_MODULES = [
     "test_c04_ab_exposure_failure",
     "test_c04_ab_lookup_failure",
     "test_prompt_ab_variants",
-    # Plan-critic round-1 additions (executed siblings of the same class):
     "test_prompt_versioning",
     "test_c03_orgless_prompt",
     "test_prompt_org_overrides",
-    # Already-guarded control:
     "test_c03b_prompt_resolution_edges",
 ]
 
@@ -92,12 +97,69 @@ NONFROZEN_DUPLICATED_DEFS = [
 _TESTS_DIR = Path(__file__).resolve().parent
 
 
-def _snapshot_db_files() -> set:
-    return set(glob.glob(os.path.join(tempfile.gettempdir(), "*.db")))
+@contextmanager
+def _recording_temp_artifacts():
+    """Record the EXACT temp artifacts (mkstemp files, mkdtemp dirs) created
+    during the drive, so leftover assertions are scoped to artifacts the
+    fixture itself created — never a before/after glob of the shared system
+    tempdir (feedback FB-001). tempfile is a process-global module, so the
+    constructor patch intercepts every ``tempfile.mkstemp``/``mkdtemp`` call
+    the fixture makes regardless of which module object it reached through;
+    both originals are restored in ``finally`` (exception-safe).
+    """
+    original_mkstemp = tempfile.mkstemp
+    original_mkdtemp = tempfile.mkdtemp
+    created: list = []
+
+    def recording_mkstemp(*args, **kwargs):
+        fd, path = original_mkstemp(*args, **kwargs)
+        created.append(("file", path))
+        return fd, path
+
+    def recording_mkdtemp(*args, **kwargs):
+        path = original_mkdtemp(*args, **kwargs)
+        created.append(("dir", path))
+        return path
+
+    try:
+        tempfile.mkstemp = recording_mkstemp
+        tempfile.mkdtemp = recording_mkdtemp
+        yield created
+    finally:
+        tempfile.mkstemp = original_mkstemp
+        tempfile.mkdtemp = original_mkdtemp
 
 
-def _snapshot_c04_dirs() -> set:
-    return set(glob.glob(os.path.join(tempfile.gettempdir(), "c04_*")))
+def _scrub_created(created):
+    """Remove recorded artifacts that still exist (feedback FB-012: a probe
+    must not persist the very leak it flags on a RED replay). Recorded paths
+    belong to the fixture the probe drove, so the scrub is scoped by
+    construction — unlike the pre-fix unscoped glob-diff delete."""
+    for kind, path in created:
+        if not os.path.exists(path):
+            continue
+        if kind == "dir":
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def _assert_created_gone(created, ac_prefix: str, context: str):
+    leftovers = [(kind, p) for kind, p in created if os.path.exists(p)]
+    assert leftovers == [], (
+        f"{ac_prefix}-LEFTOVER: {context} left temp artifact(s) behind on "
+        f"setup failure: {leftovers}"
+    )
+
+
+def _assert_created_nonempty(created, ac_prefix: str, context: str):
+    assert created, (
+        f"sanity: {context} created no temp artifacts during the drive "
+        f"(the recording wrapper is not intercepting — probe vacuous)"
+    )
 
 
 @contextmanager
@@ -128,13 +190,13 @@ def _forced_run_migrations_failure():
 
 @contextmanager
 def _forced_sqlite_connect_failure():
-    """Clobber sqlite3.connect with a raising probe (plan-critic round 1:
-    AC4 names BOTH the run_migrations and the sqlite3.connect failure
-    legs — a guard that only survives the first is half-fixed).
+    """Clobber sqlite3.connect with a raising probe (AC4 names BOTH the
+    run_migrations and the sqlite3.connect failure legs — a guard that only
+    survives the first is half-fixed).
 
-    Plan-critic round 2: sqlite3.connect is ALSO used inside run_migrations
-    (its internal connection carries kwargs like timeout=), so this leg
-    no-ops run_migrations everywhere it is bound — the fixture's own bare
+    sqlite3.connect is ALSO used inside run_migrations (its internal
+    connection carries kwargs like timeout=), so this leg no-ops
+    run_migrations everywhere it is bound — the fixture's own bare
     ``sqlite3.connect(path)`` call is then the ONLY failure point. The probe
     records every call's args/kwargs so the drive can assert the fixture's
     positional-only connect was actually reached."""
@@ -158,7 +220,9 @@ def _forced_sqlite_connect_failure():
         for module in list(sys.modules.values()):
             if getattr(module, "run_migrations", None) is migrations_original:
                 setattr(module, "run_migrations", migrations_noop)
-                patched.append((module, "run_migrations", migrations_original, migrations_noop))
+                patched.append(
+                    (module, "run_migrations", migrations_original, migrations_noop)
+                )
         sqlite3_mod.connect = connect_boom
         yield calls
     finally:
@@ -170,11 +234,9 @@ def _forced_sqlite_connect_failure():
 @contextmanager
 def _forced_pool_cache_failure():
     """Clobber app.models.database._pool_cache so the seeded_env setup's
-    pool-cache drain raises BEFORE run_migrations (plan-critic round 1: AC5
-    must exercise pre-migration setup too — the try/finally must wrap from
-    mkdtemp, not from run_migrations).
-
-    Plan-critic round 2: the probe delegates to the ORIGINAL dict for every
+    pool-cache drain raises BEFORE run_migrations (AC5 must exercise
+    pre-migration setup too — the try/finally must wrap from mkdtemp, not
+    from run_migrations). The probe delegates to the ORIGINAL dict for every
     operation except the FIRST items() call, so fixture teardown's normal
     pool-cache cleanup still works — the single injected failure is the
     realistic semantics, and any cleanup crash is the fixture's own defect,
@@ -218,10 +280,9 @@ def _unwrap_fixture(fn):
 
 def _resolve_fixture(test_module_name: str, fixture_name: str):
     """Locate the REAL fixture generator for a test module: its own
-    namespace first, then — once AC6's dedup lands — a shared home under
-    backend/tests (conftest or a helper module; never another test
-    module, so a frozen module keeping its own def cannot shadow the
-    shared one)."""
+    namespace first, then the shared home (c04_fixtures) the AC6 dedup
+    moved the fixtures into — never another test module, so a frozen module
+    keeping its own def cannot shadow the shared one."""
     mod = importlib.import_module(test_module_name)
     fn = getattr(mod, fixture_name, None)
     if fn is not None:
@@ -254,8 +315,7 @@ def _drive_setup_failure(
 ):
     """Run the fixture generator to (and past) its forced setup failure,
     requiring the ORIGINAL probe error to be the reported error. The
-    failure context defaults to the run_migrations clobber; plan-critic
-    round 1 added the sqlite3.connect and pre-migration pool-cache legs."""
+    failure context defaults to the run_migrations clobber."""
     kwargs = {}
     for param_name in inspect.signature(fixture).parameters:
         if param_name == "monkeypatch":
@@ -280,7 +340,7 @@ def _drive_setup_failure(
             gen.close()
             pytest.fail(
                 f"{ac_prefix}-NO-SETUP-FAILURE: {module_name} setup "
-                f"unexpectedly survived the forced run_migrations failure"
+                f"unexpectedly survived the forced setup failure"
             )
 
 
@@ -293,27 +353,18 @@ def _drive_setup_failure(
 def test_ab_fresh_db_setup_failure_cleans_up(module_name, monkeypatch):
     """AC4 (#946): a run_migrations failure during the A/B fresh_db
     fixture's setup must surface the ORIGINAL error and remove the temp
-    database. RED at base, GREEN after the fix."""
+    database. RED at base, GREEN after the fix. The leftover assertion is
+    recording-scoped (FB-001), not a shared-tempdir glob."""
     fixture = _resolve_fixture(module_name, "fresh_db")
-    before = _snapshot_db_files()
-    leftovers = []
-    try:
-        _drive_setup_failure(
-            fixture, monkeypatch, "AC4", f"{module_name}.fresh_db"
-        )
-        leftovers = sorted(_snapshot_db_files() - before)
-        assert leftovers == [], (
-            f"AC4-LEFTOVER-DB: {module_name}.fresh_db left temp DB file(s) "
-            f"behind on setup failure: {leftovers}"
-        )
-    finally:
-        # Best-effort scrub of anything the (unfixed) fixture leaked, so a
-        # RED base run does not snowball temp files across replays.
-        for path in leftovers or (_snapshot_db_files() - before):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+    with _recording_temp_artifacts() as created:
+        try:
+            _drive_setup_failure(
+                fixture, monkeypatch, "AC4", f"{module_name}.fresh_db"
+            )
+            _assert_created_nonempty(created, "AC4", f"{module_name}.fresh_db")
+            _assert_created_gone(created, "AC4", f"{module_name}.fresh_db")
+        finally:
+            _scrub_created(created)
 
 
 # ---------------------------------------------------------------------------
@@ -325,26 +376,24 @@ def test_ab_fresh_db_setup_failure_cleans_up(module_name, monkeypatch):
 def test_seeded_env_setup_failure_cleans_up(module_name, monkeypatch):
     """AC5 (#946/#900): a setup failure in a mkdtemp seeded_env fixture
     (before yield) must surface the ORIGINAL error and remove the temp
-    directory. RED at base, GREEN after the fix."""
+    directory. RED at base, GREEN after the fix. Recording-scoped
+    (FB-001)."""
     fixture = _resolve_fixture(module_name, "seeded_env")
-    before = _snapshot_c04_dirs()
-    leftovers = []
-    try:
-        _drive_setup_failure(
-            fixture, monkeypatch, "AC5", f"{module_name}.seeded_env"
-        )
-        leftovers = sorted(_snapshot_c04_dirs() - before)
-        assert leftovers == [], (
-            f"AC5-LEFTOVER-DIR: {module_name}.seeded_env left temp "
-            f"dir(s) behind on setup failure: {leftovers}"
-        )
-    finally:
-        for path in leftovers or (_snapshot_c04_dirs() - before):
-            shutil.rmtree(path, ignore_errors=True)
+    with _recording_temp_artifacts() as created:
+        try:
+            _drive_setup_failure(
+                fixture, monkeypatch, "AC5", f"{module_name}.seeded_env"
+            )
+            _assert_created_nonempty(
+                created, "AC5", f"{module_name}.seeded_env"
+            )
+            _assert_created_gone(created, "AC5", f"{module_name}.seeded_env")
+        finally:
+            _scrub_created(created)
 
 
 # ---------------------------------------------------------------------------
-# AC4/AC5 amendment legs (plan-critic round 1): the OTHER failure points
+# AC4/AC5 amendment legs: the OTHER failure points
 # ---------------------------------------------------------------------------
 
 
@@ -359,79 +408,71 @@ def test_seeded_env_setup_failure_cleans_up(module_name, monkeypatch):
 def test_ab_fresh_db_connect_failure_cleans_up(module_name, monkeypatch):
     """AC4 amendment (#946): AC1's issue text names BOTH the
     run_migrations and the sqlite3.connect failure legs; a conn=None guard
-    that only survives the first is half-fixed. Plan-critic round 2:
-    run_migrations is no-op'd during this leg so the fixture's OWN bare
-    sqlite3.connect(path) call is the failure point (the recorded calls
-    must include a positional-only connect — the migration path carries a
-    timeout kwarg). RED at base, GREEN after the fix."""
+    that only survives the first is half-fixed. run_migrations is no-op'd
+    during this leg so the fixture's OWN bare sqlite3.connect(path) call is
+    the failure point (the recorded calls must include a positional-only
+    connect — the migration path carries a timeout kwarg). RED at base,
+    GREEN after the fix. Recording-scoped (FB-001)."""
     fixture = _resolve_fixture(module_name, "fresh_db")
-    before = _snapshot_db_files()
-    leftovers = []
-    try:
-        with _forced_sqlite_connect_failure() as calls:
-            gen = fixture()
-            try:
-                next(gen)
-            except RuntimeError as exc:
-                assert PROBE_MARKER in str(exc), (
-                    f"AC4-ORIGINAL-ERROR-MASKED: {module_name}.fresh_db "
-                    f"reported an unexpected error on connect failure: {exc}"
-                )
-            else:
-                gen.close()
-                pytest.fail(
-                    f"AC4-NO-SETUP-FAILURE: {module_name}.fresh_db survived "
-                    f"the forced sqlite3.connect failure"
-                )
-        positional = [c for c in calls if not c[1]]
-        assert positional, (
-            "AC4-CONNECT-NOT-REACHED: the fixture's own positional "
-            "sqlite3.connect(path) was never reached (the failure fired "
-            f"elsewhere): calls={calls}"
-        )
-        leftovers = sorted(_snapshot_db_files() - before)
-        assert leftovers == [], (
-            f"AC4-LEFTOVER-DB: {module_name}.fresh_db left temp DB file(s) "
-            f"behind on sqlite3.connect failure: {leftovers}"
-        )
-    finally:
-        for path in leftovers or (_snapshot_db_files() - before):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+    with _recording_temp_artifacts() as created:
+        try:
+            with _forced_sqlite_connect_failure() as calls:
+                gen = fixture()
+                try:
+                    next(gen)
+                except RuntimeError as exc:
+                    assert PROBE_MARKER in str(exc), (
+                        f"AC4-ORIGINAL-ERROR-MASKED: {module_name}.fresh_db "
+                        f"reported an unexpected error on connect failure: "
+                        f"{exc}"
+                    )
+                else:
+                    gen.close()
+                    pytest.fail(
+                        f"AC4-NO-SETUP-FAILURE: {module_name}.fresh_db "
+                        f"survived the forced sqlite3.connect failure"
+                    )
+            positional = [c for c in calls if not c[1]]
+            assert positional, (
+                "AC4-CONNECT-NOT-REACHED: the fixture's own positional "
+                "sqlite3.connect(path) was never reached (the failure fired "
+                f"elsewhere): calls={calls}"
+            )
+            _assert_created_nonempty(
+                created, "AC4", f"{module_name}.fresh_db(connect)"
+            )
+            _assert_created_gone(
+                created, "AC4", f"{module_name}.fresh_db(connect)"
+            )
+        finally:
+            _scrub_created(created)
 
 
-@pytest.mark.parametrize(
-    "module_name",
-    ["test_c04_prompt_warning_contract", "test_c04_prompt_created_by"],
-)
+@pytest.mark.parametrize("module_name", SEEDED_ENV_MODULES)
 def test_seeded_env_pre_migration_failure_cleans_up(module_name, monkeypatch):
     """AC5 amendment (#946/#900): a failure DURING the pre-migration setup
     (the pool-cache drain runs after mkdtemp and before run_migrations)
     must also remove the temp dir — the try/finally must wrap from
-    mkdtemp, not from run_migrations. Plan-critic round 2: parametrized
-    over the frozen created_by module too (it is edited independently).
-    RED at base, GREEN after the fix."""
+    mkdtemp, not from run_migrations. RED at base, GREEN after the fix.
+    Recording-scoped (FB-001)."""
     fixture = _resolve_fixture(module_name, "seeded_env")
-    before = _snapshot_c04_dirs()
-    leftovers = []
-    try:
-        _drive_setup_failure(
-            fixture,
-            monkeypatch,
-            "AC5",
-            f"{module_name}.seeded_env",
-            failure_ctx=_forced_pool_cache_failure(),
-        )
-        leftovers = sorted(_snapshot_c04_dirs() - before)
-        assert leftovers == [], (
-            f"AC5-LEFTOVER-DIR: {module_name}.seeded_env left temp dir(s) "
-            f"behind on pre-migration setup failure: {leftovers}"
-        )
-    finally:
-        for path in leftovers or (_snapshot_c04_dirs() - before):
-            shutil.rmtree(path, ignore_errors=True)
+    with _recording_temp_artifacts() as created:
+        try:
+            _drive_setup_failure(
+                fixture,
+                monkeypatch,
+                "AC5",
+                f"{module_name}.seeded_env(pre-migration)",
+                failure_ctx=_forced_pool_cache_failure(),
+            )
+            _assert_created_nonempty(
+                created, "AC5", f"{module_name}.seeded_env(pre-migration)"
+            )
+            _assert_created_gone(
+                created, "AC5", f"{module_name}.seeded_env(pre-migration)"
+            )
+        finally:
+            _scrub_created(created)
 
 
 @pytest.mark.parametrize(
@@ -445,110 +486,86 @@ def test_seeded_env_pre_migration_failure_cleans_up(module_name, monkeypatch):
 def test_sweep_site_fresh_db_setup_failure_cleans_up(module_name, monkeypatch):
     """Plan-critic round-1 sweep sites (#946 class): the three additional
     modules with conn-inside-try fresh_db fixtures get the same behavioral
-    original-error + no-leftover proof as the issue-named files (the C4
-    main param already drives them; this leg exists so every fixed site
-    has a named, greppable probe). RED at base, GREEN after the fix."""
+    original-error + no-leftover proof as the issue-named files. RED at
+    base, GREEN after the fix. Recording-scoped (FB-001)."""
     fixture = _resolve_fixture(module_name, "fresh_db")
-    before = _snapshot_db_files()
-    leftovers = []
-    try:
-        _drive_setup_failure(fixture, monkeypatch, "AC4", f"{module_name}.fresh_db")
-        leftovers = sorted(_snapshot_db_files() - before)
-        assert leftovers == [], (
-            f"AC4-LEFTOVER-DB: {module_name}.fresh_db left temp DB file(s) "
-            f"behind on setup failure: {leftovers}"
-        )
-    finally:
-        for path in leftovers or (_snapshot_db_files() - before):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+    with _recording_temp_artifacts() as created:
+        try:
+            _drive_setup_failure(fixture, monkeypatch, "AC4", f"{module_name}.fresh_db")
+            _assert_created_nonempty(created, "AC4", f"{module_name}.fresh_db")
+            _assert_created_gone(created, "AC4", f"{module_name}.fresh_db")
+        finally:
+            _scrub_created(created)
 
 
 def test_multi_org_db_class_fixture_setup_failure_cleans_up(monkeypatch):
-    """Plan-critic round 2 (#946 class): the CLASS-scoped multi_org_db
-    fixture in test_prompt_org_overrides (TestMultiOrgPerQueryResolution)
-    is the second defect site in that module — the same guarded-teardown
+    """Plan-critic round 2 (#946 class): the multi_org_db fixture defined
+    on TestMultiOrgPerQueryResolution in test_prompt_org_overrides is the
+    second defect site in that module — the same guarded-teardown
     contract applies. RED at base, GREEN after the fix.
-
-    Plan-critic round 3: the unwrapped class-attribute function still
-    requires ``self``; bind it to an instance via types.MethodType before
-    driving (the production fixture signature is NOT altered)."""
+    Recording-scoped (FB-001)."""
     import types
 
     module = importlib.import_module("test_prompt_org_overrides")
     holder = getattr(module, "TestMultiOrgPerQueryResolution")
     fixture = types.MethodType(_unwrap_fixture(holder.multi_org_db), holder())
-    before = _snapshot_db_files()
-    leftovers = []
-    try:
-        _drive_setup_failure(
-            fixture, monkeypatch, "AC4", "test_prompt_org_overrides.multi_org_db"
-        )
-        leftovers = sorted(_snapshot_db_files() - before)
-        assert leftovers == [], (
-            f"AC4-LEFTOVER-DB: multi_org_db left temp DB file(s) behind on "
-            f"setup failure: {leftovers}"
-        )
-    finally:
-        for path in leftovers or (_snapshot_db_files() - before):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+    with _recording_temp_artifacts() as created:
+        try:
+            _drive_setup_failure(
+                fixture, monkeypatch, "AC4", "test_prompt_org_overrides.multi_org_db"
+            )
+            _assert_created_nonempty(
+                created, "AC4", "test_prompt_org_overrides.multi_org_db"
+            )
+            _assert_created_gone(
+                created, "AC4", "test_prompt_org_overrides.multi_org_db"
+            )
+        finally:
+            _scrub_created(created)
 
 
-def _snapshot_issue645_dirs() -> set:
-    return set(
-        glob.glob(os.path.join(tempfile.gettempdir(), "issue645_routes_*"))
-    )
-
-
-def _snapshot_tmp_artifacts() -> set:
-    """setup_db uses a bare tempfile.mkdtemp() (no prefix) — snapshot the
-    generic tmp* namespace around its probe."""
-    return set(glob.glob(os.path.join(tempfile.gettempdir(), "tmp*")))
-
-
-@contextmanager
-def _recording_mkddir(module):
-    """Record the exact temp dir a fixture's bare mkdtemp() creates, so the
-    leftover assertion is scoped to THAT dir — under xdist the shared /tmp
-    tmp* namespace is concurrently polluted by other workers' mkstemp files
-    and a glob diff is a false positive (CI round 1)."""
-    import tempfile as tempfile_mod
-
-    original = tempfile_mod.mkdtemp
-    created: list = []
-
-    def recording(*args, **kwargs):
-        path = original(*args, **kwargs)
-        created.append(path)
-        return path
-
-    try:
-        setattr(module.tempfile, "mkdtemp", recording)
-        yield created
-    finally:
-        setattr(module.tempfile, "mkdtemp", original)
+def test_issue645_mkddir_fixture_setup_failure_cleans_up(monkeypatch):
+    """Plan-critic round 2 (#946 class): the mkdtemp harness ANCESTOR in
+    test_issue645_converted_route_http.py has the same pre-yield exposure
+    (its temp prefix is issue645_routes_*, outside the c04_* glob, so it
+    gets its own probe). RED at base, GREEN after the fix.
+    Recording-scoped (FB-001): the leftover assertion and the finally scrub
+    both use the exact paths tempfile.mkdtemp created during the drive —
+    the pre-fix shared-tempdir glob diff is gone."""
+    module = importlib.import_module("test_issue645_converted_route_http")
+    fixture = _unwrap_fixture(module.seeded_env)
+    with _recording_temp_artifacts() as created:
+        try:
+            _drive_setup_failure(
+                fixture,
+                monkeypatch,
+                "AC5",
+                "test_issue645_converted_route_http.seeded_env",
+            )
+            _assert_created_nonempty(
+                created, "AC5", "test_issue645_converted_route_http.seeded_env"
+            )
+            _assert_created_gone(
+                created, "AC5", "test_issue645_converted_route_http.seeded_env"
+            )
+        finally:
+            _scrub_created(created)
 
 
 def test_org_overrides_setup_db_failure_cleans_up(monkeypatch):
-    """Implementation-review round 5 (#946 class): the autouse class fixture
-    setup_db in test_prompt_org_overrides (TestPromptOverrideAPIFixtures) is
-    the module's third mkdtemp site — the same original-error + no-leftover
-    contract applies to the migration leg (the SEED phase gets its own leg
-    below). RED at the pre-fix tree, GREEN after the fix. The leftover
-    assertion is scoped to the exact recorded mkdtemp dir (xdist-safe).
-    """
+    """Feedback FB-001 scope extension (#946 class): the autouse class
+    fixture setup_db in test_prompt_org_overrides
+    (TestPromptOverrideAPIFixtures) is the module's third mkdtemp site —
+    the same original-error + no-leftover contract applies to the migration
+    leg (the SEED phase gets its own leg below). RED at the pre-fix tree,
+    GREEN after the fix. Recording-scoped — the probe asserts the EXACT
+    mkdtemp dir the fixture created is gone (never a shared-tempdir glob)."""
     import types
 
     module = importlib.import_module("test_prompt_org_overrides")
     holder = getattr(module, "TestPromptOverrideAPIFixtures")
     fixture = types.MethodType(_unwrap_fixture(holder.setup_db), holder())
-
-    with _recording_mkddir(module) as created:
+    with _recording_temp_artifacts() as created:
         try:
             _drive_setup_failure(
                 fixture,
@@ -556,84 +573,109 @@ def test_org_overrides_setup_db_failure_cleans_up(monkeypatch):
                 "AC5",
                 "test_prompt_org_overrides.setup_db",
             )
-        except Exception:  # noqa: BLE001 — the drive asserts internally
-            pass
-        assert created, "sanity: setup_db created its temp dir"
-        for path in created:
-            assert not os.path.exists(path), (
-                f"AC5-LEFTOVER-DIR: setup_db left {path} behind on setup "
-                "failure"
+            _assert_created_nonempty(
+                created, "AC5", "test_prompt_org_overrides.setup_db"
             )
+            _assert_created_gone(
+                created, "AC5", "test_prompt_org_overrides.setup_db"
+            )
+        finally:
+            _scrub_created(created)
+
+
+@contextmanager
+def _forced_hash_failure(module):
+    """Clobber the module's hash_password so the seed phase (which opens
+    the sqlite connection FIRST, then hashes) fails AFTER
+    sqlite3.connect — the leg that makes the nested conn.close() load
+    bearing."""
+    original = module.hash_password
+
+    def boom(*args, **kwargs):
+        raise RuntimeError(PROBE_MARKER)
+
+    try:
+        module.hash_password = boom
+        yield
+    finally:
+        module.hash_password = original
+
+
+@contextmanager
+def _capturing_sqlite_connect():
+    """Capture every sqlite3.connect return value created during the drive
+    (feedback FB-002): the seed connection is the LAST one opened before the
+    forced hash failure, and asserting it is CLOSED afterwards is the
+    platform-independent discriminator for the nested conn.close() — the
+    dir-removal signal alone is Windows-only (POSIX rmtree succeeds with the
+    fd open)."""
+    import sqlite3 as sqlite3_mod
+
+    original = sqlite3_mod.connect
+    captured: list = []
+
+    def recording_connect(*args, **kwargs):
+        conn = original(*args, **kwargs)
+        captured.append(conn)
+        return conn
+
+    try:
+        sqlite3_mod.connect = recording_connect
+        yield captured
+    finally:
+        sqlite3_mod.connect = original
 
 
 def test_org_overrides_setup_db_seed_failure_closes_conn(monkeypatch):
-    """Round-6 reviewer question (#946 class): the SEED phase of the same
-    setup_db fixture — hash_password raises AFTER sqlite3.connect, so the
-    nested conn.close() in the finally must run before the outer rmtree
-    (an open handle can block directory removal on Windows and
-    ignore_errors would hide it). RED if the nested close is deleted,
-    GREEN with it.
-    """
+    """Feedback FB-002 (#946 class): the SEED phase of the same setup_db
+    fixture — hash_password raises AFTER sqlite3.connect — must close the
+    connection in the fixture's nested finally BEFORE the outer rmtree. The
+    discriminator is PLATFORM-INDEPENDENT: after the drive, the captured
+    seed connection must be closed (execute raises ProgrammingError); a
+    deleted nested close leaves it open on EVERY platform, so the mutant
+    that round-6's review asked about goes RED here on Linux CI too (the
+    dir-removal signal alone is Windows-only). RED without the nested
+    close, GREEN with it. Recording-scoped (FB-001)."""
     import types
-    from contextlib import contextmanager
 
     module = importlib.import_module("test_prompt_org_overrides")
     holder = getattr(module, "TestPromptOverrideAPIFixtures")
     fixture = types.MethodType(_unwrap_fixture(holder.setup_db), holder())
-
-    @contextmanager
-    def _forced_hash_failure():
-        original = module.hash_password
-
-        def boom(*args, **kwargs):
-            raise RuntimeError(PROBE_MARKER)
-
+    with _recording_temp_artifacts() as created:
         try:
-            module.hash_password = boom
-            yield
-        finally:
-            module.hash_password = original
-
-    with _recording_mkddir(module) as created:
-        _drive_setup_failure(
-            fixture,
-            monkeypatch,
-            "AC5",
-            "test_prompt_org_overrides.setup_db(seed)",
-            failure_ctx=_forced_hash_failure(),
-        )
-        assert created, "sanity: setup_db created its temp dir"
-        for path in created:
-            assert not os.path.exists(path), (
-                f"AC5-LEFTOVER-DIR: setup_db left {path} behind on seed "
-                "failure (conn not closed before rmtree)"
+            with _capturing_sqlite_connect() as conns:
+                with _forced_hash_failure(module):
+                    _drive_setup_failure(
+                        fixture,
+                        monkeypatch,
+                        "AC5",
+                        "test_prompt_org_overrides.setup_db(seed)",
+                        failure_ctx=_forced_hash_failure(module),
+                    )
+            assert conns, (
+                "sanity: the seed phase opened a sqlite connection "
+                "(the capture wrapper is not intercepting — probe vacuous)"
             )
-
-
-def test_issue645_mkddir_fixture_setup_failure_cleans_up(monkeypatch):
-    """Plan-critic round 2 (#946 class): the mkdtemp harness ANCESTOR in
-    test_issue645_converted_route_http.py has the same pre-yield exposure
-    (its temp prefix is issue645_routes_*, outside the c04_* glob, so it
-    gets its own snapshot). RED at base, GREEN after the fix."""
-    module = importlib.import_module("test_issue645_converted_route_http")
-    fixture = _unwrap_fixture(module.seeded_env)
-    before = _snapshot_issue645_dirs()
-    leftovers = []
-    try:
-        _drive_setup_failure(
-            fixture,
-            monkeypatch,
-            "AC5",
-            "test_issue645_converted_route_http.seeded_env",
-        )
-        leftovers = sorted(_snapshot_issue645_dirs() - before)
-        assert leftovers == [], (
-            f"AC5-LEFTOVER-DIR: issue645 seeded_env left temp dir(s) behind "
-            f"on setup failure: {leftovers}"
-        )
-    finally:
-        for path in leftovers or (_snapshot_issue645_dirs() - before):
-            shutil.rmtree(path, ignore_errors=True)
+            _assert_created_nonempty(
+                created, "AC5", "test_prompt_org_overrides.setup_db(seed)"
+            )
+            _assert_created_gone(
+                created, "AC5", "test_prompt_org_overrides.setup_db(seed)"
+            )
+            seed_conn = conns[-1]
+            try:
+                seed_conn.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                pass  # closed — the fixture's nested finally ran
+            else:
+                pytest.fail(
+                    "AC5-CONN-LEFT-OPEN: the seed connection was not closed "
+                    "before teardown — the nested conn.close() is load "
+                    "bearing on every platform (a deleted close ships green "
+                    "through CI's dir-removal signal)"
+                )
+        finally:
+            _scrub_created(created)
 
 
 # ---------------------------------------------------------------------------
@@ -657,21 +699,10 @@ def test_nonfrozen_c04_modules_do_not_define_duplicated_fixtures():
         f"their own copies of the shared fixtures (dedup not landed): "
         f"{offenders}"
     )
-    holders = [
-        p.name
-        for p in _TESTS_DIR.rglob("*.py")
-        if "def seeded_env(" in p.read_text(encoding="utf-8")
-    ]
-    assert holders, (
-        "AC6-SHARED-HOME-MISSING: no module under backend/tests defines "
-        "seeded_env any more (the fixture was deleted rather than shared)"
-    )
-    # Plan-critic round 1: the shared home must be c04_fixtures.py
-    # SPECIFICALLY (the frozen created_by module also defines seeded_env,
-    # so the holders check alone cannot prove the shared home exists), it
-    # must provide all THREE shared fixtures, and the converted modules'
-    # imported objects must ORIGINATE there (an import from anywhere else
-    # would satisfy the no-local-def census without a single home).
+    # Feedback UR-001 disposition evidence: this census IS the mechanical
+    # tripwire for duplicate-fixture re-introduction in the F811-ignored
+    # modules — the lint ignore is necessary (parameter shadowing) and the
+    # behavioral guard lives here.
     import c04_fixtures as shared_home
 
     for fixture_name in ("fresh_db", "seeded_env", "prompts_client"):

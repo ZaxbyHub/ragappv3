@@ -16,6 +16,8 @@ control+challenger versions, split_pct=100 experiment, vault, RAGEngine
 over the temp DB with fake collaborators).
 """
 
+import sqlite3
+
 import pytest
 from c04_fixtures import fresh_db
 

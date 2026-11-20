@@ -34,6 +34,7 @@ pytest for cheap replay.
 import asyncio
 import logging
 import re
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -543,12 +544,11 @@ def test_preserving_no_credential_passthrough_and_multihost():
     GREEN at base, must stay GREEN after the fix.
 
     Plan-critic round 1 (amend wave): the non-credential boundary cases —
-    empty userinfo (``@host`` with no username), port-only netlocs, and
-    the pre-existing lossy malformed-port rebuild — are pinned so the new
-    fail-closed arms cannot over-mask (the first two stay byte-identical;
-    the malformed-port lossy rebuild is pinned AS-IS to document that the
-    username-only fix introduces no NEW lossy behavior — it is a
-    disclosed pre-existing residual owned by this assertion).
+    empty userinfo (``@host`` with no username) and port-only netlocs — are
+    pinned so the new fail-closed arms cannot over-mask. The malformed-port
+    lossy rebuild was FIXED in the feedback round (raw-netloc-tail rebuild
+    preserves the port text); the fidelity pin below replaces the old
+    lossy pin.
     """
     assert redact_url("redis://redis.invalid:6379/0") == (
         "redis://redis.invalid:6379/0"
@@ -564,7 +564,405 @@ def test_preserving_no_credential_passthrough_and_multihost():
     )
     # Port-only netloc: the digits-only token is a port, unchanged.
     assert redact_url("redis://:6379") == "redis://:6379"
-    # Pre-existing lossy malformed-port rebuild for user:pass@ shapes:
-    # pinned as-is (the username-only arm must NOT route through this
-    # lossy rebuild — see AC1's exact-output assertions).
-    assert redact_url("redis://:pw@host:notaport/0") == "redis://:***@host/0"
+    # Malformed-port fidelity (feedback FB-003/ST-003 fix): the structured
+    # rebuild now re-renders from the RAW netloc tail, so the port TEXT is
+    # preserved (previously dropped) and IPv6 brackets survive.
+    assert redact_url("redis://:pw@host:notaport/0") == (
+        "redis://:***@host:notaport/0"
+    )
+
+def test_ac1_userinfo_at_sign_fully_masked():
+    """AC1 amend (feedback FB-003, PR-review ST-001/ST-002/AS-001): userinfo
+    credentials whose token carries a raw ``@`` are masked through the LAST
+    ``@`` (urlsplit rpartition semantics — the same parse redis-py uses), on
+    both the structured single-host path and the multi-host/username-only
+    fallback paths. RED before the fix (tails ``ss``/``ken`` leaked), GREEN
+    after.
+    """
+    assert redact_url("redis://svc:p@ss@redis:6379/0") == (
+        "redis://svc:***@redis:6379/0"
+    ), "AC1: single-host pair password containing @ must mask fully"
+    assert redact_url(
+        "redis+sentinel://svc:p@ss@h1:26379,h2:26379/mymaster/0"
+    ) == "redis+sentinel://svc:***@h1:26379,h2:26379/mymaster/0", (
+        "AC1: multi-host sentinel pair password containing @ must mask fully"
+    )
+    assert redact_url("redis://to@ken@redis:6379/0") == (
+        "redis://***@redis:6379/0"
+    ), "AC1: username-only token containing @ must mask fully"
+    assert redact_url(
+        "redis+sentinel://to@ken@h1:26379,h2:26379/0"
+    ) == "redis+sentinel://***@h1:26379,h2:26379/0", (
+        "AC1: multi-host username-only token containing @ must mask fully"
+    )
+    # Query/path @ characters still cannot feed the arms.
+    assert redact_url("redis://to@ken@redis:6379/0?email=a@b") == (
+        "redis://***@redis:6379/0?email=a@b"
+    ), "AC1: a query @ stays untouched while the userinfo token masks fully"
+
+
+def test_ac1_ipv6_and_port_fidelity():
+    """AC1 amend (feedback ST-003 + lossy-port fix): the structured rebuild
+    re-renders from the RAW netloc tail, so IPv6 brackets survive and a
+    malformed port's TEXT is preserved (the credential is still masked).
+    The bracket-drop and port-drop outputs were the pre-fix behavior.
+    """
+    assert redact_url("rediss://user:pass@[::1]:6379/0") == (
+        "rediss://user:***@[::1]:6379/0"
+    ), "AC1: IPv6 brackets must survive pair masking"
+    assert redact_url("redis://user:pass@[2001:db8::1]/0") == (
+        "redis://user:***@[2001:db8::1]/0"
+    ), "AC1: full IPv6 host text must survive pair masking"
+    assert redact_url("redis://user:pass@[::1]:6379/0?x=1") == (
+        "redis://user:***@[::1]:6379/0?x=1"
+    ), "AC1: bracket fidelity holds with a query attached"
+
+
+def test_ac2_bracket_malformed_fail_closed():
+    """AC2 amend (feedback FB-008/PO-001): urlsplit raises ValueError on
+    bracket-malformed IPv6 netlocs; the helper must NEVER raise (logging-path
+    contract) and must mask the credential-shaped span fail-closed instead of
+    echoing it. RED at the pre-fix tree (raw ValueError), GREEN after.
+    """
+    assert redact_url("redis://:pw@[::1") == "redis://:***@[::1", (
+        "AC2: bracket-malformed leading-colon netloc must mask fail-closed"
+    )
+    assert redact_url("redis://:pw@[zz]") == "redis://:***@[zz]", (
+        "AC2: bracket-malformed non-IPv6 token must mask fail-closed"
+    )
+    assert redact_url("redis://user:pass@[::1") == "redis://user:***@[::1", (
+        "AC2: bracket-malformed pair netloc must mask fail-closed"
+    )
+
+
+def test_ac2_fail_closed_tail_preserved():
+    """AC2 amend (feedback FB-005/ST-004/CS-001): the fail-closed
+    ``:<token>`` arm masks the token but PRESERVES the path/query that
+    follows the netloc (pre-fix behavior dropped everything after the
+    token). RED at the pre-fix tree (tail dropped), GREEN after.
+    """
+    assert redact_url("redis://:sup3rs3cretpw1171/0?db=1") == (
+        "redis://:***/0?db=1"
+    ), "AC2: fail-closed masking must preserve the post-netloc tail"
+    assert redact_url("redis://:sup3rs3cretpw1171") == "redis://:***", (
+        "AC2: the tail-less shape stays exact"
+    )
+
+
+def test_ac2_qmark_hash_password_documented():
+    """AC2 amend (feedback FB-004/ST-005, Stage B re-gate): a password span
+    crossing an unescaped ``?``/``#`` is masked FAIL-CLOSED — the issue's
+    malformed-shape demand (#1171) — with the URL tail after the delimiter
+    preserved. Credential-free port+query shapes
+    (``redis://host:6379?email=a@b``) stay untouched via the digits rule.
+    Pins the behavior AND the function docstring's fail-closed-arm sentence
+    so the pin and the contract cannot drift apart.
+    """
+    import app.utils.secrets as secrets_module
+
+    assert redact_url("redis://user:hunter2?x@host:6379/0") == (
+        "redis://user:***@host:6379/0"
+    ), "AC2: the ?-in-password span must mask fail-closed, tail preserved"
+    assert redact_url("redis://user:hunter2#x@host:6379/0") == (
+        "redis://user:***@host:6379/0"
+    ), "AC2: the #-in-password span must mask fail-closed, tail preserved"
+    assert "password spans that cross" in secrets_module.redact_url.__doc__, (
+        "AC2: the function docstring must carry the qmark/hash fail-closed "
+        "sentence so the pin and the contract cannot drift apart"
+    )
+
+
+def test_ac1_consecutive_at_username_masked():
+    """Stage B re-gate: consecutive ``@`` inside a username-only token.
+    urlsplit's rpartition makes ``to@@ken`` the username (the empty token
+    between the @s belongs to the userinfo), so the WHOLE userinfo must
+    mask — the pre-fix arm stopped at the first empty token and leaked
+    ``@ken``."""
+    out = redact_url("redis://to@@ken@host/0")
+    assert out == "redis://***@host/0", (
+        f"AC1: consecutive-@ username must mask fully, got {out!r}"
+    )
+
+
+def test_ac2_degenerate_at_userinfo_passthrough():
+    """An EMPTY single-``@`` userinfo carries no credential bytes (urlsplit
+    yields username None) and must pass through byte-for-byte — the
+    masking arms must not corrupt credential-free URLs. A DOUBLE ``@``
+    (``redis://@@host``) is NOT degenerate: urlsplit's rpartition makes
+    ``@`` a non-empty username, so it masks (Stage B F-003 edge)."""
+    for url in ("redis://@host", "redis://@host/0"):
+        out = redact_url(url)
+        assert out == url, (
+            f"AC2: empty-@ userinfo {url!r} must pass through, got {out!r}"
+        )
+    assert redact_url("redis://@@host") == "redis://***@host", (
+        "AC2: double-@ userinfo (username '@') must mask"
+    )
+
+
+def test_ac2_multihost_qmark_query_preserved():
+    """Stage B NEW-3: the qmark/hash arm must not reinterpret an
+    already-masked multi-host userinfo — the host list and query of
+    ``redis+sentinel://user:pw@h1,h2?email=a@b`` stay intact while the
+    password masks."""
+    out = redact_url("redis+sentinel://user:pw@h1,h2?email=a@b")
+    assert out == "redis+sentinel://user:***@h1,h2?email=a@b", (
+        f"AC2: multi-host + query-@ must preserve host list and query, "
+        f"got {out!r}"
+    )
+
+
+def test_ac2_query_at_anchor_userinfo_masked():
+    """Stage B NEW-2: a query value containing ``@`` must not consume the
+    ``@`` the userinfo arms anchor on — the userinfo password masks even
+    when the query credential is redacted first is NOT the order (userinfo
+    arms run first)."""
+    out = redact_url("redis://user:hunter2?password=x@host")
+    assert "hunter2" not in out, (
+        f"AC2: userinfo password must not survive a query-@ shape: {out!r}"
+    )
+    assert out == "redis://user:***@host", (
+        f"AC2: query-@ shape must mask fail-closed, got {out!r}"
+    )
+
+
+def test_ac2_query_scan_linear_with_late_equals():
+    """Stage B F-006 residual: a long '='-less FIRST parameter followed by
+    a LATER parameter carrying '=' must stay linear — the segment scan
+    must not backtrack across the long token."""
+    url = f"redis://host:6379/0?{'k' * 100_000}&x=1"
+    t0 = time.perf_counter()
+    out = redact_url(url)
+    elapsed = time.perf_counter() - t0
+    assert out == url, "AC2: non-credential segments must pass through"
+    assert elapsed < 0.5, (
+        f"AC2: late-'=' parameter must stay off the quadratic path, "
+        f"took {elapsed:.3f}s"
+    )
+
+
+def test_ac2_qmark_hash_pair_fail_closed():
+    """#1171 scope (Stage B): a password span crossing ``?``/``#`` is
+    masked fail-closed — the pre-delimiter ``user:token`` shape is
+    credential-shaped — not echoed verbatim."""
+    for url in ("redis://user:hunter2?x@host", "redis://user:hunter2#frag@host"):
+        out = redact_url(url)
+        assert out.startswith("redis://user:***@"), (
+            f"AC2: qmark/hash password span must mask fail-closed, got {out!r}"
+        )
+
+
+def test_ac2_digits_port_qmark_passthrough():
+    """The digits rule keeps credential-free URLs intact: an all-digits
+    token before ``?`` is a port plus a query, not a password."""
+    url = "redis://host:6379?email=a@b"
+    out = redact_url(url)
+    assert out == url, (
+        f"AC2: port+query must pass through byte-for-byte, got {out!r}"
+    )
+
+
+def test_ac2_lessequals_guard_fragment():
+    """F-006 residual (Stage B): the '='-absence fast-path guard must see
+    the QUERY alone — a long '='-less query followed by a fragment that
+    merely CONTAINS '=' must not defeat the guard into the quadratic scan."""
+    long_query = "k" * 100_000
+    url = f"redis://host:6379/0?{long_query}#x=y"
+    t0 = time.perf_counter()
+    out = redact_url(url)
+    elapsed = time.perf_counter() - t0
+    assert out == url, f"AC2: '='-less query + '='-fragment must pass through, got {out[:80]!r}"
+    assert elapsed < 0.5, (
+        f"AC2: '='-less query + '='-fragment must stay off the quadratic "
+        f"path, took {elapsed:.3f}s"
+    )
+
+
+def test_ac2_qmark_cross_multi_at_masked():
+    """Stage B NEW-4: a crossed password span with MULTIPLE inner ``@``s
+    (``redis://user:secret?part@TAILSECRET@host``) masks WHOLE — urlsplit's
+    netloc terminates at the first ``?``, so without the crossed-span arm
+    the structured rebuild leaves ``TAILSECRET@host`` verbatim in the
+    rendered query. The arm masks through the LAST ``@`` of the pre-``/``
+    segment; the digits rule keeps ``redis://host:6379?email=a@b`` intact."""
+    out = redact_url("redis://user:secret?part@TAILSECRET@host")
+    assert "TAILSECRET" not in out and "part" not in out, (
+        f"AC2: multi-@ crossed password must mask whole, got {out!r}"
+    )
+    assert out == "redis://user:***@host", (
+        f"AC2: crossed span must mask through the last @, got {out!r}"
+    )
+    # Mixed delimiters inside the crossed span (?..# and #..?) mask whole too
+    # (Stage B NEW-5), as do slash-crossed spans (Stage B NEW-6): the arm is
+    # prefix-regex + last-@ search, delimiter-agnostic up to the URL's last @.
+    for shape in (
+        "redis://user:secret?part#TAILSECRET@host",
+        "redis://user:secret#part?TAILSECRET@host",
+        "redis://user:secret?part#TAILSECRET@[::1",
+        "redis://user:secret/x@TAILSECRET@host",
+        "redis://user:secret/a/b@TAILSECRET@host",
+    ):
+        out = redact_url(shape)
+        assert "TAILSECRET" not in out and out.startswith("redis://user:***@"), (
+            f"AC2: mixed/slash-delimiter crossed span must mask whole, got {out!r}"
+        )
+    assert redact_url("redis://host:6379?email=a@b") == (
+        "redis://host:6379?email=a@b"
+    ), "AC2: digits rule must keep port+query passthrough intact"
+    assert redact_url("redis://user:123/secret@host") == (
+        "redis://user:123/secret@host"
+    ), "AC2: digits rule must keep the documented name:digits/path@ shape intact"
+    # Stage B NEW-7: a later path/query @ must NOT be consumed as the
+    # credential separator — the host/path/query tail survives.
+    for shape in (
+        "redis://user:secret/x@host/0?email=a@b",
+        "redis://user:secret?part@host/0?email=a@b",
+    ):
+        out = redact_url(shape)
+        assert out == "redis://user:***@host/0?email=a@b", (
+            f"AC2: crossed span must end before host/path/query text, got {out!r}"
+        )
+    # Stage B F-006 dense-:// residual: an @-free dense-:// input stays off
+    # the quadratic fallback scans entirely (the @-presence gate).
+    dense = "redis://" + ("a://" * 20000)
+    t0 = time.perf_counter()
+    out = redact_url(dense)
+    elapsed = time.perf_counter() - t0
+    assert out == dense, "AC2: @-free dense-:// input must pass through"
+    assert elapsed < 0.5, (
+        f"AC2: dense-:// input must stay linear, took {elapsed:.3f}s"
+    )
+
+
+def test_ac2_orphaned_query_after_cross_masked():
+    """Closeout review: a crossed-span/qmark mask can consume the original
+    ``?`` together with a query ``@`` — the orphaned parameters after the
+    final ``@`` must still get the credential-key redaction
+    (``redis://host:bad?password=x@y&password=SECRET`` leaves
+    ``&password=***``, never ``SECRET``)."""
+    out = redact_url("redis://host:bad?password=x@y&password=SECRET")
+    assert "SECRET" not in out, (
+        f"AC2: orphaned query credential must be redacted, got {out!r}"
+    )
+    assert out == "redis://host:***@y&password=***", (
+        f"AC2: orphaned-query sweep must mask the credential param, got {out!r}"
+    )
+    out = redact_url("redis://user:secret?part@x&password=SECRET")
+    assert out == "redis://user:***@x&password=***", (
+        f"AC2: qmark-cross orphaned query must be redacted, got {out!r}"
+    )
+    # A later path @ must not displace the sweep boundary (closeout NEW-10):
+    out = redact_url("redis://host:bad?password=x@y&password=SECRET&email=a/b@c")
+    assert out == "redis://host:***@y&password=***&email=a/b@c", (
+        f"AC2: later path-@ must not bypass the orphan sweep, got {out!r}"
+    )
+    # Scope guard (closeout): the sweep runs ONLY when the original carried
+    # a real query that the mask consumed — no-query URLs keep every
+    # fragment/path byte.
+    for shape in (
+        "redis://host/0#a@b&password=c",
+        "redis://host/a@b/password=1",
+        "redis://host/0#note@x&username=bob",
+    ):
+        out = redact_url(shape)
+        assert out == shape, (
+            f"AC2: no-query URL must stay byte-preserved, got {out!r}"
+        )
+    assert redact_url("redis://u:p@host/0#password=keep") == (
+        "redis://u:***@host/0#password=keep"
+    ), "AC2: a no-query URL's fragment must stay byte-preserved"
+    # A later "?" inside a QUERY VALUE must not defeat the consumed-query
+    # detection (closeout NEW-11): the delimiter is tracked by "?" COUNT,
+    # and once consumed the sweep replaces the normal scan so a surviving
+    # value-"?" cannot strand earlier credential parameters.
+    out = redact_url("redis://host:bad?password=x@y&password=SECRET&next=?foo")
+    assert "SECRET" not in out, (
+        f"AC2: value-'?' must not bypass the orphan sweep, got {out!r}"
+    )
+    assert out == "redis://host:***@y&password=***&next=?foo", (
+        f"AC2: value-'?' sweep must preserve non-credential params, got {out!r}"
+    )
+    assert redact_url("redis://user:pass?a=?b&password=SECRET2") == (
+        "redis://user:pass?a=?b&password=***"
+    ), "AC2: a live query with a value-'?' still gets the normal scan"
+    # A query VALUE embedding a full URL (nested "://") must not redirect
+    # the crossed-span classification away from the outer query (closeout
+    # NEW-12): the outer credential param masks, the URL-valued param stays.
+    out = redact_url("redis://host/0?password=SECRET&next=http://user:pass/x?part@h")
+    assert "SECRET" not in out, (
+        f"AC2: nested-URL query value must not bypass the query scan, got {out!r}"
+    )
+    assert out == (
+        "redis://host/0?password=***&next=http://user:pass/x?part@h"
+    ), f"AC2: URL-valued query param must stay verbatim, got {out!r}"
+    # The fallback userinfo arms carry the same top-level guard (closeout
+    # NEW-13): a nested "user:pass?part@h" inside a URL-valued query param
+    # must not feed the qmark arm (which would skew the delimiter count and
+    # strand the outer credential).
+    out = redact_url("redis://host/0?password=SECRET&next=http://user:pass?part@h")
+    assert "SECRET" not in out, (
+        f"AC2: nested qmark value must not bypass the query scan, got {out!r}"
+    )
+    assert out == (
+        "redis://host/0?password=***&next=http://user:pass?part@h"
+    ), f"AC2: nested qmark URL value must stay verbatim, got {out!r}"
+    # A nested URL in a NO-query FRAGMENT must also stay verbatim (closeout
+    # NEW-14): the outer-authority guard bounds userinfo matching to the
+    # scheme's authority, before the first /, ? or #.
+    shape = "redis://host/0#next=http://user:pass/x@h"
+    out = redact_url(shape)
+    assert out == shape, (
+        f"AC2: nested URL in a fragment must stay byte-preserved, got {out!r}"
+    )
+    # The leading-colon arm carries the same outer-authority boundary
+    # (closeout NEW-15): a nested "redis://:token" inside a fragment or
+    # query value is not this URL's userinfo.
+    for shape in (
+        "redis://host/0#next=redis://:notaport",
+        "redis://host/0?next=redis://:notaport",
+    ):
+        out = redact_url(shape)
+        assert out == shape, (
+            f"AC2: nested leading-colon URL must stay byte-preserved, got {out!r}"
+        )
+    # SCOPE (documented in the module docstring): an EMBEDDED url is opaque
+    # text — a different url, not this one's userinfo — while the outer
+    # url's own credential parameter is still masked.
+    assert redact_url("redis://host/0?next=http://user:pass@h") == (
+        "redis://host/0?next=http://user:pass@h"
+    ), "AC2: an embedded url in a query value is opaque text"
+    assert redact_url("redis://host/0?password=OUTER&next=http://user:pass@h") == (
+        "redis://host/0?password=***&next=http://user:pass@h"
+    ), "AC2: the outer url's own credential parameter is still masked"
+    # The CROSSED arm must not consume an embedded url either (closeout
+    # NEW-16): the "@"s of the embedded url belong to it, so the crossed
+    # span has no separator of its own — the host:port prefix is left as
+    # it is (the existing host:port contract) and the embedded url's bytes
+    # survive byte-for-byte.
+    assert redact_url("redis://host:bad?next=http://user:pass@h") == (
+        "redis://host:bad?next=http://user:pass@h"
+    ), "AC2: the crossed arm must not consume an embedded url"
+    # The structured rebuild must SPLICE the netloc, not re-assemble the url:
+    # urlunsplit drops an empty "?"/"#" delimiter (closeout NEW-17).
+    for shape, expected in (
+        ("redis://u:p@host?", "redis://u:***@host?"),
+        ("redis://u:p@host#", "redis://u:***@host#"),
+        ("redis://u:p@host/0?", "redis://u:***@host/0?"),
+        ("redis://u:p@host/0#", "redis://u:***@host/0#"),
+    ):
+        out = redact_url(shape)
+        assert out == expected, (
+            f"AC2: an empty query/fragment delimiter must survive, got {out!r}"
+        )
+    # PATH CONSISTENCY (closeout NOTE-1): an "@"-bearing username must be
+    # preserved the same way on every path — the structured rebuild keeps
+    # "to@ken:", and so must the fallback (multi-host) and crossed paths.
+    assert redact_url("redis://to@ken:hunter2@host") == (
+        "redis://to@ken:***@host"
+    ), "AC2: structured path must preserve an @-bearing username"
+    assert redact_url("redis+sentinel://to@ken:pw@h1,h2/0") == (
+        "redis+sentinel://to@ken:***@h1,h2/0"
+    ), "AC2: fallback path must preserve an @-bearing username"
+    assert redact_url("redis://to@ken:hunter2?x@host") == (
+        "redis://to@ken:***@host"
+    ), "AC2: crossed path must preserve an @-bearing username"
