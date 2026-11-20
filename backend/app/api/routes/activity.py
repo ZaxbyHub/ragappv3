@@ -55,7 +55,7 @@ from pydantic import BaseModel
 
 from app.api.deps import get_current_active_user, get_db, get_user_accessible_vault_ids
 from app.config import settings
-from app.services.job_lease import ensure_jobs_schema
+from app.services.job_lease import ensure_jobs_schema, redact_legacy_error_text
 
 router = APIRouter(prefix="/activity", tags=["activity"])
 
@@ -98,79 +98,167 @@ class ActivityJobsResponse(BaseModel):
 # with the caller's vault ids bound as one JSON array parameter; admins (all
 # vaults) use the *_ALL variants that omit the membership clause entirely.
 
-_JOBS_WIKI_ALL = """
+# Live-first windows (4.5 review F2): the LIVE arm (pending/running) can
+# never be evicted by terminal history; the TERMINAL arm is the newest-N
+# history. Live rows are bounded too (a pathological backlog must not be
+# unbounded), but independently of the terminal cap.
+_JOBS_WIKI_LIVE_ALL = """
 SELECT id,
        CASE WHEN json_valid(payload_json)
             THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER)
             ELSE NULL END AS vault_id,
        status, error, created_at, completed_at
 FROM jobs
-WHERE queue = 'wiki'
+WHERE queue = 'wiki' AND status IN ('pending', 'running')
 ORDER BY id DESC
 LIMIT ?
 """
-_JOBS_WIKI_VAULT = """
+_JOBS_WIKI_LIVE_VAULT = """
 SELECT id,
        CASE WHEN json_valid(payload_json)
             THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER)
             ELSE NULL END AS vault_id,
        status, error, created_at, completed_at
 FROM jobs
-WHERE queue = 'wiki'
+WHERE queue = 'wiki' AND status IN ('pending', 'running')
   AND CASE WHEN json_valid(payload_json)
        THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER)
        ELSE NULL END IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
 ORDER BY id DESC
 LIMIT ?
 """
-_JOBS_KMS_ALL = """
+_JOBS_WIKI_TERMINAL_ALL = """
 SELECT id,
        CASE WHEN json_valid(payload_json)
             THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER)
             ELSE NULL END AS vault_id,
        status, error, created_at, completed_at
 FROM jobs
-WHERE queue = 'kms'
+WHERE queue = 'wiki' AND status IN ('completed', 'failed', 'cancelled')
 ORDER BY id DESC
 LIMIT ?
 """
-_JOBS_KMS_VAULT = """
+_JOBS_WIKI_TERMINAL_VAULT = """
 SELECT id,
        CASE WHEN json_valid(payload_json)
             THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER)
             ELSE NULL END AS vault_id,
        status, error, created_at, completed_at
 FROM jobs
-WHERE queue = 'kms'
+WHERE queue = 'wiki' AND status IN ('completed', 'failed', 'cancelled')
   AND CASE WHEN json_valid(payload_json)
        THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER)
        ELSE NULL END IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
 ORDER BY id DESC
 LIMIT ?
 """
-_WIKI_LEGACY_ALL = """
+_JOBS_KMS_LIVE_ALL = """
+SELECT id,
+       CASE WHEN json_valid(payload_json)
+            THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER)
+            ELSE NULL END AS vault_id,
+       status, error, created_at, completed_at
+FROM jobs
+WHERE queue = 'kms' AND status IN ('pending', 'running')
+ORDER BY id DESC
+LIMIT ?
+"""
+_JOBS_KMS_LIVE_VAULT = """
+SELECT id,
+       CASE WHEN json_valid(payload_json)
+            THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER)
+            ELSE NULL END AS vault_id,
+       status, error, created_at, completed_at
+FROM jobs
+WHERE queue = 'kms' AND status IN ('pending', 'running')
+  AND CASE WHEN json_valid(payload_json)
+       THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER)
+       ELSE NULL END IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
+ORDER BY id DESC
+LIMIT ?
+"""
+_JOBS_KMS_TERMINAL_ALL = """
+SELECT id,
+       CASE WHEN json_valid(payload_json)
+            THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER)
+            ELSE NULL END AS vault_id,
+       status, error, created_at, completed_at
+FROM jobs
+WHERE queue = 'kms' AND status IN ('completed', 'failed', 'cancelled')
+ORDER BY id DESC
+LIMIT ?
+"""
+_JOBS_KMS_TERMINAL_VAULT = """
+SELECT id,
+       CASE WHEN json_valid(payload_json)
+            THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER)
+            ELSE NULL END AS vault_id,
+       status, error, created_at, completed_at
+FROM jobs
+WHERE queue = 'kms' AND status IN ('completed', 'failed', 'cancelled')
+  AND CASE WHEN json_valid(payload_json)
+       THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER)
+       ELSE NULL END IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
+ORDER BY id DESC
+LIMIT ?
+"""
+_WIKI_LEGACY_LIVE_ALL = """
 SELECT id, vault_id, status, error, created_at, completed_at
 FROM wiki_compile_jobs
+WHERE status IN ('pending', 'running')
 ORDER BY id DESC
 LIMIT ?
 """
-_WIKI_LEGACY_VAULT = """
+_WIKI_LEGACY_LIVE_VAULT = """
 SELECT id, vault_id, status, error, created_at, completed_at
 FROM wiki_compile_jobs
-WHERE vault_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
+WHERE status IN ('pending', 'running')
+  AND vault_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
 ORDER BY id DESC
 LIMIT ?
 """
-_KMS_LEGACY_ALL = """
+_WIKI_LEGACY_TERMINAL_ALL = """
 SELECT id, vault_id, status, error, created_at, completed_at
-FROM kms_compile_jobs
+FROM wiki_compile_jobs
+WHERE status IN ('completed', 'failed', 'cancelled')
 ORDER BY id DESC
 LIMIT ?
 """
-_KMS_LEGACY_VAULT = """
+_WIKI_LEGACY_TERMINAL_VAULT = """
+SELECT id, vault_id, status, error, created_at, completed_at
+FROM wiki_compile_jobs
+WHERE status IN ('completed', 'failed', 'cancelled')
+  AND vault_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
+ORDER BY id DESC
+LIMIT ?
+"""
+_KMS_LEGACY_LIVE_ALL = """
 SELECT id, vault_id, status, error, created_at, completed_at
 FROM kms_compile_jobs
-WHERE vault_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
+WHERE status IN ('pending', 'running')
+ORDER BY id DESC
+LIMIT ?
+"""
+_KMS_LEGACY_LIVE_VAULT = """
+SELECT id, vault_id, status, error, created_at, completed_at
+FROM kms_compile_jobs
+WHERE status IN ('pending', 'running')
+  AND vault_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
+ORDER BY id DESC
+LIMIT ?
+"""
+_KMS_LEGACY_TERMINAL_ALL = """
+SELECT id, vault_id, status, error, created_at, completed_at
+FROM kms_compile_jobs
+WHERE status IN ('completed', 'failed', 'cancelled')
+ORDER BY id DESC
+LIMIT ?
+"""
+_KMS_LEGACY_TERMINAL_VAULT = """
+SELECT id, vault_id, status, error, created_at, completed_at
+FROM kms_compile_jobs
+WHERE status IN ('completed', 'failed', 'cancelled')
+  AND vault_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
 ORDER BY id DESC
 LIMIT ?
 """
@@ -180,7 +268,18 @@ LIMIT ?
 # clause at all (every row, NULL-vault or not). The legacy `interrupted`
 # terminal maps to `failed` in BOTH branches, exactly as the reindex list
 # route does (documents.py).
-_REINDEX_UNIFIED_ADMIN = """
+_REINDEX_UNIFIED_LIVE_ADMIN = """
+SELECT id,
+       CASE WHEN json_valid(payload_json)
+            THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER)
+            ELSE NULL END AS vault_id,
+       status, error, created_at, completed_at
+FROM jobs
+WHERE queue = 'reindex' AND status IN ('pending', 'running')
+ORDER BY id DESC
+LIMIT ?
+"""
+_REINDEX_UNIFIED_TERMINAL_ADMIN = """
 SELECT id,
        CASE WHEN json_valid(payload_json)
             THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER)
@@ -189,14 +288,23 @@ SELECT id,
        error, created_at, completed_at
 FROM jobs
 WHERE queue = 'reindex'
+  AND status IN ('completed', 'failed', 'cancelled', 'interrupted')
 ORDER BY id DESC
 LIMIT ?
 """
-_REINDEX_LEGACY_ADMIN = """
+_REINDEX_LEGACY_LIVE_ADMIN = """
+SELECT id, vault_id, status, error, created_at, completed_at
+FROM document_reindex_jobs
+WHERE status IN ('pending', 'running')
+ORDER BY id DESC
+LIMIT ?
+"""
+_REINDEX_LEGACY_TERMINAL_ADMIN = """
 SELECT id, vault_id,
        CASE WHEN status = 'interrupted' THEN 'failed' ELSE status END AS status,
        error, created_at, completed_at
 FROM document_reindex_jobs
+WHERE status IN ('completed', 'failed', 'cancelled', 'interrupted')
 ORDER BY id DESC
 LIMIT ?
 """
@@ -217,19 +325,36 @@ WHERE status IN ('pending', 'processing')
 ORDER BY created_at DESC, id DESC
 LIMIT ?
 """
-_DRAFT_OWN_ALL = """
+_DRAFT_OWN_LIVE_ALL = """
 SELECT j.id, j.vault_id, j.status, j.active_stage, j.created_at, j.completed_at,
        j.draft_id, d.title AS draft_title
 FROM draft_jobs j JOIN drafts d ON d.id = j.draft_id
-WHERE d.created_by = ?
+WHERE d.created_by = ? AND j.status IN ('pending', 'running')
 ORDER BY j.id DESC
 LIMIT ?
 """
-_DRAFT_OWN_VAULT = """
+_DRAFT_OWN_LIVE_VAULT = """
 SELECT j.id, j.vault_id, j.status, j.active_stage, j.created_at, j.completed_at,
        j.draft_id, d.title AS draft_title
 FROM draft_jobs j JOIN drafts d ON d.id = j.draft_id
-WHERE d.created_by = ?
+WHERE d.created_by = ? AND j.status IN ('pending', 'running')
+  AND j.vault_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
+ORDER BY j.id DESC
+LIMIT ?
+"""
+_DRAFT_OWN_TERMINAL_ALL = """
+SELECT j.id, j.vault_id, j.status, j.active_stage, j.created_at, j.completed_at,
+       j.draft_id, d.title AS draft_title
+FROM draft_jobs j JOIN drafts d ON d.id = j.draft_id
+WHERE d.created_by = ? AND j.status IN ('completed', 'failed', 'cancelled')
+ORDER BY j.id DESC
+LIMIT ?
+"""
+_DRAFT_OWN_TERMINAL_VAULT = """
+SELECT j.id, j.vault_id, j.status, j.active_stage, j.created_at, j.completed_at,
+       j.draft_id, d.title AS draft_title
+FROM draft_jobs j JOIN drafts d ON d.id = j.draft_id
+WHERE d.created_by = ? AND j.status IN ('completed', 'failed', 'cancelled')
   AND j.vault_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
 ORDER BY j.id DESC
 LIMIT ?
@@ -288,6 +413,22 @@ async def list_activity_jobs(
             window.append(row.model_dump())
         windows[family] = window
 
+    def fetch_live_terminal(
+        live_sql: str,
+        terminal_sql: str,
+        live_params: tuple,
+        terminal_params: tuple,
+    ) -> list[sqlite3.Row]:
+        # Live-first window (4.5 review F2): live rows can never be evicted
+        # by newer terminal history; terminal history fills the remainder.
+        live = run(live_sql, live_params)
+        terminal = [
+            r
+            for r in run(terminal_sql, terminal_params)
+            if r["id"] not in {row["id"] for row in live}
+        ]
+        return live + terminal
+
     # --- ingest (the documents surface is always on) --------------------------
     ingest = run(
         _INGEST_VAULT if vault_json else _INGEST_ALL,
@@ -316,13 +457,17 @@ async def list_activity_jobs(
     # --- wiki (feature gate: zero rows while disabled; never an error) --------
     if settings.wiki_enabled:
         if compile_lease:
-            wiki = run(
-                _JOBS_WIKI_VAULT if vault_json else _JOBS_WIKI_ALL,
+            wiki = fetch_live_terminal(
+                _JOBS_WIKI_LIVE_VAULT if vault_json else _JOBS_WIKI_LIVE_ALL,
+                _JOBS_WIKI_TERMINAL_VAULT if vault_json else _JOBS_WIKI_TERMINAL_ALL,
+                (vault_json, limit) if vault_json else (limit,),
                 (vault_json, limit) if vault_json else (limit,),
             )
         else:
-            wiki = run(
-                _WIKI_LEGACY_VAULT if vault_json else _WIKI_LEGACY_ALL,
+            wiki = fetch_live_terminal(
+                _WIKI_LEGACY_LIVE_VAULT if vault_json else _WIKI_LEGACY_LIVE_ALL,
+                _WIKI_LEGACY_TERMINAL_VAULT if vault_json else _WIKI_LEGACY_TERMINAL_ALL,
+                (vault_json, limit) if vault_json else (limit,),
                 (vault_json, limit) if vault_json else (limit,),
             )
         collect(
@@ -336,7 +481,10 @@ async def list_activity_jobs(
                 title="Wiki compile",
                 created_at=r["created_at"],
                 completed_at=r["completed_at"],
-                error=r["error"],
+                # 4.5 review F1: the family's read-time mask — pre-#951 rows
+                # still carry raw str(exc) in the error column (the family
+                # readers mask it at wiki_store.py/kms_store.py read time).
+                error=redact_legacy_error_text(r["error"]),
             ),
         )
     else:
@@ -345,13 +493,17 @@ async def list_activity_jobs(
     # --- kms (same shape; same gate semantics) --------------------------------
     if settings.kms_enabled:
         if compile_lease:
-            kms = run(
-                _JOBS_KMS_VAULT if vault_json else _JOBS_KMS_ALL,
+            kms = fetch_live_terminal(
+                _JOBS_KMS_LIVE_VAULT if vault_json else _JOBS_KMS_LIVE_ALL,
+                _JOBS_KMS_TERMINAL_VAULT if vault_json else _JOBS_KMS_TERMINAL_ALL,
+                (vault_json, limit) if vault_json else (limit,),
                 (vault_json, limit) if vault_json else (limit,),
             )
         else:
-            kms = run(
-                _KMS_LEGACY_VAULT if vault_json else _KMS_LEGACY_ALL,
+            kms = fetch_live_terminal(
+                _KMS_LEGACY_LIVE_VAULT if vault_json else _KMS_LEGACY_LIVE_ALL,
+                _KMS_LEGACY_TERMINAL_VAULT if vault_json else _KMS_LEGACY_TERMINAL_ALL,
+                (vault_json, limit) if vault_json else (limit,),
                 (vault_json, limit) if vault_json else (limit,),
             )
         collect(
@@ -365,15 +517,18 @@ async def list_activity_jobs(
                 title="KMS recompile",
                 created_at=r["created_at"],
                 completed_at=r["completed_at"],
-                error=r["error"],
+                # 4.5 review F1: same family read-time mask as wiki.
+                error=redact_legacy_error_text(r["error"]),
             ),
         )
     else:
         windows["kms"] = []
 
     # --- draft-room (owner boundary for EVERY role) ---------------------------
-    draft = run(
-        _DRAFT_OWN_VAULT if vault_json else _DRAFT_OWN_ALL,
+    draft = fetch_live_terminal(
+        _DRAFT_OWN_LIVE_VAULT if vault_json else _DRAFT_OWN_LIVE_ALL,
+        _DRAFT_OWN_TERMINAL_VAULT if vault_json else _DRAFT_OWN_TERMINAL_ALL,
+        (int(user["id"]), vault_json, limit) if vault_json else (int(user["id"]), limit),
         (int(user["id"]), vault_json, limit) if vault_json else (int(user["id"]), limit),
     )
     collect(
@@ -394,8 +549,12 @@ async def list_activity_jobs(
 
     # --- reindex (admins only, incl. NULL-vault globals) ----------------------
     if is_admin:
-        reindex = run(
-            _REINDEX_UNIFIED_ADMIN if reindex_lease else _REINDEX_LEGACY_ADMIN,
+        reindex = fetch_live_terminal(
+            _REINDEX_UNIFIED_LIVE_ADMIN if reindex_lease else _REINDEX_LEGACY_LIVE_ADMIN,
+            _REINDEX_UNIFIED_TERMINAL_ADMIN
+            if reindex_lease
+            else _REINDEX_LEGACY_TERMINAL_ADMIN,
+            (limit,),
             (limit,),
         )
         collect(

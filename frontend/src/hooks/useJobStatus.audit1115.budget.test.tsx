@@ -156,7 +156,11 @@ describe("useActivityJobs single-endpoint poll budget (audit 1115)", () => {
   it("idle: one endpoint, alive, inside the 60s request budget, with zero per-family fan-out", async () => {
     publishAuthPrincipal({ id: 601, role: "member" });
 
-    renderHook(() => useActivityJobs({ intervalMs: 8000 }));
+    // NO intervalMs override: the default cadences themselves are under
+    // test — 8000ms while live rows exist, 32000ms once the snapshot is
+    // all-terminal (a shorter override would mask an idle-backoff
+    // regression, exactly the M6 probe's kill target).
+    renderHook(() => useActivityJobs());
     await flushFirstTick();
 
     // (ii) The poller is alive: the single endpoint is actually being asked
@@ -165,10 +169,14 @@ describe("useActivityJobs single-endpoint poll budget (audit 1115)", () => {
     expect(callsAfterMount).toBeGreaterThanOrEqual(1);
 
     // (i) Idle budget: with zero live rows in every response, an entire
-    // 60s window stays under ten requests (32000ms idle backoff cadence).
+    // 60s window stays under ten requests (32000ms idle backoff cadence —
+    // mounting included, at most mount + 2 idle ticks land inside 60s).
     await advanceTicks(60_000);
     const callsAfter60s = mockGetActivityJobs.mock.calls.length;
     expect(callsAfter60s - callsAfterMount).toBeLessThan(10);
+    // And specifically no faster than the idle cadence: fewer than four
+    // idle ticks in 60s rules out a collapsed/ignored backoff constant.
+    expect(callsAfter60s - callsAfterMount).toBeLessThan(4);
 
     // (iii) Zero of the OLD per-family calls during that window — at base
     // the five-family fan-out fires on every tick, which is the waste the
