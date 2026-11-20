@@ -1637,6 +1637,16 @@ CREATE INDEX IF NOT EXISTS idx_quality_eval_cases_report
     ON quality_eval_cases(report_id);
 """
 
+#: The quality idempotency UNIQUE indexes (issue #800) are deliberately NOT
+#: part of _QUALITY_REPORTS_DDL/SCHEMA: migrate_add_quality_reports and the
+#: schema-convergence step both executescript() the shared DDL, and a legacy
+#: database still holding duplicate rows would fail CREATE UNIQUE INDEX
+#: before the convergence migration (migrate_add_quality_idempotency_indexes)
+#: ever runs. That migration alone owns these indexes — it converges the
+#: duplicates (re-parent cases, dedup, delete) BEFORE creating them, and it
+#: is idempotent so fresh databases (empty tables) get them on their first
+#: run_migrations too.
+
 # Per-turn stream event log (issue #555). Every replayable SSE frame of a
 # durable chat turn is persisted here keyed by (session_id, turn_id, seq) so a
 # reconnecting client that sends `Last-Event-ID` can be served exactly the
@@ -2006,6 +2016,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_chat_turn_columns(sqlite_path)
     migrate_add_quality_reports(sqlite_path)
     migrate_add_quality_eval_cases(sqlite_path)
+    migrate_add_quality_idempotency_indexes(sqlite_path)
     migrate_add_document_reindex_jobs(sqlite_path)
     migrate_add_tags_tables(sqlite_path)
     migrate_add_folders(sqlite_path)
@@ -3267,6 +3278,85 @@ def migrate_add_quality_eval_cases(sqlite_path: str) -> None:
     try:
         conn.executescript(_QUALITY_REPORTS_DDL)
         conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_quality_idempotency_indexes(sqlite_path: str) -> None:
+    """Migration: unique idempotency indexes for quality reports/cases (issue #800).
+
+    One row per retry identity ``quality_reports(message_id, category)`` and
+    one case per ``quality_eval_cases.report_id``. Legacy duplicates are
+    converged BEFORE index creation, inside one transaction, preserving
+    referential integrity: eval cases owned by duplicate reports are
+    re-parented to the canonical (lowest-id) report first, then cases are
+    deduplicated per report (lowest id survives), then the duplicate reports
+    are deleted, then the indexes are created. Rerun-safe: every step is a
+    no-op on a converged database.
+    """
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        # 1. Re-parent eval cases from duplicate reports to the canonical
+        #    (lowest-id) report of each (message_id, category) identity.
+        #    The SET subquery correlates through the TARGET table's own
+        #    report_id (SQLite UPDATE SET expressions may only reference
+        #    target-table columns outside their FROM).
+        conn.execute(
+            """
+            UPDATE quality_eval_cases
+            SET report_id = (
+                SELECT MIN(qr.id)
+                FROM quality_reports qr
+                JOIN quality_reports dup
+                  ON dup.id = quality_eval_cases.report_id
+                 AND dup.message_id = qr.message_id
+                 AND dup.category = qr.category
+            )
+            WHERE report_id IN (
+                SELECT qr2.id FROM quality_reports qr2
+                WHERE qr2.id != (
+                    SELECT MIN(qr.id) FROM quality_reports qr
+                    WHERE qr.message_id = qr2.message_id
+                      AND qr.category = qr2.category
+                )
+            )
+            """
+        )
+        # 2. Deduplicate eval cases per report (lowest id survives).
+        conn.execute(
+            """
+            DELETE FROM quality_eval_cases
+            WHERE id NOT IN (
+                SELECT MIN(cec.id) FROM quality_eval_cases cec
+                GROUP BY cec.report_id
+            )
+            """
+        )
+        # 3. Delete duplicate reports (canonical lowest-id rows survive).
+        conn.execute(
+            """
+            DELETE FROM quality_reports
+            WHERE id NOT IN (
+                SELECT MIN(qr.id) FROM quality_reports qr
+                GROUP BY qr.message_id, qr.category
+            )
+            """
+        )
+        # 4. Create the unique indexes on the converged data. Per-statement
+        #    execute (NOT executescript — it issues an implicit COMMIT that
+        #    would end the transaction before the indexes exist).
+        for index_stmt in (
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_quality_reports_message_category "
+            "ON quality_reports(message_id, category)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_quality_eval_cases_report_unique "
+            "ON quality_eval_cases(report_id)",
+        ):
+            conn.execute(index_stmt)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 

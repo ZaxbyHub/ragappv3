@@ -884,6 +884,25 @@ def _redact_llm_metrics(
     return redacted
 
 
+def _canonical_done_content(
+    full_content: str, repaired_content: Optional[str]
+) -> Tuple[str, bool]:
+    """Canonical assistant content for the stream done payload (issue #1153 AC1).
+
+    The citation-repaired text (when repairs applied) or the raw joined
+    stream, passed through the persistence-boundary sanitizer so answer
+    wrapper tags never survive into the canonical done content, the durable
+    turn payload, or the client-reconciled ``repaired_content``. Returns
+    ``(canonical_content, differs_from_raw)`` — the caller emits
+    ``repaired_content`` whenever the canonical text differs from what was
+    raw-streamed, reusing the existing client reconciliation mechanism that
+    previously fired only on citation repairs.
+    """
+    base = repaired_content if repaired_content is not None else full_content
+    canonical = sanitize_chat_messages_content(base)
+    return canonical, canonical != full_content
+
+
 def stream_chat_response(
     message: str,
     history: List[Dict[str, Any]],
@@ -1240,12 +1259,14 @@ def stream_chat_response(
         # SC-015: include prompt_version identifier in response
         # SC-017: include ab_experiment_id and ab_variant for outcome comparison
         # Issue #553 durable turn: the stream completed normally; the persisted
-        # content is the citation-repaired text when repairs applied (same
-        # canonical content the client is handed below).
-        turn_state["status"] = _TURN_STATUS_COMPLETE
-        turn_state["payload"]["content"] = (
-            repaired_content if repaired_content is not None else full_content
+        # content is the canonical text — citation-repaired when repairs
+        # applied, sanitized either way (issue #1153 AC1: answer wrapper tags
+        # never survive into the canonical/persisted content).
+        canonical_content, canonical_differs = _canonical_done_content(
+            full_content, repaired_content
         )
+        turn_state["status"] = _TURN_STATUS_COMPLETE
+        turn_state["payload"]["content"] = canonical_content
         done_payload: Dict[str, Any] = {
             "type": "done",
             "turn_id": current_turn_id(),
@@ -1265,8 +1286,12 @@ def stream_chat_response(
         # from "validation data present but empty invalid set".
         if citation_validation is not None and citation_validation.get("invalid"):
             done_payload["citation_validation"] = citation_validation
-        if repaired_content is not None:
-            done_payload["repaired_content"] = repaired_content
+        # Reconcile the client to the canonical content whenever it differs
+        # from what was raw-streamed — citation repairs (pre-existing) and
+        # sanitizer-driven changes (issue #1153 AC1) alike. The client
+        # replaces its streamed mirror with this value on completion.
+        if canonical_differs:
+            done_payload["repaired_content"] = canonical_content
         if prompt_version is not None:
             done_payload["prompt_version"] = prompt_version
         if ab_experiment_id is not None:
@@ -2059,6 +2084,31 @@ async def get_stream_auth(
             request.cookies.get("access_token"),
         )
         is_admin = user.get("role") in ("superadmin", "admin")
+        # Issue #553 + #1153 AC5 (F5c): resolve the durable session's STORED
+        # vault FIRST — it is the authoritative scope for an existing session.
+        # A requested vault_id that disagrees with the session's vault is
+        # CLAMPED to the stored scope (mismatch logged), and a null body
+        # vault on an existing session becomes the stored scope instead of
+        # the admin-only "All Vaults" search — direct API clients cannot
+        # re-scope an existing session by naming a different vault.
+        durable_session_vault = None
+        if body.session_id is not None:
+            durable_session_row = conn.execute(
+                "SELECT id, vault_id FROM chat_sessions WHERE id = ?",
+                (body.session_id,),
+            ).fetchone()
+            if durable_session_row is None:
+                raise HTTPException(status_code=404, detail="Session not found")
+            durable_session_vault = durable_session_row[1]
+            if body.vault_id is not None and body.vault_id != durable_session_vault:
+                logger.info(
+                    "Chat stream vault clamped to the session's stored vault "
+                    "(session=%s requested=%s stored=%s)",
+                    body.session_id, body.vault_id, durable_session_vault,
+                )
+                body.vault_id = durable_session_vault
+            elif body.vault_id is None:
+                body.vault_id = durable_session_vault
         if body.vault_id is not None:
             if not await _evaluate_policy(conn, user, "vault", body.vault_id, "read"):
                 raise HTTPException(status_code=403, detail="No read access to this vault")
@@ -2081,18 +2131,12 @@ async def get_stream_auth(
             can_write_memory = True
         # Issue #553: when the client opts into server-side turn durability it
         # names the session the turn belongs to. That session is the same
-        # durable resource add_messages_batch writes to, so apply the same
-        # checks here (404 unknown session, 403 without vault WRITE) — inside
-        # this short-lived connection block, before the stream starts.
-        if body.session_id is not None:
-            durable_session_row = conn.execute(
-                "SELECT id, vault_id FROM chat_sessions WHERE id = ?",
-                (body.session_id,),
-            ).fetchone()
-            if durable_session_row is None:
-                raise HTTPException(status_code=404, detail="Session not found")
+        # durable resource add_messages_batch writes to — the session row and
+        # its vault WRITE check were resolved ABOVE (before requested-vault
+        # authorization) so stored scope stays authoritative.
+        if durable_session_vault is not None:
             if not await _evaluate_policy(
-                conn, user, "vault", durable_session_row[1], "write"
+                conn, user, "vault", durable_session_vault, "write"
             ):
                 raise HTTPException(
                     status_code=403, detail="No write access to this vault"
@@ -3441,12 +3485,20 @@ async def add_messages_batch(
                 if existing_row is not None:
                     existing_id = existing_row[0]
             if existing_id is not None:
+                # Issue #1153 AC9 completion fence (F7c): a row the server
+                # already finalized as 'complete' is never downgraded by a
+                # late reconciled write (interrupted/failed mirrors racing
+                # the completion). The guard lives in the UPDATE's WHERE
+                # clause — atomic against a racing finalize, no
+                # read-then-write TOCTOU. Non-complete rows reconcile as
+                # before.
                 await asyncio.to_thread(
                     conn.execute,
                     "UPDATE chat_messages SET content = ?, sources = ?, memories = ?, "
                     "wiki_refs = ?, status = ?, citation_confidence = ?, "
                     "unverifiable_claims = ?, currency_warnings = ?, "
-                    "citation_enforcement = ?, mode = ?, kms_refs = ? WHERE id = ?",
+                    "citation_enforcement = ?, mode = ?, kms_refs = ? "
+                    "WHERE id = ? AND (status IS NULL OR status != 'complete')",
                     (
                         row["content"],
                         row["sources_json"],

@@ -44,6 +44,7 @@ from app.services.document_retrieval import (
     DocumentRetrievalService,
     RAGSource,
     artifact_fields_from_metadata,
+    attach_file_hashes,
     source_dedup_key,
 )
 from app.services.embeddings import EmbeddingError, EmbeddingService
@@ -3930,7 +3931,36 @@ class RAGEngine:
     ) -> List[Dict[str, Any]]:
         """Serialize chunks exactly as done.sources does: to_source_metadata
         with 1-based source labels. evidence_type is NOT set here; it is a
-        done-time distinction assigned only to final sources."""
+        done-time distinction assigned only to final sources.
+
+        Issue #800 AC8 (F13d/F13e): the answer-time ``files.file_hash``
+        snapshot is attached HERE — the final-source serialization seam both
+        the candidates payload and the done sources flow through, after
+        filtering/window expansion by construction. ``attach_file_hashes``
+        is write-once per chunk, so the second serialization (done sources)
+        can never refresh a snapshot the first (candidates) took before a
+        files-table replacement. ONE batched SELECT, dispatched through the
+        default executor — never per-chunk queries on the event loop.
+        """
+        try:
+            pool = _get_pool()
+
+            def _attach() -> None:
+                with pool.connection() as conn:
+                    attach_file_hashes(relevant_chunks, conn)
+
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.get_running_loop().run_in_executor(None, _attach).result()
+            else:
+                _attach()
+        except Exception as exc:  # noqa: BLE001 — defensive
+            # Enrichment must never break serialization: unenriched chunks
+            # keep the explicit missing-marker (None) instead.
+            logger.debug("file-hash enrichment skipped: %s", exc)
+            for chunk in relevant_chunks:
+                if "_file_hash" not in chunk.metadata:
+                    chunk.metadata["_file_hash"] = None
         return [
             self.document_retrieval.to_source_metadata(chunk, source_index=idx + 1)
             for idx, chunk in enumerate(relevant_chunks)

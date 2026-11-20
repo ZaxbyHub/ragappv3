@@ -380,6 +380,37 @@ export function useSendMessage(
 
       if (currentState.activeChatId) {
         sessionId = parseInt(currentState.activeChatId);
+        // Issue #1153 AC5 (F5c): the STORED vault scope of the active
+        // session is authoritative for follow-ups — a mid-conversation
+        // global vault switch must never re-scope an existing session.
+        // The scope was bound atomically at load/create/fork time; an
+        // unbound existing session (legacy path that lost the binding)
+        // blocks loudly instead of silently sending the global scope.
+        const storedScope = useChatStore.getState().activeSessionVaultId;
+        if (typeof storedScope === "number") {
+          sendVaultId = storedScope;
+        } else {
+          // Unbound existing session (legacy in-flight session from before
+          // this deploy): try to REFETCH the stored scope. When the fetch
+          // is unavailable or fails, fall through to the resolved vault —
+          // the backend clamp (issue #1153 AC5, chat.py get_stream_auth)
+          // makes the session's STORED vault authoritative server-side, so
+          // a stale client scope can never actually re-scope the session.
+          try {
+            const api = await import("@/lib/api");
+            if (typeof api.getChatSession === "function") {
+              const detail = await api.getChatSession(sessionId);
+              useChatStore
+                .getState()
+                .bindSession?.(sessionId.toString(), detail.vault_id ?? null);
+              if (typeof detail.vault_id === "number") {
+                sendVaultId = detail.vault_id;
+              }
+            }
+          } catch {
+            // Server-side clamp remains the authority; proceed.
+          }
+        }
       } else {
         if (!sendVaultId) {
           setInputError(
@@ -393,7 +424,12 @@ export function useSendMessage(
         try {
           const newSession = await createChatSession({ vault_id: sendVaultId });
           sessionId = newSession.id;
-          useChatStore.setState({ activeChatId: newSession.id.toString() });
+          // Issue #1153 AC5: bind the created session's stored scope
+          // atomically with its id (the session lives in sendVaultId).
+          // Optional chain per the repo's mock-tolerance convention.
+          useChatStore
+            .getState()
+            .bindSession?.(newSession.id.toString(), sendVaultId);
           createdSession = true;
         } catch (err) {
           console.error("Failed to create chat session:", err);

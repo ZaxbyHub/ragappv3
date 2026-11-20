@@ -174,6 +174,12 @@ class VaultResponse(BaseModel):
     file_count: int = 0
     memory_count: int = 0
     session_count: int = 0
+    # Documents actually retrievable by chat (files.status='indexed' — the
+    # same admission unscoped retrieval applies, rag_engine filter seam).
+    # file_count counts every row including pending/failed uploads, so UIs
+    # must use THIS field for "has content to chat over" decisions
+    # (issue #1153 AC4).
+    indexed_file_count: int = 0
     org_id: Optional[int] = None
     current_user_permission: Optional[str] = None
     visibility: Optional[str] = None
@@ -234,6 +240,7 @@ def _row_to_vault_response(row, current_user_permission: Optional[str] = None) -
         file_count=row[5] or 0,
         memory_count=row[6] or 0,
         session_count=row[7] or 0,
+        indexed_file_count=(row[12] or 0) if len(row) > 12 else 0,
         org_id=row[8],
         visibility=row[9] if len(row) > 9 else None,
         enrichment_enabled=enrichment_override,
@@ -282,7 +289,9 @@ _VAULT_WITH_COUNTS_SQL = """
            v.org_id,
            v.visibility,
            v.enrichment_enabled,
-           v.multimodal_provider_enabled
+           v.multimodal_provider_enabled,
+           (SELECT COUNT(*) FROM files f
+             WHERE f.vault_id = v.id AND f.status = 'indexed') as indexed_file_count
     FROM vaults v
 """
 

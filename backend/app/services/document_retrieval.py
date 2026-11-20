@@ -92,6 +92,65 @@ def _extract_reupload_hash(chunk_id: str, file_id: str) -> Optional[str]:
     return candidate if _RE_HASH8.fullmatch(candidate) else None
 
 
+def attach_file_hashes(chunks, conn) -> None:
+    """Stamp each chunk's answer-time ``files.file_hash`` snapshot (issue #800 AC8).
+
+    Batched lookup: ONE ``SELECT id, file_hash FROM files WHERE id IN (...)``
+    for every distinct file_id on the final chunk list, stamping
+    ``chunk.metadata["_file_hash"]`` IN PLACE. Write-once per chunk: a chunk
+    whose metadata already CARRIES the ``_file_hash`` key (hash OR the
+    explicit None missing-marker) is skipped, so the candidate serialization
+    snapshot survives a files-table replacement landing before the done
+    serialization — the second call can never refresh it.
+
+    Mismatch guard: when the chunk's reupload-safe id embeds a hash8 prefix
+    that DISAGREES with the current table hash's first 8 chars, the SQLite
+    row and the vector chunk describe different revisions — the snapshot is
+    stamped as ``None`` (explicitly missing) rather than misattributing the
+    table hash to the chunk. Missing file rows and NULL table hashes are
+    likewise stamped ``None``.
+
+    Args:
+        chunks: iterable of RAGSource (mutated in place — metadata dict).
+        conn: sqlite3 connection to the app database (synchronous; callers
+            run it on the retrieval/serialization path, never the event loop).
+    """
+    chunk_list = list(chunks)
+    file_ids = sorted(
+        {c.file_id for c in chunk_list if c.file_id not in (None, "")}
+    )
+    if not file_ids:
+        # Still record the missing-marker for un-identified chunks so the
+        # write-once contract holds across repeated serialization.
+        for chunk in chunk_list:
+            if "_file_hash" not in chunk.metadata:
+                chunk.metadata["_file_hash"] = None
+        return
+    placeholders = ",".join("?" for _ in file_ids)
+    rows = conn.execute(
+        f"SELECT id, file_hash FROM files WHERE id IN ({placeholders})",
+        tuple(file_ids),
+    ).fetchall()
+    table_hashes = {str(row[0]): row[1] for row in rows}
+    for chunk in chunk_list:
+        if "_file_hash" in chunk.metadata:
+            continue  # write-once: the answer-time snapshot is immutable
+        table_hash = table_hashes.get(str(chunk.file_id))
+        if not table_hash:
+            chunk.metadata["_file_hash"] = None
+            continue
+        stored_chunk_id = str(
+            chunk.metadata.get("_chunk_id") or chunk.metadata.get("chunk_uid") or ""
+        )
+        embedded_hash8 = _extract_reupload_hash(stored_chunk_id, str(chunk.file_id))
+        if embedded_hash8 and table_hash[:8] != embedded_hash8:
+            # The chunk belongs to a superseded generation: emitting the
+            # current table hash would misattribute the revision.
+            chunk.metadata["_file_hash"] = None
+            continue
+        chunk.metadata["_file_hash"] = table_hash
+
+
 def _strip_reupload_hash(uid: str) -> str:
     """Remove the reupload-safe hash segment from a current-format chunk id.
 
@@ -1032,6 +1091,12 @@ class DocumentRetrievalService:
             "chunk_bbox": chunk.metadata.get("chunk_bbox"),
             "snippet": snippet,
             "score": chunk.score,
+            # Issue #800 AC8: the answer-time revision snapshot stamped by
+            # ``attach_file_hashes`` at retrieval serialization time. None =
+            # explicitly missing (legacy source, missing file row, or a
+            # chunk-id/hash8 revision mismatch) — never the CURRENT table
+            # value, so a replaced file cannot rewrite history.
+            "file_hash": chunk.metadata.get("_file_hash"),
             # Issue #480 (A1) / PR #481 (PRR-001): emit only the whitelisted
             # metadata keys. Forwarding ``chunk.metadata`` wholesale leaked
             # server-absolute ``file_path``/``source_file`` to any vault-read
