@@ -38,6 +38,55 @@ def _family(client, headers, family):
     return [j for j in resp.json()["jobs"] if j["family"] == family]
 
 
+class TestDraftOwnerBoundary:
+    """Final-critic round-1 finding: the draft owner boundary (SPEC 9.1 —
+    "draft existence is never disclosed across owners") must hold through the
+    aggregate for EVERY role. A second user's draft+job in a vault the member
+    (and the superadmin) can read must never surface — the neutralized-owner
+    mutation (``d.created_by = ? OR 1=1``) surviving every prior test is the
+    exact regression this pins."""
+
+    OTHER_USER_ID = 42
+
+    def _seed_foreign_draft(self, route_env):
+        def _seed(conn):
+            conn.execute(
+                "INSERT INTO users (id, username, hashed_password, full_name, role, "
+                "is_active) VALUES (?, 'other', 'pw-hash', 'O', 'member', 1)",
+                (self.OTHER_USER_ID,),
+            )
+            cur = conn.execute(
+                "INSERT INTO drafts (vault_id, created_by, title, mode) "
+                "VALUES (?, ?, 'secret foreign draft', 'compose')",
+                (VAULT_A, self.OTHER_USER_ID),
+            )
+            draft_id = int(cur.lastrowid)
+            conn.execute(
+                "INSERT INTO draft_jobs (draft_id, vault_id, created_by, job_type, "
+                "status, max_model_calls, timeout_seconds) "
+                "VALUES (?, ?, ?, 'compile', 'running', 5, 60)",
+                (draft_id, VAULT_A, self.OTHER_USER_ID),
+            )
+            conn.commit()
+            return draft_id
+
+        return route_env._with_conn(_seed)
+
+    def test_member_never_sees_another_users_draft_rows(self, route_env):
+        foreign_draft_id = self._seed_foreign_draft(route_env)
+        rows = _family(route_env.client, route_env.member_headers(), "draft-room")
+        assert all(j["draft_id"] != foreign_draft_id for j in rows)
+        assert all("secret foreign draft" != j["title"] for j in rows)
+
+    def test_superadmin_also_never_sees_another_users_draft_rows(self, route_env):
+        # Admins read ALL VAULTS for the other families, but drafts stay
+        # owner-scoped for every role — the draft-room routes' own boundary.
+        foreign_draft_id = self._seed_foreign_draft(route_env)
+        rows = _family(route_env.client, route_env.superadmin_headers(), "draft-room")
+        assert all(j["draft_id"] != foreign_draft_id for j in rows)
+        assert all("secret foreign draft" != j["title"] for j in rows)
+
+
 class TestErrorRedaction:
     """F1: the aggregate masks wiki/KMS error text like the family readers."""
 
