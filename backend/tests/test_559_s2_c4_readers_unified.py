@@ -582,6 +582,7 @@ class TestC3KmsJobEndpoints(unittest.IsolatedAsyncioTestCase):
         resp = await self._list_kms_jobs(
             vault_id=1,
             status=None,
+            limit=500,
             db=self.conn,
             user=_USER,
             evaluate=_allow_all,
@@ -741,6 +742,10 @@ class TestC3MigratedHistoryVisibility(unittest.IsolatedAsyncioTestCase):
         kms_resp = await self._list_kms_jobs(
             vault_id=1,
             status=None,
+            # #1157: the kms list route now defaults its bound like the wiki
+            # route; a direct call must pass a concrete int (a FastAPI Query
+            # default cannot bind to SQL).
+            limit=500,
             db=self.conn,
             user=_USER,
             evaluate=_allow_all,
