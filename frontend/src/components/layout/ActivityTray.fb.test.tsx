@@ -446,6 +446,11 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
         document.activeElement?.closest('[aria-label="Activity"]'),
       ).not.toBeNull();
     });
+    // #1158 planning-pin: show focus on the SPECIFIC row control immediately
+    // before the removal — "somewhere in the tray" is not the contract.
+    expect(document.activeElement).toBe(
+      within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }),
+    );
 
     // Poll tick: the focused row vanishes (cancelled rows drop from the
     // pending/processing windows the adapters poll).
@@ -467,12 +472,42 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
       expect(document.activeElement).toBe(header);
     });
 
-    // Negative case: focus outside the tray is NOT stolen by the guard.
-    const outside = screen.getByRole("button", { name: /activity/i });
-    outside.blur();
+    // Negative case (#1158 focus machine): a ROW is focused, focus then
+    // moves DELIBERATELY to an external control (a concrete relatedTarget
+    // outside the tray), and only then does the poll remove the focused
+    // row — the guard must NOT steal focus back to the header.
+    const wikiRow = makeRow({
+      family: "wiki",
+      key: "wiki-7",
+      title: "Wiki compile",
+      cancellable: true,
+      jobId: 7,
+      vaultId: 3,
+    });
+    hookRows = [wikiRow, makeRow({ family: "kms", key: "kms-11", title: "KMS recompile" })];
+    rerender(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
+    await user.click(
+      within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }),
+    );
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }),
+      );
+    });
     const bodyTarget = document.createElement("button");
     document.body.appendChild(bodyTarget);
-    bodyTarget.focus();
+    // A real user event (not .focus()) so the focusout carries a concrete
+    // external relatedTarget — the deliberate-move signature.
+    await user.click(bodyTarget);
+    // Poll tick removes the previously focused row: external focus stays.
     hookRows = [];
     rerender(
       <QueryClientProvider

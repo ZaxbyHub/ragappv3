@@ -17,7 +17,7 @@
 // rendered); row keys never appear as DOM text; buttons are named plain
 // "Cancel" / "Retry".
 
-import { useContext, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import { QueryClientContext } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -66,9 +66,28 @@ function errorStatus(e: unknown): number | undefined {
   );
 }
 
+/** Persisted collapse preference (#1158 AC1): the tray remounts on every
+ * route change (PageShell per-route), so the Hide choice must live outside
+ * the component or every navigation re-expands it. Same lazy-initializer +
+ * write-back shape as NavigationRail's sidebar-expanded preference. */
+const COLLAPSED_STORAGE_KEY = "activity-tray-collapsed";
+
 export function ActivityTray() {
   const { rows, loading, refresh } = useActivityJobs();
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem(COLLAPSED_STORAGE_KEY) === "true";
+    } catch {
+      return false;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(COLLAPSED_STORAGE_KEY, String(collapsed));
+    } catch {
+      // Quota/private-mode: the preference stays session-only.
+    }
+  }, [collapsed]);
   const activeCount = rows.filter((r) => !r.terminal).length;
   // Row-keyed in-flight marker: the clicked action's button is disabled
   // until its request settles, so a double-click cannot double-POST
@@ -81,6 +100,7 @@ export function ActivityTray() {
   const deniedCancelKeysRef = useRef<Set<string>>(new Set());
   const sectionRef = useRef<HTMLElement | null>(null);
   const focusedKeyRef = useRef<string | null>(null);
+  const focusInTrayRef = useRef(false);
   const prevRowKeysRef = useRef<Set<string>>(new Set());
 
   // Context-optional client read (#911): the real app always mounts the
@@ -204,23 +224,39 @@ export function ActivityTray() {
     return Promise.resolve();
   }
 
-  // Focus guard (PRR-029): a poll tick can unmount the focused row (a
-  // successful cancel removes it; the terminal cap ages it out) — restore
-  // focus to the tray header instead of dropping it to <body>.
+  // Focus guard (PRR-029, redesigned #1158): a poll tick can unmount the
+  // focused row (a successful cancel removes it; the terminal cap ages it
+  // out) — restore focus to the tray header instead of dropping it to
+  // <body>. The decision runs in a passive effect on the NEW row set, using
+  // focus facts captured BEFORE the removal (a render-phase DOM call is a
+  // side effect in render and StrictMode-unsafe):
+  //   - onFocusCapture on a row control records the focused row key and
+  //     marks focus-in-tray;
+  //   - a focusout whose relatedTarget is a CONCRETE node outside the tray
+  //     marks a deliberate move (focus intentionally left) — a focusout
+  //     with relatedTarget null is the node-removal signature and leaves
+  //     the in-tray marker intact, so restoration still fires;
+  //   - when the recorded row disappears from the new set and focus had not
+  //     deliberately left, focus lands on the header; focus deliberately
+  //     moved outside is never stolen back.
   const prevKeys = prevRowKeysRef.current;
   const currentKeys = new Set(rows.map((r) => r.key));
-  if (
-    focusedKeyRef.current &&
-    !currentKeys.has(focusedKeyRef.current) &&
-    prevKeys.has(focusedKeyRef.current) &&
-    typeof document !== "undefined" &&
-    document.activeElement instanceof HTMLElement &&
-    document.activeElement.closest('[aria-label="Activity"]')
-  ) {
-    sectionRef.current
-      ?.querySelector<HTMLButtonElement>("button[aria-expanded]")
-      ?.focus();
-  }
+  useEffect(() => {
+    const focusedKey = focusedKeyRef.current;
+    if (
+      focusedKey &&
+      !currentKeys.has(focusedKey) &&
+      prevKeys.has(focusedKey) &&
+      focusInTrayRef.current
+    ) {
+      focusedKeyRef.current = null;
+      focusInTrayRef.current = false;
+      sectionRef.current
+        ?.querySelector<HTMLButtonElement>("button[aria-expanded]")
+        ?.focus();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows]);
   prevRowKeysRef.current = currentKeys;
 
   return (
@@ -229,13 +265,35 @@ export function ActivityTray() {
     // the tray's previous `bottom-20` anchor sat exactly under it and the
     // upload card painted over the tray's only affordance (PRR-027 /
     // review F-002, execution-proven at 375x812).
+    // Desktop anchor raised to `md:bottom-54` (216px, #1158 AC7): the old
+    // `md:bottom-24` (96px) intersected the chat composer's Send control at
+    // 1024x768 (15px) and the documents table band at 1280x800/1440x900
+    // (5px/105px, covering the last row's action buttons) — measured at
+    // base in the trace geometry probe. 216px clears every measured band
+    // with >=15px margin; the expanded box grows upward, so the bottom edge
+    // is the only collision surface.
     // A labelled <section> carries the region landmark role implicitly —
     // AC1's `getByRole("region", { name: /activity/i })` resolves against
     // the implicit role (jsx-a11y forbids the explicit attribute).
     <section
       ref={sectionRef}
       aria-label="Activity"
-      className="fixed bottom-40 right-4 z-40 w-80 max-w-[calc(100vw-2rem)] md:bottom-24"
+      className="fixed bottom-40 right-4 z-40 w-80 max-w-[calc(100vw-2rem)] md:bottom-54"
+      onBlurCapture={(e) => {
+        // Deliberate external focus ONLY: a focusout whose relatedTarget is
+        // a concrete node outside the tray means the user moved focus away
+        // on purpose — never steal it back. A null relatedTarget is the
+        // node-removal signature (the focused row is being unmounted); the
+        // in-tray marker must survive it so the guard's effect still
+        // restores focus to the header.
+        const to = e.relatedTarget;
+        if (
+          to instanceof Node &&
+          !(to as HTMLElement).closest?.('[aria-label="Activity"]')
+        ) {
+          focusInTrayRef.current = false;
+        }
+      }}
     >
       <div className="rounded-lg border bg-background/95 shadow-lg backdrop-blur">
         <button
@@ -291,6 +349,7 @@ export function ActivityTray() {
                   key={row.key}
                   onFocusCapture={() => {
                     focusedKeyRef.current = row.key;
+                    focusInTrayRef.current = true;
                   }}
                   className="flex flex-col gap-1 border-b py-2 last:border-b-0"
                 >

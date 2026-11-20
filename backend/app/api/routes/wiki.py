@@ -1014,12 +1014,12 @@ async def promote_memory_to_wiki(
 async def list_wiki_jobs(
     vault_id: int = Query(...),
     status: Optional[str] = Query(None),
-    # Server-side row bound (#774 / TQ-sweep-B09-01): WikiStore.list_jobs
-    # already accepts a limit; exposing it lets bounded consumers (e.g. the
-    # Maintenance tab's "recent jobs" list) cap the query instead of pulling
-    # the vault's entire job history for a client-side slice. Payload shape
-    # is unchanged — the bound only limits the row count.
-    limit: Optional[int] = Query(None, ge=1, le=500),
+    # Server-side row bound (#774 / TQ-sweep-B09-01, default added for
+    # #1157 AC3): WikiStore.list_jobs already accepts a limit. Omitting it
+    # now returns the default page (50) instead of the vault's entire job
+    # history; an explicit limit up to 500 still fetches deeper. Payload
+    # shape is unchanged — the bound only limits the row count.
+    limit: int = Query(50, ge=1, le=500),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     evaluate: Callable = Depends(get_evaluate_policy),

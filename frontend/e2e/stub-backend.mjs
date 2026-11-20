@@ -914,6 +914,74 @@ const server = http.createServer(async (req, res) => {
     const trayVaultId = Number(url.searchParams.get("vault_id") || 0);
     const inTrayVault = (seed) =>
       !trayVaultId || (seed.vaultId ?? 1) === trayVaultId;
+    if (method === "GET" && path === "/api/activity/jobs") {
+      // Vault-scoped activity aggregate (issues #1157/#1158): one read the
+      // Activity tray polls instead of the per-family fan-out. The stub
+      // user is admin-equivalent (every family, reindex included) and the
+      // single stub vault is readable, so the aggregate simply unions the
+      // seeded families into the production ActivityJob row contract.
+      const rows = [];
+      for (const family of ["wiki", "kms", "draft-room", "reindex"]) {
+        for (const seed of e2eSeeds[family]) {
+          const shape = e2eJobShape(family, seed);
+          rows.push({
+            family,
+            id: shape.id,
+            vault_id: family === "draft-room" ? 1 : shape.vault_id ?? 1,
+            status: shape.status,
+            title:
+              family === "wiki"
+                ? "Wiki compile"
+                : family === "kms"
+                  ? "KMS recompile"
+                  : family === "reindex"
+                    ? "Embedding reindex (vault 1)"
+                    : (seed.title ?? `Draft ${shape.draft_id}`),
+            created_at: shape.created_at,
+            completed_at: shape.completed_at ?? null,
+            draft_id: family === "draft-room" ? shape.draft_id : null,
+            file_id: null,
+            active_stage: family === "draft-room" ? shape.active_stage : null,
+            phase: null,
+            phase_message: null,
+            progress_percent: null,
+            processed_units: null,
+            total_units: null,
+            unit_label: null,
+            error: shape.error ?? null,
+          });
+        }
+      }
+      for (const doc of documents) {
+        const docStatus = doc.metadata?.status;
+        if (docStatus === "pending" || docStatus === "processing") {
+          rows.push({
+            family: "ingest",
+            id: Number(doc.id),
+            vault_id: doc.vault_id ?? 1,
+            status: docStatus,
+            title: doc.filename || `Document ${doc.id}`,
+            created_at: doc.created_at ?? null,
+            completed_at: null,
+            draft_id: null,
+            file_id: String(doc.id),
+            active_stage: null,
+            phase: doc.metadata?.phase ?? null,
+            phase_message: doc.metadata?.phase_message ?? null,
+            progress_percent: doc.metadata?.progress_percent ?? null,
+            processed_units: doc.metadata?.processed_units ?? null,
+            total_units: doc.metadata?.total_units ?? null,
+            unit_label: doc.metadata?.unit_label ?? null,
+            error: null,
+          });
+        }
+      }
+      return sendJson(req, res, 200, {
+        jobs: rows,
+        change_token: `stub-${rows.length}-${e2eSeeds.wiki.length}`,
+        changed: true,
+      });
+    }
     if (method === "GET" && path === "/api/wiki/jobs") {
       return sendJson(req, res, 200, {
         jobs: e2eSeeds.wiki

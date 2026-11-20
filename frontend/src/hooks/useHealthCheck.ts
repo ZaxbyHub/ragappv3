@@ -276,6 +276,13 @@ export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
 
     const checkHealth = async (): Promise<void> => {
       if (!isCurrentLifetime(context, lifetime)) return;
+      // Visibility gate (#1158 AC5): no health request is issued while the
+      // document is hidden. Gating here covers every dispatch path — the
+      // mount check, the poll interval, and the unknown-services recheck
+      // chain (they all funnel through this function). The interval keeps
+      // running, so the first visible tick after un-hiding catches up; the
+      // settled label (last-known state) stays stable meanwhile.
+      if (typeof document !== "undefined" && document.hidden) return;
       const read: HealthRead = { context, lifetime, token: Symbol("health-read"), sequence: lifetime.nextReadSequence++ };
       if (!isCurrentLifetime(context, lifetime)) return;
       latestReadRef.current = read;

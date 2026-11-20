@@ -1,52 +1,68 @@
 // frontend/src/hooks/useJobStatus.issue1039.test.ts
 //
-// Issue #1039 ([Workstream M] follow-up to #784): the Activity tray's
-// aggregation poll must NOT dispatch the reindex family for principals that
-// can never see it — GET /documents/reindex/jobs sits behind
-// require_admin_role, so a member/viewer session's every tick was a
-// guaranteed, swallowed-but-browser-logged 403 (~7.5 wasted requests/minute
-// per mounted tray, 2026-10-28 deployment evidence).
+// Issue #1039 ([Workstream M] follow-up to #784): the Activity tray's poll
+// must never waste requests on the reindex family for principals that can
+// never see it — GET /documents/reindex/jobs sits behind require_admin_role,
+// so a member/viewer session's every tick was a guaranteed,
+// swallowed-but-browser-logged 403 (~7.5 wasted requests/minute per mounted
+// tray, 2026-10-28 deployment evidence).
 //
-// Discriminating coverage (AC1): member/viewer principals mount the tray
-// poller, advance multiple ticks, and dispatch ZERO reindex requests while
-// the other four families keep polling and rendering (AC3). Preserving
-// coverage (AC2): admin/superadmin principals keep the family every poll.
-// Backoff coverage: a role-less principal (auth still hydrating, or a
-// user-less session shape like single_admin) gets exactly one 403, then the
-// family is skipped until the principal changes; non-403 failures never arm
-// the backoff; a later admin publication overrides an armed backoff. Review
-// round (swarm-pr-review run pr1047-20261103) adds: the server's 403 verdict
-// outranks a stale admin role guess (PRR-001), and a parked 403 from a
-// previous principal never hides the current one (PRR-003).
+// SERVER-ENFORCED SINCE #1157: the contract is now carried by the aggregate
+// endpoint (GET /api/activity/jobs), which scopes reindex rows to admins the
+// same way it scopes every family to the caller's readable vaults. The old
+// client-side layers — the role-guess gate and the 403-learning backoff
+// (including the PRR-001/PRR-003 review repairs) — are DELETED BY DESIGN: a
+// member simply receives no reindex rows in the aggregate, so there is no
+// request to skip and no 403 to learn from. These tests pin the aggregate
+// seam from both sides of that scoping:
+//   - the poller NEVER dispatches any legacy family route (reindex included)
+//     across ticks — the waste class #1039 documented cannot recur, because
+//     the only request the tray makes is getActivityJobs;
+//   - a member-shaped response (no reindex rows) renders no reindex rows
+//     while sibling families keep rendering (the AC1/AC3 guarantee);
+//   - an admin-shaped response renders the reindex row with the server's
+//     title (the AC2 guarantee);
+//   - the response shape — not the client role snapshot — decides
+//     visibility: the principal channel can no longer influence the poll,
+//     which is the #1039 invariant restated for the server-enforced world;
+//   - an aggregate 403 keeps the chain polling at cadence: the per-family
+//     backoff layer is gone, and a single failed aggregate tick is a
+//     one-tick degradation, never a learned skip.
 //
-// The principal is driven through the REAL auth-lifecycle publication
-// (publishAuthPrincipal) — the same channel useAuthStore feeds in the app —
-// so these tests exercise the exact gate the production shell reads. Mock
-// layout mirrors useJobStatus.m04.test.ts (hoisted factories; the vault
-// store stand-in; the real documentProgress).
-//
-// Ordering note: the beforeEach sentinel publication both resets the role
-// to null AND bumps the principal generation, which clears any backoff a
-// previous test armed — the suite stays order-independent.
+// The principal is still driven through the REAL auth-lifecycle publication
+// (publishAuthPrincipal) in the role-invariance test so the file keeps its
+// linkage to the exact channel the old client gate read. Mock layout
+// mirrors useJobStatus.audit1115.budget.test.tsx (hoisted factories; the
+// vault-store stand-in stays mocked so its non-consultation stays asserted).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { renderHook, act } from "@testing-library/react";
+import { renderHook, waitFor, act } from "@testing-library/react";
 import { publishAuthPrincipal } from "@/lib/api/auth-lifecycle";
+import type { ActivityJob } from "@/lib/api";
 
 const {
+  mockGetActivityJobs,
   mockListDocuments,
   mockListReindexJobs,
+  mockListWikiJobs,
   mockListKMSJobs,
   mockListDrafts,
   mockListDraftJobs,
   mockVaultState,
 } = vi.hoisted(() => ({
+  mockGetActivityJobs: vi.fn(),
   mockListDocuments: vi.fn(),
   mockListReindexJobs: vi.fn(),
+  mockListWikiJobs: vi.fn(),
   mockListKMSJobs: vi.fn(),
   mockListDrafts: vi.fn(),
   mockListDraftJobs: vi.fn(),
   mockVaultState: vi.fn(),
+}));
+
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/api")>()),
+  getActivityJobs: mockGetActivityJobs,
 }));
 
 vi.mock("@/lib/api/core", () => ({
@@ -55,7 +71,7 @@ vi.mock("@/lib/api/core", () => ({
 }));
 
 vi.mock("@/lib/api/wiki", () => ({
-  listWikiJobs: vi.fn(),
+  listWikiJobs: mockListWikiJobs,
 }));
 
 vi.mock("@/lib/api/kms", () => ({
@@ -72,39 +88,38 @@ vi.mock("@/stores/useVaultStore", () => ({
 }));
 
 import { useActivityJobs } from "./useJobStatus";
-import { listWikiJobs } from "@/lib/api/wiki";
 
-function wikiJob(id: number, status: string) {
+/** A complete ActivityJob row; per-family fields default to their nulls. */
+function activityJob(
+  overrides: Partial<ActivityJob> & Pick<ActivityJob, "family" | "id">
+): ActivityJob {
   return {
-    id,
-    vault_id: 1,
-    trigger_type: "manual",
-    trigger_id: null,
-    status,
-    error: null,
-    result_json: "{}",
+    vault_id: null,
+    status: "running",
+    title: "t",
     created_at: "2026-01-01T00:00:00Z",
-    started_at: null,
     completed_at: null,
-    retry_count: 0,
+    draft_id: null,
+    file_id: null,
+    active_stage: null,
+    phase: null,
+    phase_message: null,
+    progress_percent: null,
+    processed_units: null,
+    total_units: null,
+    unit_label: null,
+    error: null,
+    ...overrides,
   };
 }
 
-function reindexJob(id: number, status: string, vaultId: number | null = 4) {
-  return {
-    id,
-    vault_id: vaultId,
-    trigger_type: "api",
-    trigger_id: "1",
-    status,
-    error: null,
-    result_json: "{}",
-    input_json: "{}",
-    retry_count: 0,
-    created_at: "2026-01-01T00:00:00Z",
-    started_at: null,
-    completed_at: null,
-  };
+/** The wire shape GET /api/activity/jobs answers with. */
+function activityResponse(
+  jobs: ActivityJob[] = [],
+  changeToken = "t0",
+  changed = false,
+) {
+  return { jobs, change_token: changeToken, changed };
 }
 
 /** Flush the synchronous mount tick's promise chain (see the m04 floor test). */
@@ -123,32 +138,26 @@ async function advanceTicks(ms: number) {
   });
 }
 
-/** Publish the sentinel-then-null pair: role unknown AND backoff cleared. */
-function resetPrincipalToUnknown() {
-  publishAuthPrincipal({ id: 103_900, role: "member" });
-  publishAuthPrincipal(null);
-}
-
 beforeEach(() => {
-  resetPrincipalToUnknown();
   mockVaultState.mockReturnValue({
     vaults: [{ id: 1 }],
     loading: false,
     fetchVaults: vi.fn().mockResolvedValue(undefined),
   });
+  mockGetActivityJobs.mockReset();
+  mockGetActivityJobs.mockResolvedValue(activityResponse());
   mockListDocuments.mockReset();
   mockListDocuments.mockResolvedValue({ documents: [], total: 0 });
+  mockListReindexJobs.mockReset();
+  mockListReindexJobs.mockResolvedValue({ jobs: [] });
+  mockListWikiJobs.mockReset();
+  mockListWikiJobs.mockResolvedValue({ jobs: [] });
   mockListKMSJobs.mockReset();
   mockListKMSJobs.mockResolvedValue({ jobs: [] });
   mockListDrafts.mockReset();
   mockListDrafts.mockResolvedValue({ items: [], total: 0, page: 1, per_page: 10 });
   mockListDraftJobs.mockReset();
   mockListDraftJobs.mockResolvedValue({ items: [], total: 0, page: 1, per_page: 20 });
-  mockListReindexJobs.mockReset();
-  mockListReindexJobs.mockResolvedValue({ jobs: [] });
-  const wikiMock = vi.mocked(listWikiJobs);
-  wikiMock.mockReset();
-  wikiMock.mockResolvedValue({ jobs: [] });
 });
 
 afterEach(() => {
@@ -156,186 +165,153 @@ afterEach(() => {
   publishAuthPrincipal(null);
 });
 
-describe("useActivityJobs reindex-family visibility (issue #1039)", () => {
-  it.each(["member", "viewer"])(
-    "AC1/AC3: a %s principal dispatches zero reindex requests while the other four families keep polling and rendering",
-    async (role) => {
-      vi.useFakeTimers();
-      publishAuthPrincipal({ id: 501, role });
-      // A live wiki row proves sibling families still RENDER (not just poll).
-      const wikiMock = vi.mocked(listWikiJobs);
-      wikiMock.mockResolvedValue({ jobs: [wikiJob(31, "running")] });
-
-      const { result } = renderHook(() => useActivityJobs({ intervalMs: 1000 }));
-
-      await flushFirstTick();
-      await advanceTicks(2300); // mount tick + ~2 scheduled ticks
-
-      expect(mockListReindexJobs).not.toHaveBeenCalled();
-      // Every sibling family kept its per-tick cadence (>= 3 ticks).
-      expect(wikiMock.mock.calls.length).toBeGreaterThanOrEqual(3);
-      expect(mockListKMSJobs.mock.calls.length).toBeGreaterThanOrEqual(3);
-      expect(mockListDrafts.mock.calls.length).toBeGreaterThanOrEqual(3);
-      expect(mockListDocuments.mock.calls.length).toBeGreaterThanOrEqual(3);
-      const wiki = result.current.rows.filter((r) => r.family === "wiki");
-      expect(wiki.map((r) => r.key)).toEqual(["wiki-31"]);
-      expect(result.current.rows.some((r) => r.family === "reindex")).toBe(false);
-    }
-  );
-
-  it.each(["admin", "superadmin"])(
-    "AC2: a %s principal keeps listing reindex jobs every poll",
-    async (role) => {
-      vi.useFakeTimers();
-      publishAuthPrincipal({ id: 502, role });
-      mockListReindexJobs.mockResolvedValue({
-        jobs: [reindexJob(21, "running")],
-      });
-
-      const { result } = renderHook(() => useActivityJobs({ intervalMs: 1000 }));
-
-      await flushFirstTick();
-      await advanceTicks(2300);
-
-      expect(mockListReindexJobs.mock.calls.length).toBeGreaterThanOrEqual(3);
-      const reindex = result.current.rows.filter((r) => r.family === "reindex");
-      expect(reindex.map((r) => r.key)).toEqual(["reindex-21"]);
-      expect(reindex[0]?.title).toBe("Embedding reindex (vault 4)");
-    }
-  );
-
-  it("does not arm the backoff on non-403 failures (family keeps polling)", async () => {
+describe("useActivityJobs reindex visibility (issues #1039 / #1157 — server-enforced)", () => {
+  it("AC1 (server-enforced): across ticks the poller dispatches ZERO legacy family routes — getActivityJobs is the only request", async () => {
     vi.useFakeTimers();
-    // Role is unknown (beforeEach reset); a 502-shaped normalized error must
-    // not hide the family — only the admin gate's 403 may.
-    mockListReindexJobs.mockRejectedValue(
-      Object.assign(new Error("network down"), { status: 502 })
+
+    renderHook(() => useActivityJobs({ intervalMs: 1000 }));
+
+    await flushFirstTick();
+    await advanceTicks(2300); // mount tick + ~2 scheduled ticks
+
+    // The aggregate endpoint is alive (>= 3 ticks dispatched)...
+    expect(mockGetActivityJobs.mock.calls.length).toBeGreaterThanOrEqual(3);
+    // ...and none of the legacy family routes — reindex included, the exact
+    // waste class #1039 documented — is ever consulted. The vault store is
+    // not consulted either: scoping is the server's job now.
+    expect(mockListReindexJobs).not.toHaveBeenCalled();
+    expect(mockListDocuments).not.toHaveBeenCalled();
+    expect(mockListWikiJobs).not.toHaveBeenCalled();
+    expect(mockListKMSJobs).not.toHaveBeenCalled();
+    expect(mockListDrafts).not.toHaveBeenCalled();
+    expect(mockListDraftJobs).not.toHaveBeenCalled();
+    expect(mockVaultState).not.toHaveBeenCalled();
+  });
+
+  it("AC1/AC3: a member-shaped response (no reindex rows) renders no reindex rows while sibling families keep rendering", async () => {
+    // The server scopes reindex to admins: a member's aggregate simply has
+    // no reindex rows, and the tray must neither invent nor miss anything.
+    mockGetActivityJobs.mockResolvedValue(
+      activityResponse(
+        [
+          activityJob({ family: "wiki", id: 31, vault_id: 1, status: "running", title: "Wiki compile" }),
+          activityJob({ family: "kms", id: 11, vault_id: 1, status: "running", title: "KMS recompile" }),
+        ],
+        "t1",
+        true
+      )
     );
 
-    renderHook(() => useActivityJobs({ intervalMs: 1000 }));
+    const { result } = renderHook(() => useActivityJobs({ intervalMs: 8000 }));
 
-    await flushFirstTick();
-    await advanceTicks(2300);
-
-    expect(mockListReindexJobs.mock.calls.length).toBeGreaterThanOrEqual(3);
+    await waitFor(
+      () => {
+        expect(result.current.rows).toHaveLength(2);
+      },
+      { timeout: 8_000 }
+    );
+    // Sibling families RENDER (not just poll) — the AC3 half of the guarantee.
+    expect(result.current.rows.map((r) => r.family).sort()).toEqual(["kms", "wiki"]);
+    expect(result.current.rows.some((r) => r.family === "reindex")).toBe(false);
   });
 
-  it("backoff: a role-less principal gets exactly one 403, then the family is skipped until the principal changes", async () => {
-    vi.useFakeTimers();
-    // Normalized interceptor shape: top-level `status` (core.ts sets it).
-    mockListReindexJobs
-      .mockRejectedValueOnce(Object.assign(new Error("Admin access required"), { status: 403 }))
-      .mockResolvedValue({ jobs: [] });
+  it("AC2: an admin-shaped response renders the reindex row with the server's title", async () => {
+    mockGetActivityJobs.mockResolvedValue(
+      activityResponse(
+        [
+          // vault_id is null only for admin-visible global reindex rows.
+          activityJob({ family: "reindex", id: 21, vault_id: null, status: "running", title: "Embedding reindex (vault 4)" }),
+        ],
+        "t1",
+        true
+      )
+    );
 
-    renderHook(() => useActivityJobs({ intervalMs: 1000 }));
+    const { result } = renderHook(() => useActivityJobs({ intervalMs: 8000 }));
 
-    await flushFirstTick();
-    expect(mockListReindexJobs.mock.calls.length).toBe(1);
-
-    await advanceTicks(2300);
-    // Backoff armed: no further dispatch for this principal, while the
-    // sibling families kept their cadence (AC3 holds under backoff too).
-    expect(mockListReindexJobs.mock.calls.length).toBe(1);
-    expect(mockListDocuments.mock.calls.length).toBeGreaterThanOrEqual(3);
-
-    // A principal change (login-as switch, no reload) re-opens the family:
-    // the new principal gets its own first-dispatch chance.
-    publishAuthPrincipal({ id: 103_901, role: "member" });
-    publishAuthPrincipal(null);
-    await advanceTicks(1100);
-    expect(mockListReindexJobs.mock.calls.length).toBe(2);
+    await waitFor(
+      () => {
+        expect(result.current.rows).toHaveLength(1);
+      },
+      { timeout: 8_000 }
+    );
+    const reindex = result.current.rows.filter((r) => r.family === "reindex");
+    expect(reindex.map((r) => r.key)).toEqual(["reindex-21"]);
+    expect(reindex[0]?.title).toBe("Embedding reindex (vault 4)");
+    expect(reindex[0]?.phase).toBe("running");
+    expect(reindex[0]?.terminal).toBe(false);
+    expect(reindex[0]?.cancellable).toBe(false);
   });
 
-  it("backoff: a role arriving after the first 403 overrides it (admin re-opens the family)", async () => {
-    vi.useFakeTimers();
-    // Auth hydrating late: first tick runs role-less and is refused...
-    mockListReindexJobs
-      .mockRejectedValueOnce(Object.assign(new Error("Admin access required"), { status: 403 }))
-      .mockResolvedValue({ jobs: [reindexJob(22, "running", null)] });
+  it("the response shape — not the client role snapshot — decides reindex visibility (the client-side gate is gone)", async () => {
+    // Pre-#1157 the hook read the auth-lifecycle principal to guess whether
+    // the reindex lane should dispatch. That gate is deleted: the SAME
+    // publications must not change what renders. Drive the real channel
+    // both ways and assert only the response decides.
+    publishAuthPrincipal({ id: 501, role: "member" });
+    mockGetActivityJobs.mockResolvedValue(
+      activityResponse(
+        [activityJob({ family: "reindex", id: 22, vault_id: null, status: "running", title: "Embedding reindex" })],
+        "t1",
+        true
+      )
+    );
+    const memberView = renderHook(() => useActivityJobs({ intervalMs: 8000 }));
+    await waitFor(
+      () => {
+        expect(memberView.result.current.rows.some((r) => r.family === "reindex")).toBe(true);
+      },
+      { timeout: 8_000 }
+    );
+    memberView.unmount();
 
-    renderHook(() => useActivityJobs({ intervalMs: 1000 }));
+    // Same member publication, member-shaped response: no reindex rows —
+    // the client role snapshot neither adds nor hides anything.
+    mockGetActivityJobs.mockResolvedValue(
+      activityResponse(
+        [activityJob({ family: "wiki", id: 31, vault_id: 1, status: "running", title: "Wiki compile" })],
+        "t2",
+        true
+      )
+    );
+    const shapedView = renderHook(() => useActivityJobs({ intervalMs: 8000 }));
+    await waitFor(
+      () => {
+        expect(shapedView.result.current.rows).toHaveLength(1);
+      },
+      { timeout: 8_000 }
+    );
+    expect(shapedView.result.current.rows.some((r) => r.family === "reindex")).toBe(false);
 
-    await flushFirstTick();
-    expect(mockListReindexJobs.mock.calls.length).toBe(1);
-
-    // ...then the principal lands: an admin must see the family again.
-    publishAuthPrincipal({ id: 503, role: "admin" });
-    await advanceTicks(1100);
-    expect(mockListReindexJobs.mock.calls.length).toBeGreaterThanOrEqual(2);
+    // And a superadmin snapshot changes nothing either: the response is the
+    // only input.
+    publishAuthPrincipal({ id: 502, role: "superadmin" });
+    const adminView = renderHook(() => useActivityJobs({ intervalMs: 8000 }));
+    await waitFor(
+      () => {
+        expect(adminView.result.current.rows).toHaveLength(1);
+      },
+      { timeout: 8_000 }
+    );
+    expect(adminView.result.current.rows.some((r) => r.family === "reindex")).toBe(false);
   });
 
-  // Review PRR-001 (swarm-pr-review run pr1047-20261102): the role branch used
-  // to return BEFORE the armed backoff was ever read, so a principal whose
-  // client-side role snapshot said admin while the server refused the route
-  // (a mid-session demotion — require_admin_role re-reads users.role per
-  // request — or a proxy 403) kept dispatching the dead request every tick
-  // for the whole session. The server's 403 verdict must outrank the stale
-  // role guess.
-  it("review PRR-001: a known-admin role whose dispatch 403s stops polling after the refusal", async () => {
+  it("a 403 from the aggregate keeps the chain polling at cadence (the 403-learning layer is gone)", async () => {
     vi.useFakeTimers();
-    publishAuthPrincipal({ id: 504, role: "admin" });
-    // Every dispatch is refused; nothing self-heals because the client role
-    // is republished only on login/init/fetchMe/profile update.
-    mockListReindexJobs.mockRejectedValue(
+    // Old world: the reindex lane's 403 armed a per-principal backoff and
+    // the family was skipped. New world: the server scopes BEFORE a 403 can
+    // exist, so an aggregate failure (any status) is a one-tick degradation
+    // — the chain must keep its cadence, never learn to stop.
+    mockGetActivityJobs.mockRejectedValue(
       Object.assign(new Error("Admin access required"), { status: 403 })
     );
 
     renderHook(() => useActivityJobs({ intervalMs: 1000 }));
 
     await flushFirstTick();
-    expect(mockListReindexJobs.mock.calls.length).toBe(1);
+    expect(mockGetActivityJobs.mock.calls.length).toBe(1);
 
     await advanceTicks(2300);
-    // Pre-fix this counted 3: the armed backoff was dead state on the
-    // role-known branch, so the guaranteed-403 dispatch repeated every tick.
-    expect(mockListReindexJobs.mock.calls.length).toBe(1);
-    // The sibling families keep their cadence (AC3 holds under this backoff).
-    expect(mockListDocuments.mock.calls.length).toBeGreaterThanOrEqual(3);
-    expect(mockListKMSJobs.mock.calls.length).toBeGreaterThanOrEqual(3);
-  });
-
-  // Review PRR-003: the backoff used to be keyed by the generation current
-  // when the rejection LANDED, so a 403 from a parked request dispatched
-  // under a previous principal hid the new principal without it ever probing.
-  // The arm now records the dispatch generation. The poller is settle-driven
-  // (an in-flight fetch blocks the next tick), so the reachable sequence is:
-  // dispatch under G0 -> principal switch to G1 -> the parked rejection lands
-  // -> the next tick must PROBE rather than treat G1 as already hidden.
-  it("review PRR-003: a parked 403 from a previous principal does not hide the current one", async () => {
-    vi.useFakeTimers();
-    // First dispatch parks in flight under the role-less principal...
-    let rejectParked: (error: unknown) => void = () => {};
-    mockListReindexJobs.mockImplementationOnce(
-      () =>
-        new Promise((_resolve, reject) => {
-          rejectParked = reject;
-        })
-    );
-    // ...and every later dispatch resolves normally.
-    mockListReindexJobs.mockResolvedValue({ jobs: [] });
-
-    renderHook(() => useActivityJobs({ intervalMs: 1000 }));
-    await flushFirstTick();
-    expect(mockListReindexJobs.mock.calls.length).toBe(1);
-
-    // Principal changes while the request is still in flight. No further
-    // dispatch can happen yet: the settle-driven poller is blocked on the
-    // parked promise.
-    publishAuthPrincipal({ id: 103_902, role: "member" });
-    publishAuthPrincipal(null);
-    await advanceTicks(1100);
-    expect(mockListReindexJobs.mock.calls.length).toBe(1);
-
-    // The parked pre-switch rejection lands. Pre-fix it armed the CURRENT
-    // (post-switch) generation's backoff, so the new principal stayed hidden
-    // and the count froze at 1 forever.
-    await act(async () => {
-      rejectParked(Object.assign(new Error("Admin access required"), { status: 403 }));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    await advanceTicks(1100);
-    // The post-switch generation is probed: the stale verdict did not carry.
-    expect(mockListReindexJobs.mock.calls.length).toBe(2);
+    expect(mockGetActivityJobs.mock.calls.length).toBeGreaterThanOrEqual(3);
   });
 });

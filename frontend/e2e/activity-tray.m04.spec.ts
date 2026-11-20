@@ -64,6 +64,9 @@
 // ----------------------------------------------------------------------------
 
 import { test, expect, type Page } from "@playwright/test";
+// Note (#1157/#1158): the tray READS the aggregated GET /api/activity/jobs
+// stub route (one request per poll); the per-family stub routes remain for
+// the cancel/retry ACTION endpoints and the /_e2e/jobs seeding contract.
 
 const STUB_PORT = process.env.E2E_STUB_PORT || "9090";
 const STUB_ORIGIN = `http://localhost:${STUB_PORT}`;

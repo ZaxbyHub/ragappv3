@@ -1,0 +1,20 @@
+# feat(activity): vault-scoped activity API + bounded job lists + tray polling budget
+
+## What changed
+- **New `GET /api/activity/jobs`** (`backend/app/api/routes/activity.py`): one vault-scoped read aggregating every background-job family (ingest/wiki/kms/draft-room/reindex) for exactly the vaults the caller can read. Admins see all vaults including NULL-vault global reindex rows; members get no reindex rows (the #1039 posture, now enforced server-side). Draft rows stay owner-scoped (`drafts.created_by`) for every role, matching the draft-room routes' own boundary. The response carries a `change_token` — a SHA-256 digest over the exact bounded per-family windows — so an unchanged token yields an empty delta (`changed=false`). Disabled wiki/KMS subsystems contribute zero rows; legacy reindex `interrupted` maps to `failed` exactly as the reindex list route does.
+- **Bounded default job lists** (#1157 AC3): `GET /api/wiki/jobs` and `GET /api/kms/jobs` now return at most 50 rows when `limit` is omitted (explicit `limit` up to 500 still fetches deeper; `KMSStore.list_jobs` gained the LIMIT in both lease branches). `KMSPage`'s recompile poll moved to the single-job route (`getKMSJob` over `GET /kms/jobs/{id}`) so a watched job beyond the default page stays visible.
+- **Activity tray polling budget** (#1158): the tray's `useActivityJobs` now polls the aggregate endpoint — ONE request per tick instead of `2..6 + 2*V + 1 + D` per-family/per-vault fan-out — with an idle backoff (8s active / 32s idle / skip-while-hidden): ≤8 requests/min active, ≤2 idle, 0 hidden, against the <10/min contract.
+- **Tray UX fixes** (#1158): the collapsed state persists across remounts (`localStorage` key `activity-tray-collapsed`, NavigationRail pattern); the desktop anchor rose to `md:bottom-54` (216px) so the expanded tray no longer intersects the chat composer's Send control (15px at 1024x768) or the documents table band (5px/105px at 1280x800/1440x900, measured at base); the focus-restore guard moved out of render into a passive effect with pre-removal focus tracking (a focusout with a concrete external `relatedTarget` marks a deliberate move and is never stolen back; a null `relatedTarget` is the node-removal signature and still restores focus to the header).
+- **Health visibility** (#1158): `useHealthCheck` issues no request while `document.hidden` (mount check, interval, and recheck chain all gated); the settled label stays stable.
+
+## Why
+Audit 2026-11-15 (issues #1157, #1158): job state required per-family, per-vault fan-out polling (a 3-vault session issued ~19 requests every 8 seconds); the two job-list routes were unbounded by default; the tray overlay covered the composer's Send control and the documents table's action column on deployed builds; the Hide choice reset on every navigation; health checks kept firing in background tabs.
+
+## Migration
+- API consumers of `GET /api/wiki/jobs` / `GET /api/kms/jobs` that relied on the omitted-limit unbounded list must pass an explicit `limit` (≤500). The frontend's own consumers already do or moved to the single-job route.
+- `listKMSJobs` keeps its export (the route remains); it has no production importer as of this change (dated allowlist entry in `frontend/src/lib/api/kms.unused-export.guardrail.test.ts`).
+
+## Caveats
+- The activity change token fingerprints the bounded visible windows: mutations entirely outside an old snapshot's window (e.g. a >50-deep historical row's deletion) do not change the token — the contract is delta-of-visible-state. A lease-branch flip can change row representations and thus the token. Disclosed in the route docstring.
+- Documents beyond the tray's per-family `limit` are not surfaced by the aggregate (same disclosure the old ingest page budget carried).
+- Two live `useHealthCheck` instances (App + MainAppShell, each 30s) predate this change and remain: this PR only gates them on visibility. Recorded in the PR's Considered table with a re-evaluation trigger.
