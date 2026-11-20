@@ -1,4 +1,4 @@
-export type ScoreType = "distance" | "rerank" | "fts";
+export type ScoreType = "distance" | "rerank" | "fts" | "positional";
 
 export interface RelevanceLabel {
   text: string;
@@ -30,10 +30,16 @@ export interface RelevanceLabel {
  * calibration — no honest band exists for it, so it returns null and every
  * caller must null-guard before dereferencing .color/.text (the label is
  * suppressed, not guessed).
+ *
+ * "positional" (issue #1150 feedback round) is a PER-SOURCE kind for
+ * retrieval-window neighbours included by position rather than score (the
+ * Draft evidence gate consumes them with identity normalization). They are
+ * not relevance-graded, so their label is suppressed like "fts".
  */
 export function getRelevanceLabel(score: number, scoreType?: ScoreType): RelevanceLabel | null {
-  if (scoreType === "fts") {
-    // Uncalibrated per-source kind (issue #1070): no relevance label.
+  if (scoreType === "fts" || scoreType === "positional") {
+    // Uncalibrated / positional per-source kinds (issues #1070, #1150): no
+    // relevance label.
     return null;
   }
   if (!scoreType || scoreType === "distance") {

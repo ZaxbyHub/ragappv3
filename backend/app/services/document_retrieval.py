@@ -891,6 +891,16 @@ class DocumentRetrievalService:
                         distance, fts_sourced = _no_distance_row_score(chunk)
                         if distance is None:
                             distance = 1.0
+                            # Issue #1149 feedback: a 1.0 placeholder score on
+                            # an adjacency row is NOT a cosine distance — under
+                            # the Draft evidence gate's typed normalization it
+                            # would resolve to relevance 0.0 and be dropped
+                            # (or inflate to 1.0 under rerank). The row is
+                            # included by POSITION, so it carries the bounded
+                            # 'positional' kind, whose relevance is the row's
+                            # own score: the placeholder's 1.0 survives the
+                            # gate un-rescaled.
+                            adjacent_score_type = "positional"
                         if fts_sourced:
                             adjacent_score_type = "fts"
 

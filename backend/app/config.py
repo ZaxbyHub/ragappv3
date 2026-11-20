@@ -995,6 +995,29 @@ class Settings(BaseSettings):
     draft_default_logical_mode: str = "thinking"
     """Default logical model mode ("instant" or "thinking") for Draft Room
     compile stages that do not pin a specific mode."""
+    draft_evidence_min_score: float = 0.05
+    """Minimum normalized relevance for vault-retrieved evidence to enter the
+    Draft Room evidence registry (issue #1149). Compared against a typed
+    per-source-kind normalization in [0, 1] where higher is better (cosine
+    similarity, sigmoid rerank scores, bounded wiki/KMS decays). Sources of a
+    kind without an absolute scale ("fts" raw BM25 magnitudes) gate on
+    draft_evidence_min_fts_score instead; kinds with unknown polarity are
+    never gated. Strict comparison: equality passes."""
+    draft_evidence_min_fts_score: float = 0.5
+    """Minimum raw BM25/FTS score for document full-text-search evidence rows
+    (issue #1149). Separate scale from draft_evidence_min_score because raw
+    BM25 magnitudes have no absolute [0, 1] meaning; default aligned with the
+    upstream document-retrieval FTS floor so default gating is at parity."""
+    draft_quality_section_floor_words: int = 40
+    """Absolute floor, in words, for the per-section over-budget blocker: a
+    section blocks only above max(1.5 x budget, budget + this floor), so tiny
+    sections can never trip the relative rule alone (issue #1150)."""
+    draft_quality_rule_version: str = "1"
+    """Version of the deterministic quality-gate rule set (length, duplicate,
+    heading, process-commentary and trailing-source blockers, issue #1150).
+    Recorded on those lint findings so waivers stay bound to the rule set
+    they were granted against; independent of the curated boilerplate
+    version. Any change to a gate rule must bump this."""
 
     # Document processing configuration (legacy - DEPRECATED)
     chunk_size: int | None = None
@@ -1983,12 +2006,33 @@ class Settings(BaseSettings):
         "draft_job_timeout_seconds",
         "draft_job_max_model_calls",
         "draft_research_retrieval_limit",
+        "draft_quality_section_floor_words",
         mode="after",
     )
     @classmethod
     def validate_draft_positive_ints(cls, v: int) -> int:
         """Validate Draft Room pipeline budget/limit settings are >= 1."""
         return cls._validate_int_range(v, 1, None, "draft pipeline setting")
+
+    @field_validator("draft_evidence_min_score", mode="after")
+    @classmethod
+    def validate_draft_evidence_min_score(cls, v: float) -> float:
+        """Validate the normalized evidence-relevance floor is finite in [0, 1]."""
+        return cls._validate_float_range(v, 0.0, 1.0, "draft_evidence_min_score")
+
+    @field_validator("draft_evidence_min_fts_score", mode="after")
+    @classmethod
+    def validate_draft_evidence_min_fts_score(cls, v: float) -> float:
+        """Validate the raw FTS evidence floor is finite and non-negative."""
+        return cls._validate_float_range(v, 0.0, None, "draft_evidence_min_fts_score")
+
+    @field_validator("draft_quality_rule_version", mode="after")
+    @classmethod
+    def validate_draft_quality_rule_version(cls, v: str) -> str:
+        """Validate the quality-gate rule version is a non-empty string."""
+        if not v.strip():
+            raise ValueError("draft_quality_rule_version must be non-empty")
+        return v
 
     @field_validator(
         "draft_qa_retry_limit",

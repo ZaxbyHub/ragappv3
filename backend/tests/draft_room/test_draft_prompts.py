@@ -72,6 +72,9 @@ _RENDER_KWARGS = {
     # Issue #517 DRAFT-015: Copy/Standards declare a sixth shared placeholder
     # carrying the Fact desk's correction feedback (default on first pass).
     "correction_feedback": "(no correction feedback)",
+    # Issue #1149: the outline template declares the project's mode so the
+    # model is TOLD the mode it must plan under (it no longer chooses one).
+    "project_mode": "compose",
 }
 
 

@@ -168,6 +168,10 @@ sees when it is hit:
 | `DRAFT_TRANSIENT_RETRY_LIMIT` | `2` | Maximum automatic retries for a transient provider/retrieval error inside one compile job, with bounded backoff, before the job fails outright. |
 | `DRAFT_LINT_REWRITE_LIMIT` | `2` | Maximum automatic rewrite attempts the deterministic lint stage may apply before surfacing remaining boilerplate findings unresolved. |
 | `DRAFT_POLL_INTERVAL_SECONDS` | `2.0` | Not user-facing — how often the durable job processor polls for queued work. Lowering it increases responsiveness at the cost of more frequent DB polling. |
+| `DRAFT_EVIDENCE_MIN_SCORE` | `0.05` | Minimum normalized relevance for vault evidence entering the Draft registry; raw-BM25 rows use `DRAFT_EVIDENCE_MIN_FTS_SCORE`; kinds without an absolute scale are never gated (issue #1150). |
+| `DRAFT_EVIDENCE_MIN_FTS_SCORE` | `0.5` | Minimum raw BM25/FTS score for document full-text evidence rows — a separate scale from the normalized floor (issue #1150). |
+| `DRAFT_QUALITY_SECTION_FLOOR_WORDS` | `40` | Absolute word floor for the per-section over-budget blocker: it blocks only above max(1.5x budget, budget + floor) (issue #1150). |
+| `DRAFT_QUALITY_RULE_VERSION` | `1` | Version stamped on quality-gate findings; waivers bind to the version stored on their finding row (issue #1150). |
 | `DRAFT_BOILERPLATE_RULE_VERSION` | `"1"` | Not a cap — the curated-boilerplate rule version recorded on lint findings and required to match for a waiver to remain valid at Ready time. |
 | `DRAFT_DEFAULT_LOGICAL_MODE` | `thinking` | Not a cap — default model mode (`instant` or `thinking`) for compile stages that don't pin a specific mode. |
 

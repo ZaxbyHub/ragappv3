@@ -2840,8 +2840,16 @@ class DraftStore:
         error_code: str,
         error_message: Optional[str] = None,
         target: str = "failed",
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+        artifact_json: Optional[str] = None,
     ) -> None:
         """Mark a stage attempt ``failed``, ``skipped``, or ``cancelled``.
+
+        ``input_tokens``/``output_tokens``/``artifact_json`` record the
+        telemetry a failing stage already spent (issue #1149 AC6: a stage
+        that makes model calls and then fails persists its per-call ledger
+        and token totals, not just the error).
 
         Raises:
             DraftValidationError: ``target`` is not a valid terminal status.
@@ -2867,11 +2875,17 @@ class DraftStore:
             )
             self._db.execute(
                 "UPDATE draft_job_stages SET status = ?, error_code = ?, "
-                "error_message = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                "error_message = ?, input_tokens = COALESCE(?, input_tokens), "
+                "output_tokens = COALESCE(?, output_tokens), "
+                "artifact_json = COALESCE(?, artifact_json), "
+                "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (
                     target,
                     error_code,
                     _truncate(error_message, _MAX_ERROR_MESSAGE_LEN),
+                    input_tokens,
+                    output_tokens,
+                    artifact_json,
                     stage_row_id,
                 ),
             )

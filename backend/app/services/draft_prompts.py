@@ -41,7 +41,7 @@ from pydantic import BaseModel, Field, ValidationInfo, field_validator
 # Bundle version
 # ---------------------------------------------------------------------------
 
-PROMPT_BUNDLE_VERSION = "2026.09.11-draft-prompts-3"
+PROMPT_BUNDLE_VERSION = "2026.11.19-draft-prompts-4"
 
 # ---------------------------------------------------------------------------
 # Shared enums / literals (SPEC §4.4, §11, §12.3, §13)
@@ -207,6 +207,7 @@ class ResearchGap(BaseModel):
 
 
 class ResearchPacket(BaseModel):
+    provider_calls: list[ProviderCallRecord] = Field(default_factory=list)
     facets: list[ResearchFacet] = Field(default_factory=list)
     retrieval_status: RetrievalStatus
     requested_source_kinds: list[SourceKind] = Field(default_factory=list)
@@ -255,6 +256,23 @@ class OutlineCritic(BaseModel):
 class OutlineArtifact(BaseModel):
     mode: OutlineMode
     sections: list[OutlineSection] = Field(default_factory=list)
+    provider_calls: list[ProviderCallRecord] = Field(default_factory=list)
+    voice_rules: list[str] = Field(default_factory=list)
+    critic: OutlineCritic
+
+
+class OutlineModelOutput(BaseModel):
+    """The MODEL-FACING outline output (issue #1149): everything except mode.
+
+    The project's mode is a project-level fact the pipeline already knows
+    (``_CompileContext.mode``), so the model is never asked to choose it: the
+    provider schema has no ``mode`` key, and the pipeline stamps the persisted
+    :class:`OutlineArtifact` from the compile context. Extra keys in a
+    response are ignored, so legacy model outputs that emitted ``mode`` still
+    parse — the value is simply discarded and re-stamped.
+    """
+
+    sections: list[OutlineSection] = Field(default_factory=list)
     voice_rules: list[str] = Field(default_factory=list)
     critic: OutlineCritic
 
@@ -277,6 +295,45 @@ class ModelCallAudit(BaseModel):
     model: str
     temperature: float
     output_sha256: str
+    duration_ms: float = 0.0
+
+
+class ProviderCallRecord(BaseModel):
+    """One provider invocation's wall-clock and token telemetry (issue #1149).
+
+    Emitted at the common provider seam (``_provider_call``) so every call —
+    structured stages, the research desk, repair passes and transient retries —
+    lands in the ledger of the stage artifact that caused it. All fields carry
+    legacy-safe defaults so pre-issue checkpoints (which predate the ledger)
+    validate unchanged. ``token_source`` is honest about provenance:
+    "provider" (provider-exact usage), "estimate" (client heuristic), "mixed"
+    (provider prompt tokens with estimated completion tokens), or
+    "unavailable" (the completion seam exposed no metrics — never fabricated).
+    """
+
+    stage: str = ""
+    attempt_kind: str = "primary"
+    duration_ms: float = 0.0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    token_source: str = "unavailable"
+
+
+class CompletionResult(BaseModel):
+    """Per-invocation completion transport (issue #1149).
+
+    The production ``complete`` seam (``_default_complete``) returns this
+    instead of a bare string so
+    each call's token usage travels with its text — per-invocation by
+    construction, no shared mutable state. Callers that only need the text
+    treat a plain ``str`` return as a degraded result (no metrics), which is
+    what injected test completions get.
+    """
+
+    text: str
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    token_source: str = "unavailable"
 
 
 class DraftSection(BaseModel):
@@ -285,10 +342,12 @@ class DraftSection(BaseModel):
     evidence_labels_used: list[str] = Field(default_factory=list)
     preserved_span_results: list[PreservedSpanResult] = Field(default_factory=list)
     model_call_audit: ModelCallAudit
+    provider_calls: list[ProviderCallRecord] = Field(default_factory=list)
 
 
 class DraftArtifact(BaseModel):
     sections: list[DraftSection] = Field(default_factory=list)
+    provider_calls: list[ProviderCallRecord] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +364,14 @@ class LintFinding(BaseModel):
     end: int
     excerpt: str
     message: str
+    # Per-finding rule-set identity (issue #1150): the gate rules carry their
+    # own version (settings.draft_quality_rule_version) while the curated
+    # boilerplate family keeps the report-wide version. A waiver binds to the
+    # version stored on the finding row; bumping the SETTING changes the
+    # version stamped on NEW findings only and does not retroactively
+    # invalidate stored rows. ``None`` (the default on legacy artifacts)
+    # means "use the report's rule_version".
+    rule_version: str | None = None
 
     @field_validator("end")
     @classmethod
@@ -386,6 +453,7 @@ class CopyReport(CopyModelReport):
     """
 
     unapplied_edits: list[CopyEdit] = Field(default_factory=list)
+    provider_calls: list[ProviderCallRecord] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +472,7 @@ class StandardsReport(StandardsModelReport):
     """Persisted standards-desk artifact; mirrors CopyReport's shape."""
 
     unapplied_edits: list[CopyEdit] = Field(default_factory=list)
+    provider_calls: list[ProviderCallRecord] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +504,7 @@ class FactClaim(BaseModel):
 
 class FactReport(BaseModel):
     claims: list[FactClaim] = Field(default_factory=list)
+    provider_calls: list[ProviderCallRecord] = Field(default_factory=list)
     findings: list[str] = Field(default_factory=list)
 
 
@@ -554,7 +624,7 @@ _RESEARCH_TEMPLATE = _frame(
 )
 
 _OUTLINE_PROMPT_ID = "draft_room.outline.v1"
-_OUTLINE_VERSION = "1.0.0"
+_OUTLINE_VERSION = "1.1.0"
 _OUTLINE_TEMPLATE = _frame(
     prompt_id=_OUTLINE_PROMPT_ID,
     version=_OUTLINE_VERSION,
@@ -564,9 +634,11 @@ _OUTLINE_TEMPLATE = _frame(
         "critique that plan against the brief and the allowed evidence."
     ),
     brief_section=(
-        "TASK: In 'rewrite' mode, preserve the manuscript's existing logical "
-        "sequence unless the brief explicitly permits restructuring. In "
-        "'compose' mode, build a new outline from the evidence. Every section "
+        "TASK: The project's mode is '{project_mode}' — you do NOT choose the "
+        "mode; plan for exactly this mode. In 'rewrite' mode, preserve the "
+        "manuscript's existing logical sequence unless the brief explicitly "
+        "permits restructuring. In 'compose' mode, build a new outline from "
+        "the evidence. Every section "
         "must list only evidence labels from the allowed registry, any "
         "manuscript spans or quotations that must be preserved verbatim, and "
         "concrete acceptance checks. Then critique the plan: return "
@@ -576,11 +648,11 @@ _OUTLINE_TEMPLATE = _frame(
         "not ask to keep revising indefinitely."
     ),
     schema_section=(
-        "OUTPUT SCHEMA (JSON object matching OutlineArtifact): "
-        "mode ('rewrite'|'compose'), sections[] (section_id, heading, purpose, "
-        "target_words, evidence_labels[], must_preserve[], acceptance_checks[]), "
-        "voice_rules[], critic (verdict: 'approved'|'needs_revision'|'rejected', "
-        "findings[])."
+        "OUTPUT SCHEMA (JSON object matching OutlineModelOutput — no mode "
+        "key; the project's mode above is fixed): sections[] (section_id, "
+        "heading, purpose, target_words, evidence_labels[], must_preserve[], "
+        "acceptance_checks[]), voice_rules[], critic (verdict: "
+        "'approved'|'needs_revision'|'rejected', findings[])."
     ),
 )
 
@@ -731,7 +803,7 @@ PROMPTS: dict[str, PromptDefinition] = {
         version=_OUTLINE_VERSION,
         logical_mode="thinking",
         template=_OUTLINE_TEMPLATE,
-        output_model=OutlineArtifact,
+        output_model=OutlineModelOutput,
         temperature=0.2,
     ),
     "draft": PromptDefinition(

@@ -122,7 +122,7 @@ BRIEF = {
     "piece_type": "memo",
     "audience": "internal counsel",
     "purpose": "restate the review window",
-    "target_words": 60,
+    "target_words": 6,
     "transformation_strength": "moderate",
 }
 
@@ -1016,11 +1016,14 @@ class TestCancellation(PipelineTestBase):
 
         self.assertEqual(failure.code, CODE_JOB_CANCELLED)
         self.assertEqual(model.count("outline"), 1)
-        # Cancellation discards the in-flight result entirely: it raises
-        # _CompileCancelled rather than CompileFailure, so unlike a failed
-        # stage it leaves NO row at all, completed or otherwise.
-        self.assertNotIn("outline", self._stage_names())
-        self.assertEqual(self._stage_names(), ["intake", "research"])
+        # Cancellation discards the in-flight RESULT entirely (no artifact is
+        # persisted and no checkpoint is reusable), but since issue #1149 the
+        # row opened at stage entry is settled as failed with the
+        # cancellation code rather than orphaned as "running".
+        self.assertEqual(self._stage_names(), ["intake", "research", "outline"])
+        outline_rows = [r for r in self._stages() if r.stage == "outline"]
+        self.assertEqual(len(outline_rows), 1)
+        self.assertEqual(outline_rows[0].status, "failed")
         self.assertEqual(self._job_row()["status"], "cancelled")
         self.assertEqual(self._draft_row()["status"], "cancelled")
         self.assertIsNone(self._current_revision())

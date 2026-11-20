@@ -190,6 +190,13 @@ class RetrievedSource:
     score: float  # retrieval score — NOT a support/confidence signal
     content_sha256: str
     updated_at: Optional[str]
+    # Typed score semantic (issue #1149): names the scale ``score`` is on so
+    # the Draft evidence gate can normalize per kind instead of guessing a
+    # polarity. "fts" is raw BM25 (higher-better, unbounded), distance kinds
+    # are lower-better, bounded kinds are [0,1] higher-better; "unknown"
+    # (the default, preserved for direct constructions in tests) is never
+    # gated by the Draft evidence minimum.
+    score_kind: str = "unknown"
     file_id: Optional[int] = None
     chunk_uid: Optional[str] = None
     wiki_page_id: Optional[int] = None
@@ -4620,7 +4627,7 @@ class RAGEngine:
 
     async def _retrieve_document_sources_for_kinds(
         self, query: str, vault_id: int, limit: int
-    ) -> List[RAGSource]:
+    ) -> tuple[List[RAGSource], bool]:
         """Full document-retrieval flow for ``retrieve_sources``' 'document' kind.
 
         Reuses ``_build_query_embeddings`` (the part genuinely shared with
@@ -4676,15 +4683,16 @@ class RAGEngine:
             ]
 
         self._sync_document_retrieval_settings()
+        reranked = bool(rerank_success) if rerank_success is not None else False
         relevant_chunks = await self.document_retrieval.filter_relevant(
             vector_results,
-            reranked=rerank_success if rerank_success is not None else False,
+            reranked=reranked,
             indexed_file_ids=indexed_file_ids,
         )
-        return relevant_chunks[:limit]
+        return relevant_chunks[:limit], reranked
 
     def _document_chunk_to_retrieved_source(
-        self, chunk: RAGSource
+        self, chunk: RAGSource, *, default_score_kind: str = "unknown"
     ) -> Optional[RetrievedSource]:
         """Map a ``document_retrieval.RAGSource`` chunk to ``RetrievedSource``.
 
@@ -4743,6 +4751,7 @@ class RAGEngine:
             artifact_id=chunk.artifact_id,
             modality=chunk.modality,
             asset_id=chunk.asset_id,
+            score_kind=chunk.score_type or default_score_kind,
         )
 
     def _wiki_evidence_to_retrieved_source(self, ev: Any) -> Optional[RetrievedSource]:
@@ -4758,6 +4767,7 @@ class RAGEngine:
             return None
         return RetrievedSource(
             kind="wiki",
+            score_kind=getattr(ev, "score_type", "unknown") or "unknown",
             title=ev.title,
             passage=passage,
             score=ev.score,
@@ -4783,6 +4793,7 @@ class RAGEngine:
             title=ev.title,
             passage=passage,
             score=ev.score,
+            score_kind=getattr(ev, "score_type", "unknown") or "unknown",
             content_sha256=_sha256_text(passage),
             updated_at=None,
             kms_entry_id=ev.entry_id,
@@ -4834,16 +4845,26 @@ class RAGEngine:
 
         if "document" in requested:
             try:
-                doc_chunks = await self._retrieve_document_sources_for_kinds(
-                    query, vault_id, limit
+                doc_chunks, doc_reranked = (
+                    await self._retrieve_document_sources_for_kinds(
+                        query, vault_id, limit
+                    )
                 )
             except Exception as exc:
                 logger.warning("retrieve_sources: document retrieval failed: %s", exc)
                 failed_kinds.add("document")
             else:
                 successful_kinds.add("document")
+                if doc_reranked:
+                    default_kind = "rerank"
+                elif settings.vector_metric in ("cosine", "l2", "dot"):
+                    default_kind = f"{settings.vector_metric}_distance"
+                else:
+                    default_kind = "unknown"
                 for chunk in doc_chunks:
-                    mapped = self._document_chunk_to_retrieved_source(chunk)
+                    mapped = self._document_chunk_to_retrieved_source(
+                        chunk, default_score_kind=default_kind
+                    )
                     if mapped is not None:
                         sources.append(mapped)
 

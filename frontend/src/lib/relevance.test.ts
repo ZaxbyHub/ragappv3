@@ -28,6 +28,18 @@ describe("getRelevanceLabel", () => {
     });
   });
 
+  describe("positional score type (issue #1150 feedback round)", () => {
+    it("test_positional_returns_null — window neighbours included by position get no relevance label", () => {
+      expect(getRelevanceLabel(1.0, "positional")).toBeNull();
+    });
+
+    it("test_positional_null_at_any_score — no rerank band is guessed for a positional row", () => {
+      expect(getRelevanceLabel(0.0, "positional")).toBeNull();
+      expect(getRelevanceLabel(1.0, "positional")).toBeNull();
+      expect(getRelevanceLabel(0.95, "positional")).toBeNull();
+    });
+  });
+
   describe("distance score type", () => {
     it("test_distance_highly_relevant — getRelevanceLabel(0.3, 'distance').text === 'Highly Relevant'", () => {
       const result = getRelevanceLabel(0.3, "distance");
