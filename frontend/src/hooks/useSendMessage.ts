@@ -401,9 +401,14 @@ export function useSendMessage(
               throw new Error("session detail unavailable");
             }
             const detail = await api.getChatSession(sessionId);
-            // Ownership check: a session switch while the lookup was in
-            // flight must not let the stale lookup rebind the store.
-            if (useChatStore.getState().activeChatId === sessionId.toString()) {
+            // Per-send ownership (review 4.5 round 3): BOTH the send
+            // generation and the active session must still be ours before
+            // ANY store mutation — a stop-and-resend in the same session
+            // bumps the generation, so the stale lookup rebinds nothing.
+            if (
+              sendGenRef.current === gen &&
+              useChatStore.getState().activeChatId === sessionId.toString()
+            ) {
               useChatStore
                 .getState()
                 .bindSession?.(sessionId.toString(), detail.vault_id ?? null);
@@ -413,18 +418,22 @@ export function useSendMessage(
             }
             sendVaultId = detail.vault_id;
           } catch {
-            // Ownership guard on the FAILURE path too: a session switch
-            // while the lookup was pending must not let the stale lookup's
-            // error clear the replacement session's streaming state or
-            // abort handle (review 4.5 round 2).
-            if (useChatStore.getState().activeChatId === sessionId.toString()) {
+            // Ownership guard on the FAILURE path too, with the SAME
+            // per-send generation check: a stale lookup (superseded by a
+            // session switch OR by a newer send in this session) must not
+            // clear the replacement's streaming state, abort handle, or
+            // send guard (review 4.5 rounds 2-3).
+            if (
+              sendGenRef.current === gen &&
+              useChatStore.getState().activeChatId === sessionId.toString()
+            ) {
               setInputError(
                 "Couldn't determine this session's vault — reload the conversation and try again."
               );
               setIsStreaming(false);
               setAbortFn(null);
+              sendingRef.current = false;
             }
-            sendingRef.current = false;
             return false;
           }
         }
