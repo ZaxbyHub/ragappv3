@@ -102,7 +102,7 @@ function StreamingRowProbe(): ReactNode {
 /** Drive one send whose stream delivers a chunk and then STAYS OPEN. */
 async function sendAndStreamOneChunk(): Promise<void> {
   act(() => {
-    useChatStore.setState({ activeChatId: "42", input: "hello" });
+    useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "hello" });
   });
   const { result } = renderHook(() => useSendMessage(7, vi.fn()));
   let sent: "sent" | "blocked" | undefined;

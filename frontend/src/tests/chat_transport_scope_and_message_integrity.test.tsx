@@ -177,7 +177,7 @@ describe("delayed interrupt after durable completion (issue #1153 AC9)", () => {
 
   it("keeps the completed turn intact when the interrupt fires after durable completion, across a reload", async () => {
     act(() => {
-      useChatStore.setState({ activeChatId: "42", input: "question" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "question" });
     });
 
     const { result } = renderHook(() => useSendMessage(7, vi.fn()));
