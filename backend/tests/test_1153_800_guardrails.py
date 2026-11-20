@@ -22,16 +22,15 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from app.main import app
 from app.api.deps import (
     get_current_active_user,
     get_db,
     get_evaluate_policy,
     get_rag_engine,
 )
+from app.main import app
 from app.models.database import init_db, run_migrations
 from app.security import csrf_protect
-
 
 ADMIN_USER = {"id": 1, "role": "admin", "username": "admin"}
 MEMBER_USER = {"id": 2, "role": "member", "username": "member"}

@@ -127,8 +127,11 @@ def attach_file_hashes(chunks, conn) -> None:
                 chunk.metadata["_file_hash"] = None
         return
     placeholders = ",".join("?" for _ in file_ids)
+    # Placeholders-only interpolation (same accepted shape as the vaults.py
+    # IN clauses): the f-string contributes nothing but N '?' marks; every
+    # value rides the parameter tuple.
     rows = conn.execute(
-        f"SELECT id, file_hash FROM files WHERE id IN ({placeholders})",
+        f"SELECT id, file_hash FROM files WHERE id IN ({placeholders})",  # nosec B608 - placeholders-only IN clause; values are bound parameters
         tuple(file_ids),
     ).fetchall()
     table_hashes = {str(row[0]): row[1] for row in rows}
