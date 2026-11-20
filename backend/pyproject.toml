@@ -17,6 +17,14 @@ ignore = ["E501"]
 # harness block sits between import groups by design and re-sorting the
 # block would change the blob the frozen checkpoint manifest pins.
 "tests/test_g04_embedding_readiness_and_metric.py" = ["I001"]
+# c04 fixture consumers (issues #946/#900 shared-fixture dedup): the imported
+# fixtures from tests/c04_fixtures.py are registered by name, so every test
+# parameter with the fixture name technically shadows the module-level import.
+"tests/test_c04_ab_exposure_failure.py" = ["F811"]
+"tests/test_c04_ab_lookup_failure.py" = ["F811"]
+"tests/test_c04_prompt_warning_contract.py" = ["F811"]
+"tests/test_c04_review_hardening.py" = ["F811"]
+"tests/test_prompt_ab_variants.py" = ["F811"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["app"]

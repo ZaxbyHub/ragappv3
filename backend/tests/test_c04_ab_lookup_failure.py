@@ -16,39 +16,15 @@ control+challenger versions, split_pct=100 experiment, vault, RAGEngine
 over the temp DB with fake collaborators).
 """
 
-import os
 import sqlite3
-import tempfile
 
 import pytest
+from c04_fixtures import fresh_db
 
-from app.models.database import run_migrations
 from app.services.ab_testing import ABTestingService
 from app.services.prompt_store import PromptVersionStore
 
 _VAULT_ID = 9973  # unique to this module; avoids cross-suite collisions
-
-
-@pytest.fixture
-def fresh_db():
-    """Temp DB with the full schema, org 10 seeded (FK target for A/B)."""
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    try:
-        run_migrations(path)
-        conn = sqlite3.connect(path)
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.row_factory = sqlite3.Row
-        conn.execute(
-            "INSERT INTO organizations (id, name, slug, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (10, "Test Org", "test-org", "2024-01-01T00:00:00Z"),
-        )
-        conn.commit()
-        yield conn
-    finally:
-        conn.close()
-        os.unlink(path)
 
 
 def test_lookup_failure_keeps_assigned_variant_and_3_5_content(

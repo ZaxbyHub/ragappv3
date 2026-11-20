@@ -29,6 +29,7 @@ def fresh_db():
     fd, path = tempfile.mkstemp(suffix=".db")
     # Close the file descriptor immediately; sqlite3.connect reopens it.
     os.close(fd)
+    conn = None
     try:
         run_migrations(path)
         conn = sqlite3.connect(path)
@@ -43,7 +44,10 @@ def fresh_db():
         conn.commit()
         yield conn
     finally:
-        conn.close()
+        # conn is bound only after run_migrations succeeds; guard so a schema
+        # failure surfaces its own traceback instead of an UnboundLocalError.
+        if conn is not None:
+            conn.close()
         os.unlink(path)
 
 
@@ -241,76 +245,84 @@ class TestPromptOverrideAPIFixtures:
 
     @pytest.fixture(autouse=True)
     def setup_db(self, monkeypatch):
-        """Set up test database with full schema + prompt_org_overrides table."""
+        """Set up test database with full schema and prompt_org_overrides table."""
         temp_dir = tempfile.mkdtemp()
         db_path = str(Path(temp_dir) / "app.db")
+        try:
+            # Clear pool cache
+            from app.models.database import _pool_cache, _pool_cache_lock
+            with _pool_cache_lock:
+                for path_, pool in list(_pool_cache.items()):
+                    pool.close_all()
+                _pool_cache.clear()
 
-        # Clear pool cache
-        from app.models.database import _pool_cache, _pool_cache_lock
-        with _pool_cache_lock:
-            for path_, pool in list(_pool_cache.items()):
-                pool.close_all()
-            _pool_cache.clear()
+            # Initialize schema
+            run_migrations(db_path)
+            conn = sqlite3.connect(db_path)
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.commit()
+            conn.close()
 
-        # Initialize schema
-        run_migrations(db_path)
-        conn = sqlite3.connect(db_path)
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.commit()
-        conn.close()
+            # Patch settings
+            monkeypatch.setattr("app.config.settings.data_dir", Path(temp_dir))
+            monkeypatch.setattr(
+                "app.config.settings.jwt_secret_key",
+                "test-secret-key-for-testing-only-min-32-chars!!",
+            )
+            monkeypatch.setattr("app.config.settings.users_enabled", True)
 
-        # Patch settings
-        monkeypatch.setattr("app.config.settings.data_dir", Path(temp_dir))
-        monkeypatch.setattr(
-            "app.config.settings.jwt_secret_key",
-            "test-secret-key-for-testing-only-min-32-chars!!",
-        )
-        monkeypatch.setattr("app.config.settings.users_enabled", True)
+            # Seed test users
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute("PRAGMA foreign_keys = ON")
+                pw = hash_password("testpass")
+                conn.execute(
+                    "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
+                    "VALUES (?, ?, ?, ?, ?, 1)",
+                    (1, "superadmin", pw, "Super Admin", "superadmin"),
+                )
+                conn.execute(
+                    "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
+                    "VALUES (?, ?, ?, ?, ?, 1)",
+                    (2, "admin1", pw, "Admin One", "admin"),
+                )
+                conn.execute(
+                    "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
+                    "VALUES (?, ?, ?, ?, ?, 1)",
+                    (3, "member1", pw, "Member One", "member"),
+                )
+                conn.execute(
+                    "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
+                    "VALUES (?, ?, ?, ?, ?, 1)",
+                    (4, "member2", pw, "Member Two", "member"),
+                )
+                # Seed test org so FK constraints on prompt_org_overrides pass.
+                conn.execute(
+                    "INSERT INTO organizations (id, name, slug, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (10, "Test Org", "test-org", "2024-01-01T00:00:00Z"),
+                )
+                conn.commit()
+            finally:
+                # Implementation-review round 5: a failure after connect (hash,
+                # insert, commit) must still close the connection BEFORE the
+                # rmtree below — an open handle can block directory removal on
+                # Windows and ignore_errors would hide it (issue645 precedent).
+                conn.close()
 
-        # Seed test users
-        conn = sqlite3.connect(db_path)
-        conn.execute("PRAGMA foreign_keys = ON")
-        pw = hash_password("testpass")
-        conn.execute(
-            "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
-            "VALUES (?, ?, ?, ?, ?, 1)",
-            (1, "superadmin", pw, "Super Admin", "superadmin"),
-        )
-        conn.execute(
-            "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
-            "VALUES (?, ?, ?, ?, ?, 1)",
-            (2, "admin1", pw, "Admin One", "admin"),
-        )
-        conn.execute(
-            "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
-            "VALUES (?, ?, ?, ?, ?, 1)",
-            (3, "member1", pw, "Member One", "member"),
-        )
-        conn.execute(
-            "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
-            "VALUES (?, ?, ?, ?, ?, 1)",
-            (4, "member2", pw, "Member Two", "member"),
-        )
-        # Seed test org so FK constraints on prompt_org_overrides pass.
-        conn.execute(
-            "INSERT INTO organizations (id, name, slug, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (10, "Test Org", "test-org", "2024-01-01T00:00:00Z"),
-        )
-        conn.commit()
-        conn.close()
-
-        self._db_path = db_path
-        self._temp_dir = temp_dir
-        yield db_path
-
-        # Cleanup
-        with _pool_cache_lock:
-            if db_path in _pool_cache:
-                _pool_cache[db_path].close_all()
-                del _pool_cache[db_path]
-        import shutil
-        shutil.rmtree(temp_dir, ignore_errors=True)
+            self._db_path = db_path
+            self._temp_dir = temp_dir
+            yield db_path
+        finally:
+            # Issues #946/#900: teardown must be reachable when SETUP fails —
+            # wrap from mkdtemp through yield so a pre-yield raise still
+            # drains this run's pool entry and removes the temp directory.
+            with _pool_cache_lock:
+                if db_path in _pool_cache:
+                    _pool_cache[db_path].close_all()
+                    del _pool_cache[db_path]
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     @pytest.fixture
     def client(self):
@@ -707,6 +719,7 @@ class TestMultiOrgPerQueryResolution:
         """DB with two orgs, each with its own override, plus vaults for per-vault resolution."""
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
+        conn = None
         try:
             run_migrations(path)
             conn = sqlite3.connect(path)
@@ -768,7 +781,10 @@ class TestMultiOrgPerQueryResolution:
             conn.commit()
             yield path
         finally:
-            conn.close()
+            # conn is bound only after run_migrations succeeds; guard so a schema
+            # failure surfaces its own traceback instead of an UnboundLocalError.
+            if conn is not None:
+                conn.close()
             os.unlink(path)
 
     def test_different_orgs_get_different_prompts(self, multi_org_db):

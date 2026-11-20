@@ -8,71 +8,26 @@ A/B resolver tuple (a re-raising exposure handler must fail), the
 disabled-mode composition (a newline must not satisfy AC8's intent),
 CSRF RETENTION on mutating routes, and the fingerprint helper's shape.
 
-The seeded_env/prompts_client fixtures intentionally mirror the frozen
-file (the manifest pins its bytes, so shared fixtures would edit frozen
-history); the duplication is noted in the review ledger.
+The seeded_env/prompts_client fixtures come from the shared home
+backend/tests/c04_fixtures.py (issues #946/#900: one guarded-teardown
+definition per fixture; the frozen #709 file keeps its own copy and takes a
+teardown-guard-only edit via the checkpoint AMEND procedure).
 """
 
-import shutil
 import sqlite3
-import tempfile
-from pathlib import Path
 
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
+from c04_fixtures import (  # noqa: F401 (fixtures consumed by parameter name)
+    prompts_client,
+    seeded_env,
+)
 
-from app.api.routes.prompts import router as prompts_router
 from app.models.database import run_migrations
 from app.security import admin_scope_fingerprint
 
 _ADMIN_TOKEN = "test-admin-secret"
 _LEGACY_TOKEN = "c04-legacy-created-by-probe-token"
 _ROTATED_TOKEN = "c04-rotated-before-upgrade-token-9f8e7d6c"
-
-
-@pytest.fixture()
-def seeded_env(monkeypatch):
-    temp_dir = tempfile.mkdtemp(prefix="c04_hardening_")
-    db_path = str(Path(temp_dir) / "app.db")
-    env = {"db_path": db_path, "temp_dir": temp_dir}
-    try:
-        from app.models.database import _pool_cache, _pool_cache_lock
-
-        with _pool_cache_lock:
-            for _path, pool in list(_pool_cache.items()):
-                pool.close_all()
-            _pool_cache.clear()
-
-        run_migrations(db_path)
-
-        monkeypatch.setattr("app.config.settings.data_dir", Path(temp_dir))
-        monkeypatch.setattr("app.config.settings.admin_secret_token", _ADMIN_TOKEN)
-        monkeypatch.setattr(
-            "app.config.settings.admin_token_scopes",
-            {_ADMIN_TOKEN: ["admin:config"]},
-        )
-        yield env
-    finally:
-        from app.models.database import _pool_cache, _pool_cache_lock
-
-        with _pool_cache_lock:
-            if db_path in _pool_cache:
-                _pool_cache[db_path].close_all()
-                del _pool_cache[db_path]
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-@pytest.fixture()
-def prompts_client(seeded_env):
-    from app.security import csrf_protect
-
-    app = FastAPI()
-    app.include_router(prompts_router, prefix="/api")
-    app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
-    tc = TestClient(app)
-    tc.headers["user-agent"] = ""
-    return tc
 
 
 _ADMIN_HEADERS = {"Authorization": f"Bearer {_ADMIN_TOKEN}"}

@@ -9,16 +9,10 @@ directive) cannot pass on a constant string. Harness mirrors the frozen
 file's seeded_env/prompts_client fixtures.
 """
 
-import shutil
-import tempfile
-from pathlib import Path
-
-import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
-
-from app.api.routes.prompts import router as prompts_router
-from app.models.database import run_migrations
+from c04_fixtures import (  # noqa: F401 (fixtures consumed by parameter name)
+    prompts_client,
+    seeded_env,
+)
 
 _ADMIN_TOKEN = "test-admin-secret"
 
@@ -33,49 +27,6 @@ _FULL_CONTRACT_CONTENT = (
     "- If no context supports the answer, reply with \"This information is "
     "not available in the provided context.\"\n"
 )
-
-
-@pytest.fixture()
-def seeded_env(monkeypatch):
-    temp_dir = tempfile.mkdtemp(prefix="c04_warning_negative_")
-    db_path = str(Path(temp_dir) / "app.db")
-
-    from app.models.database import _pool_cache, _pool_cache_lock
-
-    with _pool_cache_lock:
-        for _path, pool in list(_pool_cache.items()):
-            pool.close_all()
-        _pool_cache.clear()
-
-    run_migrations(db_path)
-
-    monkeypatch.setattr("app.config.settings.data_dir", Path(temp_dir))
-    monkeypatch.setattr("app.config.settings.admin_secret_token", _ADMIN_TOKEN)
-    monkeypatch.setattr(
-        "app.config.settings.admin_token_scopes",
-        {_ADMIN_TOKEN: ["admin:config"]},
-    )
-
-    env = {"db_path": db_path, "temp_dir": temp_dir}
-    yield env
-
-    with _pool_cache_lock:
-        if db_path in _pool_cache:
-            _pool_cache[db_path].close_all()
-            del _pool_cache[db_path]
-    shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-@pytest.fixture()
-def prompts_client(seeded_env):
-    from app.security import csrf_protect
-
-    app = FastAPI()
-    app.include_router(prompts_router, prefix="/api")
-    app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
-    tc = TestClient(app)
-    tc.headers["user-agent"] = ""
-    return tc
 
 
 def test_no_warning_when_contract_markers_present(prompts_client):

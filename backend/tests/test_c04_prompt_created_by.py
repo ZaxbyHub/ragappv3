@@ -60,33 +60,38 @@ def seeded_env(monkeypatch):
     """
     temp_dir = tempfile.mkdtemp(prefix="c04_prompts_created_by_")
     db_path = str(Path(temp_dir) / "app.db")
+    try:
+        from app.models.database import _pool_cache, _pool_cache_lock
 
-    from app.models.database import _pool_cache, _pool_cache_lock
+        with _pool_cache_lock:
+            for _path, pool in list(_pool_cache.items()):
+                pool.close_all()
+            _pool_cache.clear()
 
-    with _pool_cache_lock:
-        for _path, pool in list(_pool_cache.items()):
-            pool.close_all()
-        _pool_cache.clear()
+        run_migrations(db_path)
 
-    run_migrations(db_path)
+        monkeypatch.setattr("app.config.settings.data_dir", Path(temp_dir))
+        # require_scope("admin:config") for the prompts router: a static admin
+        # token mapped to the scope server-side (test_prompt_ab_variants pattern).
+        monkeypatch.setattr("app.config.settings.admin_secret_token", _ADMIN_TOKEN)
+        monkeypatch.setattr(
+            "app.config.settings.admin_token_scopes",
+            {_ADMIN_TOKEN: ["admin:config"]},
+        )
 
-    monkeypatch.setattr("app.config.settings.data_dir", Path(temp_dir))
-    # require_scope("admin:config") for the prompts router: a static admin
-    # token mapped to the scope server-side (test_prompt_ab_variants pattern).
-    monkeypatch.setattr("app.config.settings.admin_secret_token", _ADMIN_TOKEN)
-    monkeypatch.setattr(
-        "app.config.settings.admin_token_scopes",
-        {_ADMIN_TOKEN: ["admin:config"]},
-    )
+        env = {"db_path": db_path, "temp_dir": temp_dir}
+        yield env
+    finally:
+        # Issues #946/#900: teardown must be reachable when SETUP fails —
+        # wrap from mkdtemp through yield so a pre-yield raise still drains
+        # this run's pool entry and removes the temp directory.
+        from app.models.database import _pool_cache, _pool_cache_lock
 
-    env = {"db_path": db_path, "temp_dir": temp_dir}
-    yield env
-
-    with _pool_cache_lock:
-        if db_path in _pool_cache:
-            _pool_cache[db_path].close_all()
-            del _pool_cache[db_path]
-    shutil.rmtree(temp_dir, ignore_errors=True)
+        with _pool_cache_lock:
+            if db_path in _pool_cache:
+                _pool_cache[db_path].close_all()
+                del _pool_cache[db_path]
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @pytest.fixture()

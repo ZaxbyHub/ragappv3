@@ -2524,10 +2524,10 @@ def test_string_error_renders_text_not_constant_str():
 
 
 def test_limiter_info_log_channel_pins_known_1171_leak(caplog):
-    """Review F-003/A-1a (pr1169-20261117): the boot INFO line logs
-    redact_url(storage_uri); redact_url does not mask username-only
-    userinfo, so the guard must observe the REAL logger ('rate_limit')
-    and probe a shape redact_url passes through verbatim. Companion to
+    """Review F-003/A-1a (pr1169-20261117), FLIPPED with the #1171 fix:
+    the boot INFO line logs redact_url(storage_uri), and redact_url now
+    masks username-only userinfo, so the channel must stay credential-
+    free. The guard observes the REAL logger ('rate_limit'). Companion to
     the frozen C6 (whose 'app.limiter' capture can never see these
     records — vacuous leg, disclosed).
     """
@@ -2546,12 +2546,9 @@ def test_limiter_info_log_channel_pins_known_1171_leak(caplog):
         "Rate limiter" in r.message for r in info_records
     ), "sanity: the boot INFO line fired on the rate_limit logger"
     leaked = [r.message for r in info_records if marker in r.message]
-    # The INFO line carries redact_url output; redact_url passes
-    # username-only userinfo through VERBATIM (verified by the review
-    # probe). This test PINS that known gap so the follow-up fix flips
-    # it red — until then it documents the leak precisely.
-    assert leaked, (
-        "982F003: expected the known username-only pass-through on the "
-        "rate_limit INFO line — if this fires, redact_url was hardened "
-        "(follow-up landed); update this pin to assert NO leak then"
+    # #1171 landed: redact_url masks username-only userinfo, so the boot
+    # INFO line must never carry the credential marker again.
+    assert leaked == [], (
+        "982F003: the rate_limit boot INFO line carried a credential "
+        f"marker after the #1171 hardening: {leaked}"
     )

@@ -33,6 +33,7 @@ def fresh_db():
     """Create a temporary DB with the full schema including A/B tables."""
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
+    conn = None
     try:
         run_migrations(path)
         conn = sqlite3.connect(path)
@@ -47,7 +48,10 @@ def fresh_db():
         conn.commit()
         yield conn
     finally:
-        conn.close()
+        # conn is bound only after run_migrations succeeds; guard so a schema
+        # failure surfaces its own traceback instead of an UnboundLocalError.
+        if conn is not None:
+            conn.close()
         os.unlink(path)
 
 
