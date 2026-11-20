@@ -231,7 +231,9 @@ describe("TranscriptPane", () => {
     // Mock useVaultStore with selector support
     (useVaultStore as unknown as ReturnType<typeof vi.fn>).mockImplementation((selector) => {
       const state = {
-        vaults: [{ id: 1, name: "Test Vault", file_count: 5 }],
+        vaults: [
+          { id: 1, name: "Test Vault", file_count: 5, indexed_file_count: 5 },
+        ],
         activeVaultId: 1,
         getActiveVault: mockGetActiveVault,
       };
@@ -258,6 +260,7 @@ describe("TranscriptPane", () => {
       id: 1,
       name: "Test Vault",
       file_count: 5,
+      indexed_file_count: 5,
     });
   });
 
@@ -358,6 +361,8 @@ describe("TranscriptPane", () => {
       });
 
       await waitFor(() => expect(mockChatState.loadChat).toHaveBeenCalledTimes(1));
+      // Issue #1153 AC5: the fork's stored vault scope (vault_id from the
+      // fork response) rides as the third loadChat argument.
       expect(mockChatState.loadChat).toHaveBeenCalledWith(
         "20",
         expect.arrayContaining([
@@ -365,7 +370,8 @@ describe("TranscriptPane", () => {
             id: "102",
             wikiRefs: [{ wiki_label: "W1", title: "Runbook" }],
           }),
-        ])
+        ]),
+        1
       );
       expect(mockRefreshHistory).toHaveBeenCalledTimes(1);
       expect(mockNavigate).toHaveBeenCalledWith("/chat/20");
