@@ -378,17 +378,13 @@ async def convert_report_to_eval_case(
             )
             candidate = await asyncio.to_thread(adjacency_result.fetchone)
             if candidate is not None:
-                # Refuse unless the candidate is IMMEDIATELY adjacent: no
-                # row of any role may sit between the user row and the
-                # reported assistant row.
-                between_result = await asyncio.to_thread(
-                    conn.execute,
-                    "SELECT COUNT(*) FROM chat_messages "
-                    "WHERE session_id = ? AND seq > ? AND seq < ?",
-                    (report[1], candidate[2], report_seq_row[0]),
-                )
-                between_count = await asyncio.to_thread(between_result.fetchone)
-                if between_count[0] == 0:
+                # Refuse unless the candidate is NUMERICALLY adjacent: the
+                # user row must sit at assistant_seq - 1. This is stricter
+                # than counting intervening rows — a deleted middle row
+                # leaves a numeric gap that is exactly the ambiguity the
+                # plan refuses (05-fix-plan.md F12b: "Any other shape (gap,
+                # intervening row...) -> 404 refusal, no insert").
+                if candidate[2] == report_seq_row[0] - 1:
                     query_row = candidate
                     user_message_id = candidate[1]
                     user_seq = candidate[2]

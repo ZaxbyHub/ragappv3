@@ -391,24 +391,35 @@ export function useSendMessage(
           sendVaultId = storedScope;
         } else {
           // Unbound existing session (legacy in-flight session from before
-          // this deploy): try to REFETCH the stored scope. When the fetch
-          // is unavailable or fails, fall through to the resolved vault —
-          // the backend clamp (issue #1153 AC5, chat.py get_stream_auth)
-          // makes the session's STORED vault authoritative server-side, so
-          // a stale client scope can never actually re-scope the session.
+          // this deploy): REFETCH the stored scope and BLOCK loudly when it
+          // cannot be resolved — an existing session never sends an
+          // unresolved or globally-scoped vault (issue #1153 AC5, F5c; the
+          // backend clamp is defense in depth, not a substitute).
           try {
             const api = await import("@/lib/api");
-            if (typeof api.getChatSession === "function") {
-              const detail = await api.getChatSession(sessionId);
+            if (typeof api.getChatSession !== "function") {
+              throw new Error("session detail unavailable");
+            }
+            const detail = await api.getChatSession(sessionId);
+            // Ownership check: a session switch while the lookup was in
+            // flight must not let the stale lookup rebind the store.
+            if (useChatStore.getState().activeChatId === sessionId.toString()) {
               useChatStore
                 .getState()
                 .bindSession?.(sessionId.toString(), detail.vault_id ?? null);
-              if (typeof detail.vault_id === "number") {
-                sendVaultId = detail.vault_id;
-              }
             }
+            if (typeof detail.vault_id !== "number") {
+              throw new Error("session has no stored vault");
+            }
+            sendVaultId = detail.vault_id;
           } catch {
-            // Server-side clamp remains the authority; proceed.
+            setInputError(
+              "Couldn't determine this session's vault — reload the conversation and try again."
+            );
+            setIsStreaming(false);
+            setAbortFn(null);
+            sendingRef.current = false;
+            return false;
           }
         }
       } else {
