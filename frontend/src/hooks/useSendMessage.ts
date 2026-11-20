@@ -413,11 +413,17 @@ export function useSendMessage(
             }
             sendVaultId = detail.vault_id;
           } catch {
-            setInputError(
-              "Couldn't determine this session's vault — reload the conversation and try again."
-            );
-            setIsStreaming(false);
-            setAbortFn(null);
+            // Ownership guard on the FAILURE path too: a session switch
+            // while the lookup was pending must not let the stale lookup's
+            // error clear the replacement session's streaming state or
+            // abort handle (review 4.5 round 2).
+            if (useChatStore.getState().activeChatId === sessionId.toString()) {
+              setInputError(
+                "Couldn't determine this session's vault — reload the conversation and try again."
+              );
+              setIsStreaming(false);
+              setAbortFn(null);
+            }
             sendingRef.current = false;
             return false;
           }
