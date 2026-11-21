@@ -19,5 +19,9 @@ Audit 2026-11-15 (issues #1157, #1158): job state required per-family, per-vault
 - The activity change token fingerprints the bounded visible windows: mutations entirely outside an old snapshot's window (e.g. a >50-deep historical row's deletion) do not change the token — the contract is delta-of-visible-state. A lease-branch flip can change row representations and thus the token. Disclosed in the route docstring.
 - The aggregate's ingest window is a single combined `limit` (default 50, processing rows ranked first) — a reduction from the tray's previous 3×200-per-status page budget. The tray header count is capped at the window size, so a very large backlog shows the newest/processing-first 50.
 - The member vault filter on the `jobs` queue rides `json_extract(payload_json)`, which no index covers: per-poll cost grows linearly with a family queue's accumulated terminal history (bounded by `LIMIT`, off the event loop). A terminal-history retention janitor on the `jobs` table is the systemic fix and is recorded in the PR's Considered table.
-- A health check that first mounts while the tab is hidden stays in its initial state until the tab becomes visible and the first visible interval tick lands (≤ one poll interval); a previously settled label never changes while hidden.
+- A health check that first mounts while the tab is hidden stays in its initial state until the tab becomes visible — the visibilitychange re-arm then checks immediately, even for callers without a poll interval (a previously settled label never changes while hidden).
 - Two live `useHealthCheck` instances (App + MainAppShell, each 30s) predate this change and remain: this PR only gates them on visibility. Recorded in the PR's Considered table with a re-evaluation trigger.
+
+## Rollback
+
+Revert this PR's squash-merge commit. The endpoint is additive (no migrations, no DDL, no settings changes); the frontend consumers move with the revert, and the old per-family polling fan-out resumes exactly as before.

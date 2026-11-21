@@ -280,8 +280,10 @@ export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
       // document is hidden. Gating here covers every dispatch path — the
       // mount check, the poll interval, and the unknown-services recheck
       // chain (they all funnel through this function). The interval keeps
-      // running, so the first visible tick after un-hiding catches up; the
-      // settled label (last-known state) stays stable meanwhile.
+      // running, so the first visible tick after un-hiding catches up; for
+      // callers WITHOUT a poll interval the visibilitychange re-arm fires
+      // the check at the first visible moment. The settled label
+      // (last-known state) stays stable meanwhile.
       if (typeof document !== "undefined" && document.hidden) return;
       const read: HealthRead = { context, lifetime, token: Symbol("health-read"), sequence: lifetime.nextReadSequence++ };
       if (!isCurrentLifetime(context, lifetime)) return;
@@ -418,6 +420,16 @@ export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
         void checkHealth();
       }, pollInterval);
     }
+    // K-12 (closeout): a caller WITHOUT a poll interval (SettingsPage) has
+    // no tick to catch up on after a hidden-tab mount skips the mount check
+    // — re-arm on visibilitychange so the first visible moment always
+    // checks. Interval callers get the same catch-up; one extra
+    // visible-state request is within the health budget.
+    const onVisibilityChange = (): void => {
+      if (!isCurrentLifetime(context, lifetime)) return;
+      if (typeof document !== 'undefined' && !document.hidden) void checkHealth();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
 
     return () => {
       lifetime.active = false;
@@ -429,6 +441,7 @@ export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
         clearInterval(lifetime.interval);
         lifetime.interval = null;
       }
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       if (activeReadRef.current?.lifetime === lifetime) activeReadRef.current = null;
       if (lifetimeRef.current === lifetime) lifetimeRef.current = null;
       if (healthContextRef.current === context) healthContextRef.current = null;

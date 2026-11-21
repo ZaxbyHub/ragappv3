@@ -295,10 +295,16 @@ describe("useActivityJobs single-endpoint poll budget (audit 1115)", () => {
     expect(wikiRows[0].terminal).toBe(false);
     expect(wikiRows[0].status).toBe("running");
 
-    // Cadence: while a live row exists the poller stays at 8000ms — at
-    // least 3 further dispatches inside a 32s window.
+    // Cadence: while a live row exists the poller stays at 8000ms — pinned
+    // from BOTH sides inside a 32s window (K-26 closeout): at least 3
+    // further dispatches (an always-idle mutant is too slow) and at most 6
+    // (a 1000ms mutant would fire ~32 and blow the PR's own ≤8 req/min
+    // active budget; 8s cadence over 32s yields 4 ticks + the boundary
+    // tick, so 6 leaves margin without admitting the fast mutant).
     const callsAtStart = mockGetActivityJobs.mock.calls.length;
     await advanceTicks(32_000);
-    expect(mockGetActivityJobs.mock.calls.length - callsAtStart).toBeGreaterThanOrEqual(3);
+    const dispatched = mockGetActivityJobs.mock.calls.length - callsAtStart;
+    expect(dispatched).toBeGreaterThanOrEqual(3);
+    expect(dispatched).toBeLessThanOrEqual(6);
   });
 });

@@ -570,3 +570,29 @@ class TestTerminalSettleRace:
         assert wiki_ids == {10, 9, 8, 7, 6}, (
             f"settled live row must not underfill the remainder: {sorted(wiki_ids)}"
         )
+
+
+class TestDisabledGates:
+    """K-17b (20b closeout): the wiki/KMS feature gates on the aggregate
+    route (activity.py: if settings.wiki_enabled / kms_enabled) were
+    unpinned — a mutant replacing them with `if True:` survived every
+    prior activity test. With BOTH flags False, seeded wiki/kms rows must
+    contribute ZERO rows (disabled subsystems are zero rows, never an
+    error)."""
+
+    def test_disabled_wiki_and_kms_contribute_zero_rows(self, route_env, monkeypatch):
+        route_env.seed_queue_job("wiki", VAULT_A, status="running")
+        route_env.seed_queue_job("kms", VAULT_A, status="completed")
+        monkeypatch.setattr(settings, "wiki_enabled", False)
+        monkeypatch.setattr(settings, "kms_enabled", False)
+        resp = route_env.client.get(
+            "/api/activity/jobs", headers=route_env.member_headers()
+        )
+        assert resp.status_code == 200, resp.text
+        families = {j["family"] for j in resp.json()["jobs"]}
+        assert "wiki" not in families, (
+            "disabled wiki gate must contribute zero wiki rows"
+        )
+        assert "kms" not in families, (
+            "disabled kms gate must contribute zero kms rows"
+        )

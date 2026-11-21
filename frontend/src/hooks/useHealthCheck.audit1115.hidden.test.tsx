@@ -91,6 +91,27 @@ describe("useHealthCheck hidden-document gating (audit 1115)", () => {
     expect(mockGet.mock.calls.length).toBeGreaterThanOrEqual(1);
   });
 
+  // K-12 (closeout): a caller WITHOUT a poll interval (SettingsPage) has no
+  // tick to catch up on after a hidden-tab mount skips the mount check —
+  // the visibilitychange re-arm must fire the first check the moment the
+  // document becomes visible.
+  it("hidden mount without a poll interval re-arms on visibility", async () => {
+    setHidden(true);
+
+    renderHook(() => useHealthCheck());
+
+    // Hidden mount: the mount check is gated, and with no interval nothing
+    // else can fire.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(mockGet).not.toHaveBeenCalled();
+
+    // Becoming visible fires the re-arm check IMMEDIATELY (no interval
+    // needed).
+    setHidden(false);
+    await vi.waitFor(() => expect(mockGet).toHaveBeenCalledTimes(1));
+    expect(mockGet.mock.calls.length).toBe(1);
+  });
+
   it("visible baseline: mount check plus interval polling still work (pin)", async () => {
     const { result } = renderHook(() => useHealthCheck({ pollInterval: 30_000 }));
 
