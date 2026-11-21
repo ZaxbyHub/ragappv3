@@ -537,6 +537,26 @@ describe("WikiJobsPanel read outcomes, filters, and preserved display", () => {
     expect(screen.getByText("No jobs found")).toBeInTheDocument();
   });
 
+  // 20b K-03 disclosure: at exactly the requested page size the list may be
+  // truncated — the panel must say so (and stay silent below the cap).
+  it("discloses possible truncation at the page cap and stays silent below it", async () => {
+    const atCap = Array.from({ length: 500 }, (_, i) => makeJob(i + 1, "completed"));
+    listWikiJobsMock.mockResolvedValue({ jobs: atCap });
+    const view = render(<WikiJobsPanel vaultId={1} />);
+    await flush();
+    expect(
+      screen.getByText(/Showing the newest 500 jobs/i),
+    ).toBeInTheDocument();
+
+    // A rerender with unchanged props does not refetch — remount instead.
+    cleanup();
+    const belowCap = Array.from({ length: 499 }, (_, i) => makeJob(i + 1, "completed"));
+    listWikiJobsMock.mockResolvedValue({ jobs: belowCap });
+    render(<WikiJobsPanel vaultId={1} />);
+    await flush();
+    expect(screen.queryByText(/Showing the newest 500 jobs/i)).not.toBeInTheDocument();
+  });
+
   it("passes the route-max limit (500) on the status filter and refresh-signal query", async () => {
     const allJobs = Array.from({ length: 11 }, (_, index) =>
       makeJob(index + 1, "completed"),

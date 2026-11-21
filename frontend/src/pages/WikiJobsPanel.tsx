@@ -1,4 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+
+// Route-max page for the jobs list (#1157 AC3): the route caps omitted
+// limits at 50, so the panel passes the explicit maximum; at exactly this
+// many rows the list may be truncated, which the render discloses.
+const WIKI_JOBS_LIMIT = 500;
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import {
@@ -137,7 +142,7 @@ function WikiJobsPanelState({
     try {
       // #1157: the jobs route defaults omitted limits to 50; pass the route
       // maximum so the panel keeps near-parity with its previous unbounded view.
-      const res = await listWikiJobs({ vault_id: vaultId, status: statusFilter || undefined, limit: 500 });
+      const res = await listWikiJobs({ vault_id: vaultId, status: statusFilter || undefined, limit: WIKI_JOBS_LIMIT });
       if (!Array.isArray(res?.jobs)) throw new Error("Jobs response was malformed");
       if (!currentRead()) return;
       setJobs((current) => currentRead() ? res.jobs : current);
@@ -396,6 +401,14 @@ function WikiJobsPanelState({
           </CardContent>
         </Card>
       ))}
+      {jobsDataContext === queryContext &&
+        jobsPhase === "ready" &&
+        jobs.length >= WIKI_JOBS_LIMIT && (
+          <p className="px-1 text-xs text-muted-foreground" role="note">
+            Showing the newest {WIKI_JOBS_LIMIT} jobs — older history is not
+            listed; narrow the status filter to page further.
+          </p>
+        )}
     </div>
   );
 }

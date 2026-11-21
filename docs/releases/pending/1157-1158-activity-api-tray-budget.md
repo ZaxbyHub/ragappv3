@@ -11,7 +11,7 @@
 Audit 2026-11-15 (issues #1157, #1158): job state required per-family, per-vault fan-out polling (a 3-vault session issued ~19 requests every 8 seconds); the two job-list routes were unbounded by default; the tray overlay covered the composer's Send control and the documents table's action column on deployed builds; the Hide choice reset on every navigation; health checks kept firing in background tabs.
 
 ## Migration
-- API consumers of `GET /api/wiki/jobs` / `GET /api/kms/jobs` that relied on the omitted-limit unbounded list must pass an explicit `limit` (≤500). In-repo consumers now do: WikiJobsPanel passes `limit: 500` (near-parity with its previous unbounded view), MaintenanceSettings passes `limit: 10`, and KMSPage's recompile poll moved to the single-job route.
+- API consumers of `GET /api/wiki/jobs` / `GET /api/kms/jobs` that relied on the omitted-limit unbounded list must pass an explicit `limit` (≤500). In-repo consumers now do: WikiJobsPanel passes `limit: 500` (near-parity with its previous unbounded view, and it renders a 'showing the newest 500' disclosure when the response reaches the cap), MaintenanceSettings passes `limit: 10`, and KMSPage's recompile poll moved to the single-job route.
 - `listKMSJobs` keeps its export (the route remains); it has no production importer as of this change (dated allowlist entry in `frontend/src/lib/api/kms.unused-export.guardrail.test.ts`).
 - `listReindexJobs` and `ReindexJobSummary` were REMOVED from the frontend api client (dated tombstone comment at core.ts): the tray now reads reindex rows through the aggregate. The backend route remains.
 
