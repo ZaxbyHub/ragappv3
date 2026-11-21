@@ -389,6 +389,15 @@ export function useActivityJobs(options: UseActivityJobsOptions = {}) {
     if (mountedRef.current && !hasLoadedRef.current) setLoading(true);
     try {
       do {
+        // Queued-dispatch gate (closeout reviewer): a coalesced refresh can
+        // be queued while visible and drained after the tab is hidden —
+        // re-check visibility before EVERY dispatch, the same invariant as
+        // the tick's and refresh's hidden gates. A stale pending flag is
+        // harmless: it only ever causes one extra (visible) iteration later.
+        if (typeof document !== "undefined" && document.hidden) {
+          pendingRef.current = false;
+          break;
+        }
         pendingRef.current = false;
         const next = await fetchAllActivityRows();
         hasLiveRef.current = next.some((r) => !r.terminal);

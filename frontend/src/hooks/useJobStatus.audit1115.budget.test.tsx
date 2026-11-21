@@ -239,6 +239,47 @@ describe("useActivityJobs single-endpoint poll budget (audit 1115)", () => {
     );
   });
 
+  it("queued refresh does not dispatch while hidden (visible queue, hidden drain race)", async () => {
+    // Closeout-reviewer round 2: a refresh QUEUED while visible (in-flight
+    // coalescing sets pendingRef) must not dispatch when the loop drains it
+    // after the tab is hidden. Controlled in-flight fetch: the first
+    // aggregate call parks on a deferred promise the test releases.
+    publishAuthPrincipal({ id: 604, role: "member" });
+
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    mockGetActivityJobs.mockImplementationOnce(() =>
+      firstGate.then(() => activityResponse()),
+    );
+
+    const { result } = renderHook(() => useActivityJobs());
+    await flushFirstTick();
+    expect(mockGetActivityJobs).toHaveBeenCalledTimes(1); // in flight (gated)
+
+    // Refresh while visible AND in flight → queued (pendingRef = true).
+    act(() => {
+      result.current.refresh();
+    });
+    // Tab hidden BEFORE the in-flight fetch resolves.
+    setHidden(true);
+    releaseFirst();
+    await flushFirstTick();
+    // The loop drained the queue: visibility re-checked per iteration, so
+    // NO second dispatch happened while hidden.
+    expect(mockGetActivityJobs).toHaveBeenCalledTimes(1);
+
+    // Back visible: the queued refresh intent is gone (dropped with the
+    // hidden drain), but the surface re-syncs on the next explicit refresh.
+    setHidden(false);
+    act(() => {
+      result.current.refresh();
+    });
+    await flushFirstTick();
+    expect(mockGetActivityJobs).toHaveBeenCalledTimes(2);
+  });
+
   it("live: 8000ms cadence while a non-terminal row exists, mapped onto rows", async () => {
     publishAuthPrincipal({ id: 603, role: "member" });
     mockGetActivityJobs.mockResolvedValue(
