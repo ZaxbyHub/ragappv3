@@ -33,9 +33,9 @@ from app.security import csrf_protect
 
 
 class _AdoptionHarness:
-    """Full-app harness (d07 pattern): own temp DB, get_db override, csrf
-    mode with a MUTABLE acting-user dict so each test can act as a different
-    principal."""
+    """Full-app harness (d07 pattern): own temp DB, get_db override, settings
+    save and restore, and a MUTABLE acting-user dict so each test can act as
+    a different principal."""
 
     def __init__(self):
         self.temp_dir = tempfile.mkdtemp(prefix="t1003_")

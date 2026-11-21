@@ -164,7 +164,6 @@ class TestUserOrganizationsScopedAccess:
 
         # Also patch deps.get_pool for evaluate_policy
         from app.api import deps
-        from app.api.routes import users
 
         original_deps_pool = deps.get_pool
         deps.get_pool = lambda path: test_pool
