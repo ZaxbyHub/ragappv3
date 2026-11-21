@@ -4,31 +4,16 @@ Pins the accepted KMS contract: update_entry on a missing id returns
 None and leaves no open transaction on the connection.
 """
 
-import sqlite3
-import tempfile
 import unittest
-from pathlib import Path
 
-
-def _make_env():
-    from app.models.database import run_migrations
-
-    td = tempfile.mkdtemp()
-    db_path = str(Path(td) / "test.db")
-    run_migrations(db_path)
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.row_factory = sqlite3.Row
-    conn.execute("INSERT OR IGNORE INTO vaults (id, name) VALUES (1, 'Test')")
-    conn.commit()
-    return conn
+from _wiki_lint_o01_support import make_env
 
 
 class TestKMSEntryUpdateTransaction(unittest.TestCase):
     """KMSStore.update_entry on a missing id closes its transaction."""
 
     def setUp(self):
-        self.conn = _make_env()
+        self.conn = make_env(self)
 
     def tearDown(self):
         self.conn.close()
