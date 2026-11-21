@@ -84,6 +84,7 @@ describe("TranscriptPane stepper history (issue #685)", () => {
 
     useChatStore.setState({
       activeChatId: "7",
+      activeSessionVaultId: 7,
       messageIds: ["u1", "a1"],
       messagesById: {
         u1: {

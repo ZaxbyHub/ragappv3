@@ -229,7 +229,13 @@ describe("ChatShell stale-view revision reload (issue #684)", () => {
 
     // ...so the tab must converge by reloading the session: the unseen 4th
     // row (the assistant marker message) becomes visible exactly once.
-    expect(screen.queryAllByText(/unseen-answer-4/).length).toBe(1);
+    // The unseen 4th row renders exactly once. The follow-up chips derived
+    // from this answer (#1153 AC6) legitimately repeat the answer topic text
+    // outside the message rows, so scope the count to the row wrappers.
+    const matchingRows = screen
+      .getAllByText(/unseen-answer-4/)
+      .filter((el) => el.closest("[data-message-id]"));
+    expect(matchingRows).toHaveLength(1);
 
     // Restore the URL for any test that follows.
     window.history.pushState({}, "", "/");

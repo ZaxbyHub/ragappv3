@@ -80,7 +80,7 @@ describe("useSendMessage — evidence candidates", () => {
   it("sets candidateSources on the active streaming message and clears them on done", async () => {
     const { captured } = installCapturingStreamMock();
     const refreshHistory = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ activeChatId: "42", input: "question" });
+    useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "question" });
 
     const { result } = renderHook(() => useSendMessage(7, refreshHistory));
     await act(async () => {
@@ -114,7 +114,7 @@ describe("useSendMessage — evidence candidates", () => {
   it("clears candidateSources when the send is stopped", async () => {
     const { captured } = installCapturingStreamMock();
     const refreshHistory = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ activeChatId: "42", input: "stop me" });
+    useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "stop me" });
 
     const { result } = renderHook(() => useSendMessage(7, refreshHistory));
     await act(async () => {

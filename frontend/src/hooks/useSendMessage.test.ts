@@ -107,6 +107,7 @@ describe("useSendMessage", () => {
       inputError: null,
       expandedSources: new Set(),
       activeChatId: null,
+      activeSessionVaultId: null,
       pendingTurnPersist: null,
     });
     useLlmHealthStore.setState({ thinking: true, instant: true });
@@ -263,7 +264,7 @@ describe("useSendMessage", () => {
 
   it("force-refreshes history and the session rail after an existing session is persisted", async () => {
     const refreshHistory = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ activeChatId: "42", input: "Follow up" });
+    useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "Follow up" });
 
     const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -284,7 +285,7 @@ describe("useSendMessage", () => {
       .mockRejectedValueOnce(new Error("network down"))
       .mockResolvedValueOnce({ chat_message_max_chars: 20_000 });
     const refreshHistory = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ activeChatId: "42", input: "Try again" });
+    useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "Try again" });
 
     const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -315,7 +316,7 @@ describe("useSendMessage", () => {
     it("the awaited server-cap gate refuses an over-cap submit even without the composer inline check (PRR-005)", async () => {
       apiMocks.getSettings.mockResolvedValue({ chat_message_max_chars: 20_000 });
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "x".repeat(25_000) });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "x".repeat(25_000) });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -334,7 +335,7 @@ describe("useSendMessage", () => {
       const gate = new Promise<void>((r) => { release = r; });
       apiMocks.getSettings.mockImplementation(() => gate.then(() => ({ chat_message_max_chars: 20_000 })));
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "OLD-TEXT" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "OLD-TEXT" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -358,7 +359,7 @@ describe("useSendMessage", () => {
       const gate = new Promise<void>((r) => { release = r; });
       apiMocks.getSettings.mockImplementation(() => gate.then(() => ({ chat_message_max_chars: 20_000 })));
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "for chat 42" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "for chat 42" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -376,7 +377,7 @@ describe("useSendMessage", () => {
 
     it("sendDirect restores the original turn rows when the send is dropped mid-revision (PRR-003)", async () => {
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "", isStreaming: true });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "", isStreaming: true });
       const restoreRows: Message[] = [
         { id: "1", role: "user", content: "original question" },
         { id: "2", role: "assistant", content: "original answer" },
@@ -434,7 +435,7 @@ describe("useSendMessage", () => {
 
     it("allows send when activeVaultId is null but activeChatId exists", async () => {
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "Follow up" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "Follow up" });
 
       const { result } = renderHook(() => useSendMessage(null, refreshHistory));
 
@@ -512,7 +513,7 @@ describe("useSendMessage", () => {
       // for non-admins ("Searching all vaults requires admin access").
       seedVaults([makeVault(7, "Only Vault")]);
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "Follow up" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "Follow up" });
 
       const { result } = renderHook(() => useSendMessage(null, refreshHistory));
 
@@ -587,9 +588,13 @@ describe("useSendMessage", () => {
       });
     });
 
-    it("chatStream receives the actual activeVaultId when it is non-null", async () => {
+    it("chatStream receives the session's STORED vault scope, not the global activeVaultId (#1153 AC5)", async () => {
+      // An existing session sends its stored scope even when the global
+      // vault switcher points elsewhere — a mid-conversation switch must
+      // never re-scope the session. (The global param still flows on the
+      // new-session arm, pinned by the createChatSession test below.)
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "99", input: "Hello" });
+      useChatStore.setState({ activeChatId: "99", activeSessionVaultId: 7, input: "Hello" });
 
       const { result } = renderHook(() => useSendMessage(5, refreshHistory));
 
@@ -600,7 +605,7 @@ describe("useSendMessage", () => {
       await waitFor(() => {
         expect(apiMocks.chatStream).toHaveBeenCalled();
         const callArgs = apiMocks.chatStream.mock.calls[0];
-        expect(callArgs[2]).toBe(5);
+        expect(callArgs[2]).toBe(7);
       });
     });
 
@@ -628,7 +633,7 @@ describe("useSendMessage", () => {
         return vi.fn();
       });
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "Stream start" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "Stream start" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -648,7 +653,7 @@ describe("useSendMessage", () => {
     it("handles AbortError: clears isStreaming, abortFn, streamingMessageId, sendingRef — without stamping an error on the message", async () => {
       const capture = installCapturingStreamMock();
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "Will be aborted" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "Will be aborted" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -696,7 +701,7 @@ describe("useSendMessage", () => {
       // The code also matches /aborted|abort/i on message — exercise that branch.
       const capture = installCapturingStreamMock();
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "Will be aborted via message" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "Will be aborted via message" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -724,7 +729,7 @@ describe("useSendMessage", () => {
     it("network error: stamps a friendly 'Connection lost' message and rolls back streaming state", async () => {
       const capture = installCapturingStreamMock();
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "Will fail with network error" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "Will fail with network error" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -779,7 +784,7 @@ describe("useSendMessage", () => {
     it("non-network, non-abort error before any content: stamps status failed and surfaces the empty-response error (PRR-001 + LIVE-01)", async () => {
       const capture = installCapturingStreamMock();
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "Will fail with server error" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "Will fail with server error" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -810,7 +815,7 @@ describe("useSendMessage", () => {
     it("failure rollback: after a non-abort error, sendingRef is reset so a follow-up send is not silently dropped", async () => {
       const capture = installCapturingStreamMock();
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "First send will fail" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "First send will fail" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -845,7 +850,7 @@ describe("useSendMessage", () => {
     it("does NOT persist the user message when loadChat aborts the stream before onComplete fires", async () => {
       const capture = installCapturingStreamMock();
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "abandoned user" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "abandoned user" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -888,7 +893,7 @@ describe("useSendMessage", () => {
     it("does NOT persist the user message when newChat aborts the stream before onComplete fires", async () => {
       const capture = installCapturingStreamMock();
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "abandoned again" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "abandoned again" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -917,7 +922,7 @@ describe("useSendMessage", () => {
       // (no session switch in between) must still save both messages.
       const capture = installCapturingStreamMock();
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "normal completion" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "normal completion" });
       apiMocks.addChatMessagesBatch
         .mockReset()
         .mockResolvedValue([
@@ -1007,7 +1012,7 @@ describe("useSendMessage", () => {
     it("saves the turn via one ordered batch with a shared turn id", async () => {
       const capture = installCapturingStreamMock();
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "batch me" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "batch me" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -1072,7 +1077,7 @@ describe("useSendMessage", () => {
     it("maps done-payload currency warnings and citation enforcement onto the streaming message (issue #510)", async () => {
       const capture = installCapturingStreamMock();
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "fresh sources only" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "fresh sources only" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -1104,7 +1109,7 @@ describe("useSendMessage", () => {
       const capture = installCapturingStreamMock();
       apiMocks.addChatMessagesBatch.mockRejectedValueOnce(new Error("server exploded"));
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "will fail to save" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "will fail to save" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -1141,7 +1146,7 @@ describe("useSendMessage", () => {
     it("persists an interrupted stream as interrupted, not complete (CHAT-004)", async () => {
       const capture = installCapturingStreamMock();
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "interrupted turn" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "interrupted turn" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -1195,7 +1200,7 @@ describe("useSendMessage", () => {
       // must neither be saved nor look like a successful turn (LIVE-01).
       const capture = installCapturingStreamMock();
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "say anything" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "say anything" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -1223,7 +1228,7 @@ describe("useSendMessage", () => {
     it("persists a failed stream as failed so a reload never loses the turn (PRR-001)", async () => {
       const capture = installCapturingStreamMock();
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "will fail mid-stream" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "will fail mid-stream" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -1270,7 +1275,7 @@ describe("useSendMessage", () => {
     it("does not persist a failed stream that produced no content (LIVE-01 under PRR-001)", async () => {
       const capture = installCapturingStreamMock();
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "say something" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "say something" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -1304,7 +1309,7 @@ describe("useSendMessage", () => {
         })
       );
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ activeChatId: "42", input: "slow save" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "slow save" });
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
