@@ -75,7 +75,7 @@ test.describe("chat smoke (issue #573 AC7 / C7)", () => {
       page.getByText("What did the maintenance manual say about coolant?")
     ).toBeVisible({ timeout: 10_000 });
     // ...the assistant answer streams in...
-    await expect(page.getByText(/Here is the streamed answer/i)).toBeVisible({
+    await expect(page.getByRole("log", { name: "Chat messages" }).getByText(/Here is the streamed answer/i)).toBeVisible({
       timeout: 20_000,
     });
     // ...and the final sources from the done frame render a citation chip.
@@ -137,7 +137,7 @@ test.describe("chat smoke (issue #573 AC7 / C7)", () => {
 
     const question = "What does the manual recommend for maintenance?";
     await sendQuestion(page, question);
-    await expect(page.getByText(/Here is the streamed answer/i)).toBeVisible({
+    await expect(page.getByRole("log", { name: "Chat messages" }).getByText(/Here is the streamed answer/i)).toBeVisible({
       timeout: 20_000,
     });
 
@@ -154,7 +154,7 @@ test.describe("chat smoke (issue #573 AC7 / C7)", () => {
     // .first(): the follow-up-suggestions region (issue #573 AC1) may render
     // a suggestion button whose text embeds the question's topic.
     await expect(page.getByText(question).first()).toBeVisible({ timeout: 20_000 });
-    await expect(page.getByText(/Here is the streamed answer/i)).toBeVisible({
+    await expect(page.getByRole("log", { name: "Chat messages" }).getByText(/Here is the streamed answer/i)).toBeVisible({
       timeout: 20_000,
     });
     await expect(
