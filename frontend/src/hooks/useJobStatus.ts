@@ -450,6 +450,11 @@ export function useActivityJobs(options: UseActivityJobsOptions = {}) {
   }, [runFetch]);
 
   const refresh = useCallback(() => {
+    // Same hidden-tab gate as the scheduled tick (PRR-008): a user action is
+    // started while the tab is visible, but its SETTLEMENT is asynchronous —
+    // the finally-refresh must not dispatch a request once the document is
+    // hidden. The chain's next visible tick reconciles the rows instead.
+    if (typeof document !== "undefined" && document.hidden) return;
     void runFetch().catch(() => {});
   }, [runFetch]);
 

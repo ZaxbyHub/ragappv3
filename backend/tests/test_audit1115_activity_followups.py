@@ -441,26 +441,38 @@ class TestThreadOffloadWiring:
     route must dispatch _collect_snapshot through asyncio.to_thread."""
 
     def test_route_offloads_collection_to_worker_thread(self, route_env, monkeypatch):
+        import asyncio as asyncio_module
         import threading
 
         import app.api.routes.activity as activity_module
 
-        # The route wraps _collect_snapshot in a route-local closure and
-        # dispatches THE CLOSURE through asyncio.to_thread, so pinning the
-        # to_thread argument list cannot see _collect_snapshot itself. The
-        # faithful observable is thread identity: the module-level function
-        # resolves through module globals at call time, so wrapping it here
-        # intercepts the worker-thread execution — and a sync revert (the
-        # route calling _collect_snapshot inline) would record the MAIN
-        # thread id and fail this pin.
-        main_thread = threading.get_ident()
+        # TestClient serves the ASGI app on an anyio PORTAL thread, so the
+        # pytest caller's thread id is NOT the loop thread — comparing the
+        # collection against the caller would let an inline (sync) revert
+        # pass. The faithful capture: the `asyncio.to_thread(...)` CALL
+        # expression evaluates synchronously inside the route coroutine,
+        # i.e. ON the event-loop thread, so a to_thread spy records the loop
+        # thread; a module-level _collect_snapshot wrapper records where the
+        # collection actually ran (executor worker under correct code, the
+        # loop thread under a sync revert). Auth dependencies also dispatch
+        # through to_thread, so the loop-thread capture survives even a
+        # route-only revert. A sync revert fails BOTH pins: no route
+        # dispatch (the offload call is gone), or collection on the loop
+        # thread (inline execution).
+        loop_threads: list[int] = []
         collected_threads: list[int] = []
+        real_to_thread = asyncio_module.to_thread
         real_collect = activity_module._collect_snapshot
+
+        def to_thread_spy(fn, *args, **kwargs):
+            loop_threads.append(threading.get_ident())
+            return real_to_thread(fn, *args, **kwargs)
 
         def recording_collect(*args, **kwargs):
             collected_threads.append(threading.get_ident())
             return real_collect(*args, **kwargs)
 
+        monkeypatch.setattr(activity_module.asyncio, "to_thread", to_thread_spy)
         monkeypatch.setattr(
             activity_module, "_collect_snapshot", recording_collect
         )
@@ -469,10 +481,13 @@ class TestThreadOffloadWiring:
             "/api/activity/jobs", headers=route_env.member_headers()
         )
         assert resp.status_code == 200
-        assert collected_threads, (
-            "the activity route never invoked _collect_snapshot"
+        assert loop_threads, (
+            "the activity route never dispatched through asyncio.to_thread "
+            "(sync revert: the offload call is gone)"
         )
-        assert collected_threads != [main_thread], (
-            "the activity route ran the SQLite snapshot collection on the "
-            "event-loop thread (sync revert of the to_thread offload)"
+        assert collected_threads, "the route never invoked _collect_snapshot"
+        loop_thread = loop_threads[0]
+        assert all(t != loop_thread for t in collected_threads), (
+            "the SQLite snapshot collection ran on the event-loop thread "
+            "(sync revert of the to_thread offload)"
         )

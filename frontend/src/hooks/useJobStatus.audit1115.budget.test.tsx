@@ -209,6 +209,36 @@ describe("useActivityJobs single-endpoint poll budget (audit 1115)", () => {
     );
   });
 
+  it("settlement refresh does not dispatch while hidden (visible click, hidden settle race)", async () => {
+    // Closeout-reviewer Important#2: a user action is STARTED while the tab
+    // is visible but settles asynchronously — backgrounding the tab before
+    // the action's finally-refresh runs must not dispatch a hidden request
+    // (same budget invariant as the scheduled tick's hidden skip).
+    publishAuthPrincipal({ id: 603, role: "member" });
+
+    const { result } = renderHook(() => useActivityJobs());
+    await flushFirstTick();
+    const callsAtSettle = mockGetActivityJobs.mock.calls.length;
+    expect(callsAtSettle).toBeGreaterThanOrEqual(1);
+
+    setHidden(true);
+    act(() => {
+      result.current.refresh();
+    });
+    await flushFirstTick();
+    expect(mockGetActivityJobs.mock.calls.length).toBe(callsAtSettle);
+
+    // Back visible: the surface re-syncs (explicit refresh works again).
+    setHidden(false);
+    act(() => {
+      result.current.refresh();
+    });
+    await flushFirstTick();
+    expect(mockGetActivityJobs.mock.calls.length).toBeGreaterThan(
+      callsAtSettle,
+    );
+  });
+
   it("live: 8000ms cadence while a non-terminal row exists, mapped onto rows", async () => {
     publishAuthPrincipal({ id: 603, role: "member" });
     mockGetActivityJobs.mockResolvedValue(
