@@ -540,10 +540,11 @@ async def _resolve_active_user(
             "must_change_password": bool(row[5])
             if len(row) > 5 and row[5] is not None
             else False,
-            # _fetch_user_row_with_pwc is loud on a missing column (#798
-            # AC3), so row is always the 7-column shape here; None still
-            # maps to epoch (never bumped).
-            "password_changed_at": float(row[6]) if row[6] is not None else 0.0,
+            # Real rows always carry password_changed_at (#798 AC3 made
+            # _fetch_user_row_with_pwc loud on a missing column), but mock
+            # harnesses that bypass the SQL layer still feed 6-tuples, so
+            # the length guard stays; None maps to epoch (never bumped).
+            "password_changed_at": float(row[6]) if len(row) > 6 and row[6] is not None else 0.0,
         }
 
         if ttl > 0:
