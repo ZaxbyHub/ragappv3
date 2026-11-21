@@ -633,18 +633,38 @@ class QualityReportReplayIdentityTest(unittest.TestCase):
                 / "rag_engine.py"
             )
             tree = _ast.parse(engine_path.read_text(encoding="utf-8"))
-            to_thread_calls = [
-                node
-                for node in _ast.walk(tree)
-                if isinstance(node, _ast.Attribute)
-                and node.attr == "to_thread"
-            ]
-            self.assertGreaterEqual(
-                len(to_thread_calls),
-                2,
-                "expected >=2 asyncio.to_thread dispatches of the serializer/"
-                "done-message build (candidate payload + done path); found %d"
-                % len(to_thread_calls),
+            # Pin each off-loop dispatch precisely: an AWAITED
+            # asyncio.to_thread(<method>) whose method is the sync serializer or
+            # the done-message build. Counting bare `.to_thread` attributes would
+            # pass against unrelated calls, so we require the specific callables
+            # AND that they are awaited (review r3).
+            target_attrs = {"_serialize_source_candidates", "_build_done_message"}
+            awaited_dispatches = set()
+            for node in _ast.walk(tree):
+                if not isinstance(node, _ast.Await):
+                    continue
+                call = node.value
+                if not isinstance(call, _ast.Call):
+                    continue
+                func = call.func
+                if not (
+                    isinstance(func, _ast.Attribute)
+                    and func.attr == "to_thread"
+                    and isinstance(func.value, _ast.Name)
+                    and func.value.id == "asyncio"
+                ):
+                    continue
+                if (
+                    call.args
+                    and isinstance(call.args[0], _ast.Attribute)
+                    and call.args[0].attr in target_attrs
+                ):
+                    awaited_dispatches.add(call.args[0].attr)
+            self.assertEqual(
+                awaited_dispatches,
+                target_attrs,
+                "both off-loop dispatches must be awaited asyncio.to_thread "
+                "calls: missing %s" % (target_attrs - awaited_dispatches),
             )
 
     def test_serialize_skips_pool_when_all_chunks_stamped(self):

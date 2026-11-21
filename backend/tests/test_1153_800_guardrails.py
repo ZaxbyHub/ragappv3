@@ -677,22 +677,29 @@ class StreamAuthClampDirectTest(unittest.TestCase):
         # Retrieval-bound proof (review r3): the clamp must not only authorize
         # against the stored vault -- the STORED vault must be the one the
         # retrieval path actually uses. FastAPI gives get_stream_auth and
-        # chat_stream SEPARATE body instances (verified: a dependency mutating
-        # its body is invisible to the route), so the authorized scope is
-        # threaded back on the user dict via _scoped_vault_id. This runs the
-        # REAL get_stream_auth, then feeds its user dict to the REAL
-        # chat_stream and asserts retrieval is scoped to V1, not the requested
-        # V3. Without the _scoped_vault_id propagation chat_stream would read
-        # its own unclamped body.vault_id == V3.
+        # chat_stream SEPARATE body instances (verified on fastapi 0.163.0: a
+        # dependency mutating its body is invisible to the route), so the
+        # authorized scope is threaded back on the user dict via
+        # _scoped_vault_id. This runs the REAL get_stream_auth on one body
+        # instance, then feeds its user dict to the REAL chat_stream with a
+        # DISTINCT, UNCLAMPED body (vault_id=V3). Retrieval must use the
+        # propagated V1, not the route body's V3 -- so a revert of the
+        # propagation (route reads body.vault_id) turns this test red.
         self._patch_user(MEMBER_USER)
-        body = ChatStreamRequest(
+        auth_body = ChatStreamRequest(
             messages=[{"role": "user", "content": "hi"}],
             vault_id=V3,
             session_id=SESSION_7,
         )
-        user = self._run_auth(body)  # get_stream_auth clamps + stamps scope
+        user = self._run_auth(auth_body)  # clamps auth_body + stamps scope
+        self.assertEqual(auth_body.vault_id, V1)  # the dependency's copy is clamped
         self.assertEqual(user["_scoped_vault_id"], V1)
-        captured = self._run_chat_stream(body, user)
+        route_body = ChatStreamRequest(
+            messages=[{"role": "user", "content": "hi"}],
+            vault_id=V3,  # a FRESH, unclamped instance, as FastAPI would supply
+            session_id=SESSION_7,
+        )
+        captured = self._run_chat_stream(route_body, user)
         self.assertEqual(captured.get("vault_id"), V1)
 
     def test_no_scope_key_falls_back_to_body_vault(self):
