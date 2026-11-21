@@ -213,8 +213,6 @@ class TestCreateUserForcesPasswordRotation:
 
     def test_created_user_has_must_change_password(self, db_path):
         """Admin-created user has must_change_password=1 in DB after creation."""
-        from app.api.routes import users
-
         orig_get_pool = deps_mod.get_pool
         from app.models.database import get_pool
 

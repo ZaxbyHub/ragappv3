@@ -418,7 +418,6 @@ class TestCreateUserEndpoint(unittest.TestCase):
 
     def tearDown(self):
         """Clean up after tests."""
-        from app.api.routes import users
         from app.models.database import _pool_cache
 
         self.client.close()

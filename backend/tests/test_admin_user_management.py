@@ -34,7 +34,6 @@ def setup_test_db(db_path: str):
     """Set up test database with schema and initial users."""
     return _setup_user_route_test_db(db_path, include_locked_until_index=True)
 
-
 class TestUpdateUser:
     """Tests for PATCH /users/{user_id} endpoint."""
 
@@ -86,7 +85,6 @@ class TestUpdateUser:
                 yield conn
             finally:
                 test_pool.release_connection(conn)
-
 
         app.dependency_overrides[deps.get_db] = override_get_db
 
@@ -278,7 +276,6 @@ class TestUpdateUser:
         )
         assert response.status_code == 401
 
-
 class TestAdminResetPassword:
     """Tests for PATCH /users/{user_id}/password endpoint."""
 
@@ -330,7 +327,6 @@ class TestAdminResetPassword:
                 yield conn
             finally:
                 test_pool.release_connection(conn)
-
 
         app.dependency_overrides[deps.get_db] = override_get_db
 
@@ -498,7 +494,6 @@ class TestAdminResetPassword:
 
         assert response.status_code == 200
 
-
 class TestUpdateUserActiveStatus:
     """Tests for PATCH /users/{user_id}/active endpoint."""
 
@@ -550,7 +545,6 @@ class TestUpdateUserActiveStatus:
                 yield conn
             finally:
                 test_pool.release_connection(conn)
-
 
         app.dependency_overrides[deps.get_db] = override_get_db
 
@@ -752,7 +746,6 @@ class TestUpdateUserActiveStatus:
         assert response.status_code == 200
         assert response.json()["is_active"] is False
 
-
 class TestActiveStatusWithMultipleAdmins:
     """Edge case tests for active status with multiple admins."""
 
@@ -800,7 +793,6 @@ class TestActiveStatusWithMultipleAdmins:
                 yield conn
             finally:
                 test_pool.release_connection(conn)
-
 
         app.dependency_overrides[deps.get_db] = override_get_db
 

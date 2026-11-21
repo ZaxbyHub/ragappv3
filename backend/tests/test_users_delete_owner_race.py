@@ -42,7 +42,6 @@ from starlette.requests import Request  # noqa: E402
 
 from app.api import deps as deps_mod
 from app.api.routes import organizations as orgs_mod  # noqa: E402
-from app.api.routes import users as users_mod  # noqa: E402
 from app.api.routes.organizations import (  # noqa: E402
     TransferOwnershipRequest,
     transfer_ownership,

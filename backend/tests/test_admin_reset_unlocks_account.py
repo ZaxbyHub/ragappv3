@@ -156,8 +156,6 @@ class TestAdminResetUnlocksAccount:
                 test_pool.release_connection(conn)
 
         # Patch get_pool in users module to return our test pool
-        from app.api.routes import users
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         # Mutating user endpoints require csrf_protect — override to pass-through

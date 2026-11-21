@@ -54,7 +54,6 @@ import pytest
 from starlette.requests import Request
 
 from app.api import deps as deps_mod
-from app.api.routes import users as users_mod
 from app.api.routes.users import delete_user
 from app.config import settings
 from app.models.database import SQLiteConnectionPool, _pool_cache, init_db

@@ -152,8 +152,6 @@ class TestSQLInjection:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         self.test_pool = test_pool
@@ -281,8 +279,6 @@ class TestXSSPrevention:
                 yield conn
             finally:
                 test_pool.release_connection(conn)
-
-        from app.api.routes import users
 
         app.dependency_overrides[deps.get_db] = override_get_db
 
@@ -412,8 +408,6 @@ class TestMassAssignment:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         self.test_pool = test_pool
@@ -516,8 +510,6 @@ class TestNegativeAndBoundaryUserIds:
                 yield conn
             finally:
                 test_pool.release_connection(conn)
-
-        from app.api.routes import users
 
         app.dependency_overrides[deps.get_db] = override_get_db
 
@@ -655,8 +647,6 @@ class TestOversizedParameters:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         self.test_pool = test_pool
@@ -785,8 +775,6 @@ class TestEmptyAndMalformedBodies:
                 yield conn
             finally:
                 test_pool.release_connection(conn)
-
-        from app.api.routes import users
 
         app.dependency_overrides[deps.get_db] = override_get_db
 
@@ -957,8 +945,6 @@ class TestJWTTokenManipulation:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         self.test_pool = test_pool
@@ -1102,8 +1088,6 @@ class TestLastSuperadminRaceCondition:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         self.test_pool = test_pool
@@ -1233,8 +1217,6 @@ class TestInvalidRoleValues:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         self.test_pool = test_pool
@@ -1352,8 +1334,6 @@ class TestInvalidIsActiveValues:
                 yield conn
             finally:
                 test_pool.release_connection(conn)
-
-        from app.api.routes import users
 
         app.dependency_overrides[deps.get_db] = override_get_db
 

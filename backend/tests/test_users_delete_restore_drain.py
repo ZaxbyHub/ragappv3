@@ -50,7 +50,6 @@ import pytest  # noqa: E402
 from starlette.requests import Request  # noqa: E402
 
 from app.api import deps as deps_mod
-from app.api.routes import users as users_mod  # noqa: E402
 from app.api.routes.users import delete_user  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.models.database import SQLiteConnectionPool, _pool_cache, init_db  # noqa: E402

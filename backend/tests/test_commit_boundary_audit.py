@@ -47,7 +47,6 @@ from pathlib import Path  # noqa: E402
 from starlette.requests import Request  # noqa: E402
 
 from app.api import deps as deps_mod
-from app.api.routes import users as users_mod  # noqa: E402
 from app.api.routes.users import UpdateRoleRequest, update_user_role  # noqa: E402
 from app.models.database import SQLiteConnectionPool, _pool_cache, init_db  # noqa: E402
 

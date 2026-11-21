@@ -85,8 +85,6 @@ class TestMustChangePasswordInCreateUserInsert:
                 test_pool.release_connection(conn)
 
         # Patch get_pool in users module to return our test pool
-        from app.api.routes import users
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         from app.security import csrf_protect
@@ -331,8 +329,6 @@ class TestMustChangePasswordBehaviorVsAdminReset:
                 yield conn
             finally:
                 test_pool.release_connection(conn)
-
-        from app.api.routes import users
 
         app.dependency_overrides[deps.get_db] = override_get_db
 
