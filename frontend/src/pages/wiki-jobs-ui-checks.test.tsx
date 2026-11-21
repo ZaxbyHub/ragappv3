@@ -557,6 +557,23 @@ describe("WikiJobsPanel read outcomes, filters, and preserved display", () => {
     expect(screen.queryByText(/Showing the newest 500 jobs/i)).not.toBeInTheDocument();
   });
 
+  // The disclosure tracks the DISPLAYED snapshot: a failed refresh retains
+  // the capped rows (see the retention test) and must retain the note too.
+  it("retains the truncation disclosure through a failed refresh", async () => {
+    cleanup();
+    const capped = Array.from({ length: 500 }, (_, i) => makeJob(i + 1, "completed"));
+    listWikiJobsMock
+      .mockResolvedValueOnce({ jobs: capped })
+      .mockRejectedValueOnce(new Error("panel refresh unavailable"));
+    render(<WikiJobsPanel vaultId={1} />);
+    await flush();
+    expect(screen.getByText(/Showing the newest 500 jobs/i)).toBeInTheDocument();
+    const refreshIcon = document.querySelector('[data-handler-key="refresh"]');
+    fireEvent.click(refreshIcon!);
+    await flush();
+    expect(screen.getByText(/Showing the newest 500 jobs/i)).toBeInTheDocument();
+  });
+
   it("passes the route-max limit (500) on the status filter and refresh-signal query", async () => {
     const allJobs = Array.from({ length: 11 }, (_, index) =>
       makeJob(index + 1, "completed"),

@@ -402,11 +402,12 @@ function WikiJobsPanelState({
         </Card>
       ))}
       {jobsDataContext === queryContext &&
-        jobsPhase === "ready" &&
         jobs.length >= WIKI_JOBS_LIMIT && (
+          // Tracks the DISPLAYED snapshot (not jobsPhase): the rows survive a
+          // failed refresh, so the disclosure must survive with them.
           <p className="px-1 text-xs text-muted-foreground" role="note">
             Showing the newest {WIKI_JOBS_LIMIT} jobs — older history is not
-            listed; narrow the status filter to page further.
+            listed.
           </p>
         )}
     </div>
