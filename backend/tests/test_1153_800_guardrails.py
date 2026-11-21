@@ -196,6 +196,9 @@ class QualityIdempotencyMigrationTest(unittest.TestCase):
             "SELECT id FROM quality_reports ORDER BY id").fetchall()
         cases = conn.execute(
             "SELECT id, report_id FROM quality_eval_cases ORDER BY id").fetchall()
+        archived = conn.execute(
+            "SELECT id, report_id, query, expected_outcome FROM quality_eval_cases_archive"
+            " ORDER BY id").fetchall()
         indexes = {
             row[0]
             for row in conn.execute(
@@ -205,8 +208,15 @@ class QualityIdempotencyMigrationTest(unittest.TestCase):
         }
         conn.close()
         self.assertEqual(reports, [(10,)])  # canonical survives, dupe deleted
-        # All cases re-parented to 10 and deduplicated: lowest id 50 survives.
+        # Live cases: re-parented to 10 and deduplicated, lowest id 50 survives.
         self.assertEqual(cases, [(50, 10)])
+        # The discarded cases (51 re-parented from the dupe report, 52 distinct
+        # on the canonical report) are ARCHIVED, not deleted — recoverable. The
+        # archive assigns its own ids, so assert on the preserved content.
+        self.assertEqual(
+            sorted((a[1], a[2], a[3]) for a in archived),
+            [(10, "q", "e"), (10, "q2", "e2")],
+        )
         self.assertIn("idx_quality_reports_message_category", indexes)
         self.assertIn("idx_quality_eval_cases_report_unique", indexes)
 
@@ -364,7 +374,7 @@ class QualityIdempotencyMigrationTest(unittest.TestCase):
         conn.close()
         self.assertEqual(after, before + 1, "the dirty convergence must journal")
         self.assertIn("deleted=1", detail, f"journal must record the report deletion count: {detail!r}")
-        self.assertIn("eval cases deleted=0", detail, f"journal must record the case deletion count: {detail!r}")
+        self.assertIn("eval cases archived=0", detail, f"journal must record the case archive count: {detail!r}")
 
     def test_uniqueness_enforced_post_migration(self):
         db_path = self._db()

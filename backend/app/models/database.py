@@ -3295,22 +3295,38 @@ def migrate_add_quality_idempotency_indexes(sqlite_path: str) -> None:
     are deleted, then the indexes are created. Rerun-safe: every step is a
     no-op on a converged database.
 
-    Data-loss handling (review F-03): convergence keeps the lowest-id row per
-    identity and discards the rest, which is irreversible. To make that loss
-    observable rather than silent:
+    Data-loss handling (review F-03; archive table added per user decision
+    2026-11-21): convergence keeps the lowest-id row per identity and the rest
+    would be irreversible, so:
 
     * differing ``note`` text on discarded reports is merged into the
       canonical report's note (all distinct non-empty notes, ``' || '``
       separated) so no reviewer commentary is lost;
     * eval cases cannot be merged — the ``report_id`` unique index allows one
-      case per report — so genuinely distinct legacy cases are counted and
-      logged, not silently dropped;
-    * the counts of discarded reports, merged notes, and discarded cases are
-      logged and journaled via ``record_migration_outcome`` inside the same
-      transaction, matching the sibling destructive-dedup migrations.
+      case per report — so the cases the per-report dedup would drop are
+      ARCHIVED into ``quality_eval_cases_archive`` (original columns plus
+      ``archived_at``) instead of deleted, making the loss reversible;
+    * the counts of discarded reports and archived cases are logged and
+      journaled via ``record_migration_outcome`` inside the same transaction.
     """
     conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
+        # The archive table must exist before the convergence runs (and on every
+        # fresh install), so create it up front — even when the fast path below
+        # skips the convergence, an already-migrated DB keeps the empty table.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS quality_eval_cases_archive (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id INTEGER NOT NULL,
+                query TEXT NOT NULL,
+                expected_outcome TEXT NOT NULL,
+                provenance TEXT NOT NULL DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
         # Converged-DB fast path (review RP-004): the migration is transactional
         # (BEGIN IMMEDIATE .. commit), so the two unique indexes existing is a
         # durable proof the data is already converged. Skip the convergence
@@ -3395,7 +3411,23 @@ def migrate_add_quality_idempotency_indexes(sqlite_path: str) -> None:
             "   SELECT MIN(cec.id) FROM quality_eval_cases cec GROUP BY cec.report_id"
             ")"
         ).fetchone()[0]
-        # 2. Deduplicate eval cases per report (lowest id survives).
+        # 2. Archive then deduplicate eval cases per report. The unique index
+        #    allows one case per report, so the non-lowest-id cases cannot stay;
+        #    instead of deleting them, copy their full content into
+        #    quality_eval_cases_archive (reversible) and then delete the copies.
+        conn.execute(
+            """
+            INSERT INTO quality_eval_cases_archive
+                (report_id, query, expected_outcome, provenance, created_at)
+            SELECT cec.report_id, cec.query, cec.expected_outcome,
+                   cec.provenance, cec.created_at
+            FROM quality_eval_cases cec
+            WHERE cec.id NOT IN (
+                SELECT MIN(cec2.id) FROM quality_eval_cases cec2
+                GROUP BY cec2.report_id
+            )
+            """
+        )
         conn.execute(
             """
             DELETE FROM quality_eval_cases
@@ -3424,9 +3456,9 @@ def migrate_add_quality_idempotency_indexes(sqlite_path: str) -> None:
         )
         logger.info(
             "migrate_add_quality_idempotency_indexes: converged quality-report "
-            "idempotency duplicates — reports deleted=%d, eval cases deleted=%d "
-            "(irreversible; differing notes were merged into the surviving "
-            "canonical report)",
+            "idempotency duplicates — reports deleted=%d, eval cases archived=%d "
+            "(differing notes merged into the surviving canonical report; "
+            "archived cases are recoverable from quality_eval_cases_archive)",
             reports_discarded,
             cases_discarded,
         )
@@ -3437,7 +3469,7 @@ def migrate_add_quality_idempotency_indexes(sqlite_path: str) -> None:
             outcome="ok",
             detail=(
                 f"deduplicated quality reports: deleted={reports_discarded}, "
-                f"eval cases deleted={cases_discarded}"
+                f"eval cases archived={cases_discarded}"
             ),
         )
         # 4. Create the unique indexes on the converged data. Per-statement
