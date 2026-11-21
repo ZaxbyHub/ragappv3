@@ -127,9 +127,15 @@ def _mutation_env(
         # touch drafts/files/memories/chat_sessions/document_assets/... tables
         # (the #744 shared fixture now builds this same production schema;
         # this explicit build stays because this suite predates it).
-        from app.models.database import init_db
+        # run_migrations too (#798 AC3): init_db alone does not add
+        # password_changed_at, and the loud _fetch_user_row_with_pwc
+        # contract means a schema without the column must fail loudly —
+        # fixtures model production, so they run the migrations production
+        # runs at startup.
+        from app.models.database import init_db, run_migrations
 
         init_db(db_path)
+        run_migrations(db_path)
         conn = sqlite3.connect(db_path)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA foreign_keys = ON;")
