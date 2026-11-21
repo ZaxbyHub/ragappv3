@@ -554,6 +554,12 @@ class TestTerminalSettleRace:
             route_env.pool.release_connection(conn)
 
         wiki_rows = [r for r in rows if r.family == "wiki"]
+        # The inter-read settle MUST have fired exactly once — without it the
+        # static seed already satisfies the id assertions (Stage B reviewer
+        # round 2: non-vacuity pin for the race fixture itself).
+        assert proxy.flips == 1, (
+            f"the inter-read settle fixture never fired (flips={proxy.flips})"
+        )
         # Live row (read as running, id 10) + exactly `remaining`=4 distinct
         # terminal rows — the vacated slot refilled from older history
         # (ids 9,8,7,6; the mutant's LIMIT-4 read misses id 6).
