@@ -89,9 +89,7 @@ class _HardeningHarness:
         app.dependency_overrides[get_db] = override_get_db
         app.dependency_overrides[csrf_protect] = lambda: "t1025h-csrf"
 
-        from app.api.routes import users as users_module
 
-        self._users_module = users_module
 
         from app.config import settings
 

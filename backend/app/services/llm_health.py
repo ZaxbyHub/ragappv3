@@ -134,7 +134,8 @@ class LLMHealthChecker:
             return {"ok": True, "error": None}
 
         except asyncio.TimeoutError as e:
-            return {"ok": False, "error": f"Chat service timeout: {str(e)}"}
+            detail = str(e) or f"exceeded {self.timeout}s probe deadline"
+            return {"ok": False, "error": f"Chat service timeout: {detail}"}
         except LLMError as e:
             return {"ok": False, "error": f"Chat service error: {str(e)}"}
         except httpx.TimeoutException as e:

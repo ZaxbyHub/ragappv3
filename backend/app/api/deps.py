@@ -540,9 +540,10 @@ async def _resolve_active_user(
             "must_change_password": bool(row[5])
             if len(row) > 5 and row[5] is not None
             else False,
-            # password_changed_at may not exist on test schemas without the column;
-            # treat missing/None as 0 (epoch never bumped).
-            "password_changed_at": float(row[6]) if len(row) > 6 and row[6] is not None else 0.0,
+            # _fetch_user_row_with_pwc is loud on a missing column (#798
+            # AC3), so row is always the 7-column shape here; None still
+            # maps to epoch (never bumped).
+            "password_changed_at": float(row[6]) if row[6] is not None else 0.0,
         }
 
         if ttl > 0:

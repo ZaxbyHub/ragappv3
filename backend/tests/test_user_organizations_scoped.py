@@ -162,7 +162,6 @@ class TestUserOrganizationsScopedAccess:
             finally:
                 test_pool.release_connection(conn)
 
-        # Also patch deps.get_pool for evaluate_policy
         from app.api import deps
 
         original_deps_pool = deps.get_pool

@@ -101,7 +101,7 @@ class _ScriptedConn:
         return getattr(self._inner, name)
 
 
-class _ReleaseTrackingPool:
+class _PassThroughPool:
     """Pool facade over the real pool handing the route the scripted conn."""
 
     def __init__(self, real_pool: SQLiteConnectionPool, conn: _ScriptedConn) -> None:
@@ -200,7 +200,7 @@ class _CancelCommitEnv:
         assert self.storage.exists(self.input_relpath)
         self.gate = threading.Event()
         self.conn = _ScriptedConn(self.real_pool.get_connection(), self.gate)
-        self.facade = _ReleaseTrackingPool(self.real_pool, self.conn)
+        self.facade = _PassThroughPool(self.real_pool, self.conn)
         self._saved_get_pool = deps_mod.get_pool
         deps_mod.get_pool = lambda _path: self.facade
         self._saved_data_dir = settings.data_dir

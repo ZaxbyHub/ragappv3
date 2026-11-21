@@ -84,7 +84,6 @@ class TestMustChangePasswordInCreateUserInsert:
             finally:
                 test_pool.release_connection(conn)
 
-        # Patch get_pool in users module to return our test pool
         app.dependency_overrides[deps.get_db] = override_get_db
 
         from app.security import csrf_protect
@@ -111,7 +110,6 @@ class TestMustChangePasswordInCreateUserInsert:
         _pool_cache.clear()
         self.conn.close()
 
-        # Restore original get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret

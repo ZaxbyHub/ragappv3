@@ -16,7 +16,8 @@ Interleavings, per the approved plan (rev 6):
 - Cancellation at the await while the worker is blocked mid-transaction,
   then released to fail inside the transaction: rows survive -> restore;
   CancelledError propagates; the connection is not released before the
-  worker settles.
+  worker settles (release modeled by the test's request-scope finally,
+  mirroring the Depends(get_db) teardown in production).
 - Cancellation at the await, worker completes the commit afterwards:
   tombstones stay discarded (startup reconcile owns them).
 - Cleanup failures (rollback raises inside the backstop; restore_purge
@@ -478,9 +479,12 @@ def test_second_cancel_during_settle_wait_is_drained_not_abandoning(tmp_path: Pa
     SECOND cancellation delivered while the backstop waits for the detached
     worker no longer aborts the wait — the settle-wait is DRAINED, so
     settlement is observed, the (non-committed) restore runs, and only then
-    does the original CancelledError propagate. Containment still holds: the
-    worker reaches its terminal outcome, the connection is released exactly
-    once, and only AFTER settlement."""
+    does the original CancelledError propagate. Containment still holds:
+    the worker reaches its terminal outcome, and the connection is
+    released exactly once, only AFTER settlement (release modeled by the
+    test's own request-scope finally, mirroring the Depends(get_db)
+    teardown in production — the assertions still catch an early or
+    double release by the route)."""
     release = threading.Event()
     env = _OutcomesEnv(
         tmp_path,
