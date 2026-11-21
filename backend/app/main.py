@@ -13,6 +13,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import FileResponse
 
+from app.api.routes.activity import router as activity_router
 from app.api.routes.admin import router as admin_router
 from app.api.routes.auth import router as auth_router
 from app.api.routes.canvas import router as canvas_router
@@ -188,6 +189,7 @@ register_metrics_route(app)
 # E3 closure (issue #518 amendment): FastAPI server spans — registers the
 # span middleware only when the optional OTel extra + telemetry are live.
 register_span_middleware(app)
+app.include_router(activity_router, prefix="/api")
 app.include_router(draft_room_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
 app.include_router(canvas_router, prefix="/api")

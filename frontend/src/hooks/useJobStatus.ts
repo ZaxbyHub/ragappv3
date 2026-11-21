@@ -1,15 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Document } from "@/lib/api/core";
-import { listDocuments, listReindexJobs } from "@/lib/api/core";
-import { listWikiJobs } from "@/lib/api/wiki";
-import { listKMSJobs } from "@/lib/api/kms";
-import { listDrafts, listDraftJobs } from "@/lib/api/draftRoom";
+import type { ActivityJob } from "@/lib/api/activity";
+import { getActivityJobs } from "@/lib/api";
 import { documentProgress } from "@/components/documents/documentProgress";
-import { useVaultStore } from "@/stores/useVaultStore";
-import {
-  captureAuthPrincipalGeneration,
-  captureAuthPrincipalRole,
-} from "@/lib/api/auth-lifecycle";
 
 /**
  * Shared job-family contract for background-job polling (issue #783).
@@ -173,13 +166,15 @@ export function useJobStatus(family: JobFamily, opts: UseJobStatusOptions) {
 // ---------------------------------------------------------------------------
 // Activity tray aggregation (issue #784, [Workstream M] PR 4 of 4)
 //
-// The tray's data source: one poll loop over the five family adapters, each
-// reusing the family's existing server list client (never the client upload
-// store). Mirrors the single-job hook's discipline above: setTimeout chain,
-// never setInterval; API clients are imported (dynamic) and dereferenced
-// ONLY at poll time; every family failure degrades to zero rows for one
-// tick instead of throwing (a 403 for feature/admin-gated families is an
-// ordinary "not visible to this user", not an error).
+// The tray's data source: one poll loop over ONE aggregate endpoint —
+// getActivityJobs (GET /api/activity/jobs, audit 1115-1157-1158) — never
+// the per-family fan-out and never the client upload store. Mirrors the
+// single-job hook's discipline above: setTimeout chain, never setInterval;
+// API clients are imported (dynamic) and dereferenced ONLY at poll time;
+// a failed aggregate request retains the last good snapshot — there is no
+// one-tick expiry, the snapshot is replaced only by a successful fetch (an
+// authorization failure for content the caller cannot see is an ordinary
+// "not visible to this user", not an error).
 // ---------------------------------------------------------------------------
 
 /** One normalized job row the Activity tray renders, whatever the family. */
@@ -210,9 +205,12 @@ const ACTIVITY_TRAY_INTERVAL_MS = 8000;
  */
 const ACTIVITY_MIN_INTERVAL_MS = 1000;
 
-/** Page budget for the ingest family's bounded pagination. */
-const ACTIVITY_INGEST_PAGES = 3;
-const ACTIVITY_INGEST_PAGE_SIZE = 200;
+/**
+ * Idle backoff (#1158 AC6): while the last snapshot had zero live rows the
+ * chain stretches to 32s (~2 requests/min); any live row returns it to the
+ * active 8s cadence (~8/min). Both stay under the ten-per-minute budget.
+ */
+const ACTIVITY_IDLE_INTERVAL_MS = 32000;
 
 /** Bounded retention: all live rows plus the N most recent terminal rows. */
 const ACTIVITY_TERMINAL_RETENTION = 3;
@@ -231,252 +229,120 @@ function retainRows(rows: ActivityJobRow[]): ActivityJobRow[] {
   return [...live, ...terminal];
 }
 
-async function accessibleVaultIds(): Promise<number[]> {
-  const store = useVaultStore.getState();
-  // The tray's first tick can race the shell's vault fetch; an empty store
-  // must not silently stay empty — kick a load so a later tick sees the
-  // vaults (the kick is a no-op while the store is already loading).
-  if (store.vaults.length === 0 && !store.loading) {
-    void Promise.resolve(store.fetchVaults()).catch(() => {});
-  }
-  return store.vaults.map((v: { id: number }) => v.id);
-}
-
-async function fetchIngestRows(): Promise<ActivityJobRow[]> {
-  // The route filters by a single status value; union both live statuses and
-  // dedupe by file id (a list source that ignores the filter must not
-  // double-count a document). Pagination is bounded: a pathological backlog
-  // must not fan out unbounded requests — documents beyond the page budget
-  // are not surfaced (disclosed in the release note).
-  const fetchStatusDocs = async (status: string): Promise<Document[]> => {
-    const docs: Document[] = [];
-    for (let page = 1; page <= ACTIVITY_INGEST_PAGES; page += 1) {
-      const res = await listDocuments({ status, perPage: ACTIVITY_INGEST_PAGE_SIZE, page });
-      docs.push(...res.documents);
-      if (docs.length >= res.total) break;
-    }
-    return docs;
-  };
-  const [pending, processing] = await Promise.all([
-    fetchStatusDocs("pending"),
-    fetchStatusDocs("processing"),
-  ]);
-  const byId = new Map<string, Document>();
-  for (const doc of [...pending, ...processing]) {
-    byId.set(doc.id, doc);
-  }
-  return [...byId.values()].map((doc) => ({
-    family: "ingest" as const,
-    key: `ingest-${doc.id}`,
-    title: doc.filename || `Document ${doc.id}`,
-    phase: documentProgress(doc).label,
-    status: (doc.metadata?.status as string | undefined) ?? "",
-    terminal: false,
-    cancellable: true,
-    retryable: false,
-    fileId: doc.id,
-  }));
-}
-
-async function fetchWikiRows(): Promise<ActivityJobRow[]> {
-  const vaultIds = await accessibleVaultIds();
-  const lists = await Promise.allSettled(
-    vaultIds.map((vaultId) => listWikiJobs({ vault_id: vaultId }))
-  );
-  const jobs = lists.flatMap((r) => (r.status === "fulfilled" ? r.value.jobs : []));
-  return retainRows(
-    jobs.map((job) => ({
-      family: "wiki" as const,
-      key: `wiki-${job.id}`,
-      // A failed compile's own error text is the most useful title the
-      // family's job shape carries (WikiCompileJob has no title field).
-      title:
-        job.status === "failed" && job.error ? job.error : "Wiki compile",
-      phase: job.status,
+function ingestPhaseLabel(job: ActivityJob): string {
+  // documentProgress reads its fields off a Document-shaped object (direct
+  // fields first, metadata second) — the aggregate row already carries the
+  // same phase columns, so a minimal carrier keeps the EXACT label logic.
+  const carrier = {
+    id: job.file_id ?? String(job.id),
+    phase: job.phase ?? undefined,
+    phase_message: job.phase_message ?? undefined,
+    metadata: {
       status: job.status,
-      terminal: isTerminalJobStatus(job.status),
-      cancellable: !isTerminalJobStatus(job.status),
-      retryable: job.status === "failed",
-      jobId: job.id,
-      vaultId: job.vault_id,
-    }))
-  );
+      progress_percent: job.progress_percent ?? undefined,
+      processed_units: job.processed_units ?? undefined,
+      total_units: job.total_units ?? undefined,
+      unit_label: job.unit_label ?? undefined,
+    },
+  } as unknown as Document;
+  return documentProgress(carrier).label;
 }
 
-async function fetchKmsRows(): Promise<ActivityJobRow[]> {
-  const vaultIds = await accessibleVaultIds();
-  // require_kms_enabled / per-vault read denials (403) are the family's
-  // ordinary hidden state, not errors.
-  const lists = await Promise.allSettled(
-    vaultIds.map((vaultId) => listKMSJobs(vaultId))
-  );
-  const jobs = lists.flatMap((r) => (r.status === "fulfilled" ? r.value.jobs : []));
-  return retainRows(
-    jobs.map((job) => ({
-      family: "kms" as const,
-      key: `kms-${job.id}`,
-      title: "KMS recompile",
-      phase: job.status,
-      status: job.status,
-      terminal: isTerminalJobStatus(job.status),
-      cancellable: false,
-      retryable: false,
-      jobId: job.id,
-      vaultId: job.vault_id,
-    }))
-  );
-}
-
-async function fetchDraftRoomRows(): Promise<ActivityJobRow[]> {
-  const drafts = await listDrafts({ page: 1, per_page: 10 });
-  const lists = await Promise.allSettled(
-    drafts.items.map((draft) => listDraftJobs(draft.id, { page: 1, per_page: 20 }))
-  );
-  const jobsByDraft = drafts.items.map((draft, i) => ({
-    draft,
-    jobs: lists[i].status === "fulfilled" ? lists[i].value.items : [],
-  }));
-  return retainRows(
-    jobsByDraft.flatMap(({ draft, jobs }) =>
-      jobs.map((job) => ({
+function mapActivityJob(job: ActivityJob) {
+  switch (job.family) {
+    case "ingest":
+      return {
+        family: "ingest" as const,
+        key: `ingest-${job.file_id ?? job.id}`,
+        title: job.title,
+        phase: ingestPhaseLabel(job),
+        status: job.status,
+        // The server only returns the two live ingest statuses, but the
+        // classification stays status-derived, never hard-coded.
+        terminal: isTerminalJobStatus(job.status),
+        cancellable: !isTerminalJobStatus(job.status),
+        retryable: false,
+        fileId: job.file_id ?? undefined,
+        vaultId: job.vault_id ?? undefined,
+      };
+    case "wiki":
+      return {
+        family: "wiki" as const,
+        key: `wiki-${job.id}`,
+        // A failed compile's own (already-redacted) error text is the most
+        // useful title the family's job shape carries — same composition the
+        // per-family adapter used.
+        title: job.status === "failed" && job.error ? job.error : job.title,
+        phase: job.status,
+        status: job.status,
+        terminal: isTerminalJobStatus(job.status),
+        cancellable: !isTerminalJobStatus(job.status),
+        retryable: job.status === "failed",
+        jobId: job.id,
+        vaultId: job.vault_id ?? undefined,
+      };
+    case "kms":
+      return {
+        family: "kms" as const,
+        key: `kms-${job.id}`,
+        title: job.title,
+        phase: job.status,
+        status: job.status,
+        terminal: isTerminalJobStatus(job.status),
+        cancellable: false,
+        retryable: false,
+        jobId: job.id,
+        vaultId: job.vault_id ?? undefined,
+      };
+    case "draft-room":
+      return {
         family: "draft-room" as const,
-        key: `draft-${draft.id}-job-${job.id}`,
-        title: draft.title || `Draft ${draft.id}`,
+        key: `draft-${job.draft_id}-job-${job.id}`,
+        title: job.title,
         phase: job.active_stage ?? job.status,
         status: job.status,
         terminal: isTerminalJobStatus(job.status),
         cancellable: !isTerminalJobStatus(job.status),
         retryable: job.status === "failed",
-        draftId: draft.id,
+        draftId: job.draft_id ?? undefined,
         jobId: job.id,
-      }))
-    )
-  );
-}
-
-async function fetchReindexRows(): Promise<ActivityJobRow[]> {
-  const { jobs } = await listReindexJobs();
-  return retainRows(
-    jobs.map((job) => ({
-      family: "reindex" as const,
-      key: `reindex-${job.id}`,
-      title:
-        job.vault_id != null
-          ? `Embedding reindex (vault ${job.vault_id})`
-          : "Embedding reindex",
-      phase: job.status,
-      status: job.status,
-      terminal: isTerminalJobStatus(job.status),
-      cancellable: false,
-      retryable: false,
-      jobId: job.id,
-    }))
-  );
-}
-
-// --- Reindex family visibility (issue #1039) -------------------------------
-//
-// GET /documents/reindex/jobs sits behind require_admin_role
-// (backend/app/api/routes/documents.py): for a member/viewer session it can
-// ONLY ever 403. Polling it every tray tick is pure waste the browser still
-// logs as a failed network resource (100+ 403s measured in one member
-// session, 2026-10-28). Two layers keep the family visible exactly where it
-// belongs, without touching the other four families (#1039 AC3):
-//
-//   1. Role-aware skip: when the principal's role is known (the auth store
-//      publishes it to auth-lifecycle), a non-admin never dispatches the
-//      call — zero requests for the whole session.
-//   2. First-403 session backoff: the family is fetched once per principal
-//      generation; a 403 arms a backoff and later ticks skip the dispatch.
-//      A principal change (login-as switch without a reload) gives the new
-//      principal its own first probe.
-//
-// The layers are COMBINED, not short-circuited (review PRR-001): the role is
-// only a client-side snapshot (published at login/init/fetchMe/profile and
-// never revalidated mid-session), while require_admin_role re-reads
-// users.role on every request. A role guess that outranks the server's own
-// 403 verdict would keep dispatching the dead request every tick for a
-// demoted admin — the exact waste this gate exists to remove. So the server
-// verdict always wins: the role guess only decides the FIRST dispatch of a
-// generation, and an armed 403 hides the family for the rest of that
-// principal's session no matter what the snapshot says. A later principal
-// change still re-opens the family for the new principal, and a later role
-// publication on the SAME generation (a re-login into the same identity) is
-// honoured because a fresh publication bumps the generation.
-//
-// Session-wide by design: the tray is remounted on route changes, and a
-// per-mount flag would re-issue the dead request after every navigation.
-const REINDEX_ADMIN_ROLES: ReadonlySet<string> = new Set(["admin", "superadmin"]);
-let reindexHiddenBy403Generation: number | null = null;
-
-function reindexFamilyVisible(): boolean {
-  const generation = captureAuthPrincipalGeneration();
-  if (
-    reindexHiddenBy403Generation !== null &&
-    reindexHiddenBy403Generation !== generation
-  ) {
-    // The 403 belonged to a previous principal: the new one gets a fresh
-    // chance (its own first 403 re-arms the backoff).
-    reindexHiddenBy403Generation = null;
+        vaultId: job.vault_id ?? undefined,
+      };
+    case "reindex":
+      return {
+        family: "reindex" as const,
+        key: `reindex-${job.id}`,
+        title: job.title,
+        phase: job.status,
+        status: job.status,
+        terminal: isTerminalJobStatus(job.status),
+        cancellable: false,
+        retryable: false,
+        jobId: job.id,
+      };
   }
-  if (reindexHiddenBy403Generation !== null) return false;
-  const role = captureAuthPrincipalRole();
-  return role === null || REINDEX_ADMIN_ROLES.has(role);
-}
-
-/**
- * HTTP status of a family fetch failure, in either error shape this repo's
- * API client produces: the response interceptor's normalized Error (top-level
- * `status`) or a raw AxiosError (`.response.status`). Mirrors the
- * shape-tolerance convention of `logApiFailure` (core.ts).
- */
-function httpStatusOf(error: unknown): number | undefined {
-  const candidate = error as {
-    status?: number;
-    response?: { status?: number };
-    originalError?: { response?: { status?: number } };
-  } | null;
-  return (
-    candidate?.status ??
-    candidate?.response?.status ??
-    candidate?.originalError?.response?.status
-  );
 }
 
 async function fetchAllActivityRows(): Promise<ActivityJobRow[]> {
-  const results = await Promise.allSettled([
-    fetchIngestRows(),
-    fetchWikiRows(),
-    fetchKmsRows(),
-    fetchDraftRoomRows(),
-    // Adapter stays registered inline (issue #784 family census) but is
-    // dispatched only when the family can be visible to this principal
-    // (issue #1039): the spread keeps the census-visible `fetchReindexRows()`
-    // call while gating it before any network work happens.
-    ...(reindexFamilyVisible()
-      ? [
-          // Key the backoff to the generation THIS dispatch was made under
-          // (review PRR-003), not the one current when the rejection lands:
-          // a 403 from a parked request that arrives after a principal
-          // switch must not hide a principal that never probed.
-          (() => {
-            const dispatchGeneration = captureAuthPrincipalGeneration();
-            return fetchReindexRows().catch((error: unknown) => {
-              // A 403 is the admin gate answering: hide the family for the
-              // rest of this principal's session so later ticks skip the
-              // dispatch, whatever the client role snapshot says (review
-              // PRR-001). Any other failure (network, 5xx) stays an ordinary
-              // one-tick family miss and keeps polling.
-              if (httpStatusOf(error) === 403) {
-                reindexHiddenBy403Generation = dispatchGeneration;
-              }
-              return [];
-            });
-          })(),
-        ]
-      : []),
-  ]);
-  return results.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
+  // ONE request per tick (#1157's aggregate endpoint): the server scopes
+  // families to exactly the vaults this caller can read (including the
+  // #1039 admin-only reindex scoping and the draft-room owner boundary), so
+  // the old per-family/per-vault fan-out and its client-side 403 backoff
+  // layers are gone. Family failures are not per-family any more: a failed
+  // aggregate call RETAINS the previous snapshot for that tick (last-known
+  // state beats a blank tray); the next successful tick replaces it.
+  const response = await getActivityJobs();
+  const mapped = response.jobs.map(mapActivityJob);
+  // Retention stays PER FAMILY (the <=3-terminal-rows budget each family's
+  // adapter held): one global pass would spend the whole budget on a single
+  // family's backlog and hide a just-failed job from every other family.
+  const byFamily = new Map<string, ReturnType<typeof mapActivityJob>[]>();
+  for (const row of mapped) {
+    const list = byFamily.get(row.family) ?? [];
+    list.push(row);
+    byFamily.set(row.family, list);
+  }
+  return [...byFamily.values()].flatMap((familyRows) => retainRows(familyRows));
 }
 
 export interface UseActivityJobsOptions {
@@ -506,6 +372,10 @@ export function useActivityJobs(options: UseActivityJobsOptions = {}) {
   // the timer chain alive, so a StrictMode remount's stale in-flight fetch
   // settles without arming a second chain (PRR-007 / review F-005a).
   const generationRef = useRef(0);
+  // Idle backoff state (#1158 AC6): true while the last snapshot had at
+  // least one live (non-terminal) row — the active 8s cadence; an all-idle
+  // snapshot stretches the chain to ACTIVITY_IDLE_INTERVAL_MS.
+  const hasLiveRef = useRef(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Stable indirection so the loop can schedule its own next tick without a
   // self-referencing useCallback (same pattern as useJobStatus above).
@@ -520,8 +390,18 @@ export function useActivityJobs(options: UseActivityJobsOptions = {}) {
     if (mountedRef.current && !hasLoadedRef.current) setLoading(true);
     try {
       do {
+        // Queued-dispatch gate (closeout reviewer): a coalesced refresh can
+        // be queued while visible and drained after the tab is hidden —
+        // re-check visibility before EVERY dispatch, the same invariant as
+        // the tick's and refresh's hidden gates. A stale pending flag is
+        // harmless: it only ever causes one extra (visible) iteration later.
+        if (typeof document !== "undefined" && document.hidden) {
+          pendingRef.current = false;
+          break;
+        }
         pendingRef.current = false;
         const next = await fetchAllActivityRows();
+        hasLiveRef.current = next.some((r) => !r.terminal);
         if (mountedRef.current) {
           setRows(next);
           hasLoadedRef.current = true;
@@ -537,13 +417,13 @@ export function useActivityJobs(options: UseActivityJobsOptions = {}) {
     mountedRef.current = true;
     const generation = ++generationRef.current;
     const schedule = (): void => {
-      timerRef.current = setTimeout(
-        () => tickRef.current(),
-        Math.max(
-          optionsRef.current.intervalMs ?? ACTIVITY_TRAY_INTERVAL_MS,
-          ACTIVITY_MIN_INTERVAL_MS
-        )
-      );
+      // Idle backoff (#1158 AC6): a caller-supplied intervalMs pins the
+      // cadence (tests); otherwise the chain idles at 32s and runs at 8s
+      // whenever the last snapshot held a live row.
+      const base =
+        optionsRef.current.intervalMs ??
+        (hasLiveRef.current ? ACTIVITY_TRAY_INTERVAL_MS : ACTIVITY_IDLE_INTERVAL_MS);
+      timerRef.current = setTimeout(() => tickRef.current(), Math.max(base, ACTIVITY_MIN_INTERVAL_MS));
     };
     const tick = (): void => {
       // Backgrounded tab: skip the fetch but keep the chain alive at the same
@@ -554,8 +434,9 @@ export function useActivityJobs(options: UseActivityJobsOptions = {}) {
       }
       void runFetch()
         .catch(() => {
-          // fetchAllActivityRows never rejects (allSettled); this guard only
-          // covers the setState bookkeeping above.
+          // fetchAllActivityRows rejects only when the aggregate request
+          // itself fails; swallow it so the chain stays alive and the last
+          // good snapshot remains on screen (r1-critic F-5 disposition).
         })
         .finally(() => {
           if (!mountedRef.current || generationRef.current !== generation) return;
@@ -579,6 +460,11 @@ export function useActivityJobs(options: UseActivityJobsOptions = {}) {
   }, [runFetch]);
 
   const refresh = useCallback(() => {
+    // Same hidden-tab gate as the scheduled tick (PRR-008): a user action is
+    // started while the tab is visible, but its SETTLEMENT is asynchronous —
+    // the finally-refresh must not dispatch a request once the document is
+    // hidden. The chain's next visible tick reconciles the rows instead.
+    if (typeof document !== "undefined" && document.hidden) return;
     void runFetch().catch(() => {});
   }, [runFetch]);
 

@@ -224,7 +224,9 @@ class TestPositiveCodePins(_FeedbackPins):
 
         with self.pool.connection() as conn:
             resp = await list_kms_jobs(
-                vault_id=1, status=None, db=conn,
+                # #1157: concrete int for the Query-defaulted limit outside
+                # a request context.
+                vault_id=1, status=None, limit=500, db=conn,
                 user=_USER, evaluate=_allow_all, _=None,
             )
         job = next(j for j in resp["jobs"] if j["trigger_type"] == "manual")

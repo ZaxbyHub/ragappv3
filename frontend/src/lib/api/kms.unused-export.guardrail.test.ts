@@ -39,6 +39,13 @@ const ALLOWLIST: Record<string, string> = {
   // a second search client is redundant UI work outside this PR's
   // contract (trace 783 pre-run census finding).
   searchKMS: "trace 783 census: page search uses listKMSEntries search param",
+  // #1157 (2026-11-20): the tray's KMS rows now come from the aggregated
+  // GET /activity/jobs and KMSPage's targeted poll moved to getKMSJob over
+  // the single-job route (the list route's omitted limit is now the default
+  // page, so a watched job beyond it would go invisible). The list client
+  // stays exported for the still-listening GET /kms/jobs route; re-wire on
+  // the next consumer and delete this entry.
+  listKMSJobs: "issue #1157: tray reads /activity/jobs; KMSPage polls getKMSJob",
 };
 
 function walkFiles(dir: string, out: string[] = []): string[] {

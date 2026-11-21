@@ -204,6 +204,9 @@ class TestO02CompileJobErrorRedaction(unittest.IsolatedAsyncioTestCase):
             resp = await list_kms_jobs(
                 vault_id=1,
                 status=None,
+                # #1157: the route's limit default is a FastAPI Query object
+                # outside a request; direct calls bind a concrete int.
+                limit=500,
                 db=conn,
                 user=_USER,
                 evaluate=_allow_all,

@@ -485,7 +485,16 @@ class KMSStore:
         ).fetchone()
         return _to_job(row)
 
-    def list_jobs(self, vault_id: int, status: Optional[str] = None) -> list[KMSCompileJob]:
+    def list_jobs(
+        self,
+        vault_id: int,
+        status: Optional[str] = None,
+        # Default row bound (#1157 AC3): matches the ROUTE default (50).
+        # Unlike WikiStore.list_jobs (whose None means unbounded), the kms
+        # store always applies LIMIT — direct callers must pass a concrete
+        # int (a Route Query default or None cannot bind to `LIMIT ?`).
+        limit: int = 50,
+    ) -> list[KMSCompileJob]:
         if _lease_enabled():
             ensure_jobs_schema(self._db)
             sql = (
@@ -498,18 +507,21 @@ class KMSStore:
             if status:
                 sql += " AND status = ?"
                 params.append(status)
-            sql += " ORDER BY id DESC"
+            sql += " ORDER BY id DESC LIMIT ?"
+            params.append(limit)
             rows = self._db.execute(sql, params).fetchall()
             return [_compile_job_from_jobs_row(r) for r in rows]
         if status:
             rows = self._db.execute(
-                "SELECT * FROM kms_compile_jobs WHERE vault_id = ? AND status = ? ORDER BY created_at DESC",
-                (vault_id, status),
+                "SELECT * FROM kms_compile_jobs WHERE vault_id = ? AND status = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (vault_id, status, limit),
             ).fetchall()
         else:
             rows = self._db.execute(
-                "SELECT * FROM kms_compile_jobs WHERE vault_id = ? ORDER BY created_at DESC",
-                (vault_id,),
+                "SELECT * FROM kms_compile_jobs WHERE vault_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (vault_id, limit),
             ).fetchall()
         return [_to_job(r) for r in rows]
 

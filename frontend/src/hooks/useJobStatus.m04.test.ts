@@ -1,36 +1,55 @@
 // frontend/src/hooks/useJobStatus.m04.test.ts
-// Issue #784 ([Workstream M] PR 4 of 4) — unit coverage for the Activity
-// tray's data source: the useActivityJobs aggregation and its five family
-// adapters. The frozen component-level contract lives in
-// ActivityTray.m04.test.tsx / PageShell.m04.test.tsx; this file pins the
-// ADAPTER semantics: vault fan-out flattening, the pending+processing
-// ingest union dedupe, 403 tolerance for gated families, the draft
-// two-hop fan-out, GLOBAL-recency terminal retention (including the
-// two-vault regression for the per-parent backlog bug), refresh
-// coalescing, the interval floor, and unmount safety of the poll loop.
+// Issue #784 ([Workstream M] PR 4 of 4), re-pinned for the #1157 aggregate
+// seam: the Activity tray's data source is useActivityJobs, which now polls
+// ONE endpoint per tick — getActivityJobs from "@/lib/api" — instead of the
+// old five-family, per-vault fan-out. The frozen component-level contract
+// lives in ActivityTray.m04.test.tsx / PageShell.m04.test.tsx; this file
+// pins the SEAM semantics against the aggregate: exactly one request per
+// tick with zero legacy family dispatches, family-discriminated row mapping
+// (wiki error titles, draft active_stage phases, ingest phase labels through
+// the REAL documentProgress vocabulary, reindex terminal classification),
+// PER-FAMILY terminal retention across a multi-family backlog (one family's
+// backlog must not spend another family's budget), live-row non-capping,
+// degradation to the last snapshot on a rejected aggregate call, refresh
+// coalescing while a tick is in flight, the interval floor, and unmount
+// safety of the poll loop.
 //
-// Feedback round 853-20261005: mocks are reset in beforeEach (clearMocks
-// only clears call history); the ingest phase assertion exercises the REAL
-// documentProgress vocabulary; the retention fixture is server-ordered
-// newest-first like the real lists.
+// Lineage (feedback round 853-20261005 discipline preserved): mocks are
+// reset in beforeEach (clearMocks only clears call history); the ingest
+// phase assertion still exercises the REAL documentProgress vocabulary; the
+// retention fixtures stay server-ordered newest-first like the real lists.
+// Mock layout mirrors useJobStatus.audit1115.budget.test.tsx: "@/lib/api"
+// is mocked with the importActual spread PLUS getActivityJobs, and every
+// legacy per-family module stays mocked so the zero-tolerance no-fan-out
+// assertions keep their teeth.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook, waitFor, act } from "@testing-library/react";
+import type { ActivityJob } from "@/lib/api";
 
 const {
+  mockGetActivityJobs,
   mockListDocuments,
   mockListReindexJobs,
+  mockListWikiJobs,
   mockListKMSJobs,
   mockListDrafts,
   mockListDraftJobs,
   mockVaultState,
 } = vi.hoisted(() => ({
+  mockGetActivityJobs: vi.fn(),
   mockListDocuments: vi.fn(),
   mockListReindexJobs: vi.fn(),
+  mockListWikiJobs: vi.fn(),
   mockListKMSJobs: vi.fn(),
   mockListDrafts: vi.fn(),
   mockListDraftJobs: vi.fn(),
   mockVaultState: vi.fn(),
+}));
+
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/api")>()),
+  getActivityJobs: mockGetActivityJobs,
 }));
 
 vi.mock("@/lib/api/core", () => ({
@@ -39,7 +58,7 @@ vi.mock("@/lib/api/core", () => ({
 }));
 
 vi.mock("@/lib/api/wiki", () => ({
-  listWikiJobs: vi.fn(),
+  listWikiJobs: mockListWikiJobs,
 }));
 
 vi.mock("@/lib/api/kms", () => ({
@@ -53,416 +72,327 @@ vi.mock("@/lib/api/draftRoom", () => ({
 
 vi.mock("@/stores/useVaultStore", () => ({
   // A zustand store stand-in: callable component-side, with a poll-time
-  // getState the tests drive through mockReturnValue.
+  // getState the tests drive through mockReturnValue (asserted UNCONSULTED —
+  // accessibleVaultIds is gone; the server scopes vaults now).
   useVaultStore: Object.assign(() => ({}), { getState: mockVaultState }),
 }));
 
 // The REAL documentProgress runs (no identity mock): ingest phase asserts
 // the family's own phase vocabulary through it (PRR-016).
 import { useActivityJobs } from "./useJobStatus";
-import { listWikiJobs } from "@/lib/api/wiki";
 
-function doc(id: string, status: string, filename = `${id}.txt`) {
+/** A complete ActivityJob row; per-family fields default to their nulls. */
+function activityJob(
+  overrides: Partial<ActivityJob> & Pick<ActivityJob, "family" | "id">
+): ActivityJob {
   return {
-    id,
-    filename,
-    vault_id: 1,
-    metadata: { status, phase: "embedding" },
-  };
-}
-
-function wikiJob(id: number, status: string, error: string | null = null) {
-  return {
-    id,
-    vault_id: 3,
-    trigger_type: "manual",
-    trigger_id: null,
-    status,
-    error,
-    result_json: "{}",
-    created_at: `2026-01-01T00:00:00Z`,
-    started_at: null,
-    completed_at: null,
-    retry_count: 0,
-  };
-}
-
-function kmsJob(id: number, status: string) {
-  return { ...wikiJob(id, status), vault_id: 3 };
-}
-
-function reindexJob(id: number, status: string, vaultId: number | null = 1) {
-  return {
-    id,
-    vault_id: vaultId,
-    trigger_type: "api",
-    trigger_id: "1",
-    status,
-    error: null,
-    result_json: "{}",
-    input_json: "{}",
-    retry_count: 0,
+    vault_id: null,
+    status: "running",
+    title: "t",
     created_at: "2026-01-01T00:00:00Z",
-    started_at: null,
     completed_at: null,
+    draft_id: null,
+    file_id: null,
+    active_stage: null,
+    phase: null,
+    phase_message: null,
+    progress_percent: null,
+    processed_units: null,
+    total_units: null,
+    unit_label: null,
+    error: null,
+    ...overrides,
   };
 }
 
-function draftJob(id: number, draftId: number, status: string, activeStage: string | null = null) {
-  return {
-    id,
-    draft_id: draftId,
-    job_type: "compile",
-    status,
-    active_stage: activeStage,
-  };
+/** The wire shape GET /api/activity/jobs answers with. */
+function activityResponse(
+  jobs: ActivityJob[] = [],
+  changeToken = "t0",
+  changed = false,
+) {
+  return { jobs, change_token: changeToken, changed };
 }
 
 beforeEach(() => {
   mockVaultState.mockReturnValue({
-    vaults: [],
+    vaults: [{ id: 1 }],
     loading: false,
     fetchVaults: vi.fn().mockResolvedValue(undefined),
   });
+  mockGetActivityJobs.mockReset();
+  mockGetActivityJobs.mockResolvedValue(activityResponse());
   mockListDocuments.mockReset();
   mockListDocuments.mockResolvedValue({ documents: [], total: 0 });
+  mockListReindexJobs.mockReset();
+  mockListReindexJobs.mockResolvedValue({ jobs: [] });
+  mockListWikiJobs.mockReset();
+  mockListWikiJobs.mockResolvedValue({ jobs: [] });
   mockListKMSJobs.mockReset();
   mockListKMSJobs.mockResolvedValue({ jobs: [] });
   mockListDrafts.mockReset();
   mockListDrafts.mockResolvedValue({ items: [], total: 0, page: 1, per_page: 10 });
   mockListDraftJobs.mockReset();
   mockListDraftJobs.mockResolvedValue({ items: [], total: 0, page: 1, per_page: 20 });
-  mockListReindexJobs.mockReset();
-  mockListReindexJobs.mockResolvedValue({ jobs: [] });
-  const wikiMock = vi.mocked(listWikiJobs);
-  wikiMock.mockReset();
-  wikiMock.mockResolvedValue({ jobs: [] });
 });
 
 afterEach(() => {
   vi.useRealTimers();
 });
 
-describe("useActivityJobs adapters (issue #784)", () => {
-  it("fans wiki jobs out across the accessible vaults and flattens", async () => {
-    mockVaultState.mockReturnValue({
-      vaults: [{ id: 1 }, { id: 2 }],
-      loading: false,
-      fetchVaults: vi.fn().mockResolvedValue(undefined),
-    });
-    const wikiMock = vi.mocked(listWikiJobs);
-    wikiMock.mockImplementation(async ({ vault_id }: { vault_id: number }) =>
-      vault_id === 1
-        ? { jobs: [wikiJob(1, "running")] }
-        : { jobs: [wikiJob(2, "failed", "compile exploded")] }
-    );
+describe("useActivityJobs aggregate seam (issues #784 / #1157)", () => {
+  it("dispatches exactly one getActivityJobs call for the first tick and consults none of the legacy per-family routes", async () => {
+    const { result } = renderHook(() => useActivityJobs({ intervalMs: 8000 }));
 
-    const { result } = renderHook(() => useActivityJobs());
-
-    await waitFor(
-      () => {
-        const wiki = result.current.rows.filter((r) => r.family === "wiki");
-        expect(wiki.map((r) => r.key).sort()).toEqual(["wiki-1", "wiki-2"]);
-        expect(wikiMock).toHaveBeenCalledWith({ vault_id: 1 });
-        expect(wikiMock).toHaveBeenCalledWith({ vault_id: 2 });
-      },
-      { timeout: 8_000 }
-    );
-    const failed = result.current.rows.find((r) => r.key === "wiki-2");
-    expect(failed?.retryable).toBe(true);
-    expect(failed?.title).toBe("compile exploded");
-    const running = result.current.rows.find((r) => r.key === "wiki-1");
-    expect(running?.cancellable).toBe(true);
-    expect(running?.title).toBe("Wiki compile");
-  });
-
-  it("keeps a later vault's just-failed job when an earlier vault has a terminal backlog (two-vault retention regression)", async () => {
-    // Server lists are newest-first per vault; vault 1 has a full terminal
-    // backlog, vault 2 has one FRESH failed job. The pre-fix positional
-    // slice kept vault 1's three oldest-terminal rows and dropped wiki-9.
-    mockVaultState.mockReturnValue({
-      vaults: [{ id: 1 }, { id: 2 }],
-      loading: false,
-      fetchVaults: vi.fn().mockResolvedValue(undefined),
-    });
-    const wikiMock = vi.mocked(listWikiJobs);
-    wikiMock.mockImplementation(async ({ vault_id }: { vault_id: number }) =>
-      vault_id === 1
-        ? { jobs: [wikiJob(3, "completed"), wikiJob(2, "completed"), wikiJob(1, "completed")] }
-        : { jobs: [wikiJob(9, "failed", "later vault failed")] }
-    );
-
-    const { result } = renderHook(() => useActivityJobs());
-
-    await waitFor(
-      () => {
-        const wiki = result.current.rows.filter((r) => r.family === "wiki");
-        expect(wiki.map((r) => r.key)).toEqual(["wiki-9", "wiki-3", "wiki-2"]);
-      },
-      { timeout: 8_000 }
-    );
-    const failed = result.current.rows.find((r) => r.key === "wiki-9");
-    expect(failed?.retryable).toBe(true);
-    expect(failed?.title).toBe("later vault failed");
-  });
-
-  it("dedupes the ingest pending+processing union by file id (real documentProgress vocabulary)", async () => {
-    mockListDocuments.mockImplementation(async ({ status }: { status?: string }) =>
-      status === "pending"
-        ? {
-            documents: [doc("42", "pending"), doc("43", "pending")],
-            total: 2,
-          }
-        : { documents: [doc("42", "processing")], total: 1 }
-    );
-
-    const { result } = renderHook(() => useActivityJobs());
-
-    await waitFor(
-      () => {
-        const ingest = result.current.rows.filter((r) => r.family === "ingest");
-        expect(ingest.map((r) => r.fileId).sort()).toEqual(["42", "43"]);
-      },
-      { timeout: 8_000 }
-    );
-    const row = result.current.rows.find((r) => r.fileId === "42");
-    expect(row?.status).toBe("processing");
-    expect(row?.cancellable).toBe(true);
-    expect(row?.retryable).toBe(false);
-    // The real documentProgress maps metadata.phase through its vocabulary.
-    expect(row?.phase).toBe("embedding");
-  });
-
-  it("bounds the ingest pagination (stops at the page budget, dedupes across pages)", async () => {
-    // total exceeds one page: the adapter pages until the budget, and the
-    // union must not double-count a document returned on two pages.
-    mockListDocuments.mockImplementation(
-      async ({ status, page }: { status?: string; page?: number }) => {
-        const p = page ?? 1;
-        const document = doc(`${status}-${p}`, status);
-        return { documents: [document], total: 1000 };
-      }
-    );
-
-    const { result } = renderHook(() => useActivityJobs());
-
-    await waitFor(
-      () => {
-        expect(mockListDocuments).toHaveBeenCalledWith({
-          status: "pending",
-          perPage: 200,
-          page: 3,
-        });
-      },
-      { timeout: 8_000 }
-    );
-    // Page budget reached: exactly 3 pages per status, no 4th call.
-    expect(mockListDocuments).not.toHaveBeenCalledWith({
-      status: "pending",
-      perPage: 200,
-      page: 4,
-    });
-    const ingest = result.current.rows.filter((r) => r.family === "ingest");
-    expect(ingest).toHaveLength(6); // 3 pages x 2 statuses
-  });
-
-  it("drops the kms family silently when every vault call rejects (403)", async () => {
-    mockVaultState.mockReturnValue({
-      vaults: [{ id: 9 }],
-      loading: false,
-      fetchVaults: vi.fn().mockResolvedValue(undefined),
-    });
-    const wikiMock = vi.mocked(listWikiJobs);
-    wikiMock.mockResolvedValue({ jobs: [] });
-    mockListKMSJobs.mockRejectedValue(new Error("403 kms disabled"));
-
-    const { result } = renderHook(() => useActivityJobs());
-
-    // Wait on the sibling wiki call (same vault fan-out) rather than on
-    // empty rows — rows start empty, so that wait would be vacuous before
-    // the first tick lands. The rejecting kms mock leaves zero kms rows,
-    // which is the behaviour under test.
-    await waitFor(() => expect(wikiMock).toHaveBeenCalledWith({ vault_id: 9 }), {
-      timeout: 8_000,
-    });
+    // Wait on the settle (loading clears in the tick's finally), then pin
+    // the exactly-once dispatch: one tick, one aggregate request.
     await waitFor(
       () => {
         expect(result.current.loading).toBe(false);
       },
       { timeout: 8_000 }
     );
-    expect(result.current.rows.filter((r) => r.family === "kms")).toHaveLength(0);
+    expect(mockGetActivityJobs).toHaveBeenCalledTimes(1);
+
+    // Zero fan-out: none of the deleted per-family fetchers, and none of the
+    // deleted vault-store consultation, may run (the server scopes families
+    // to the caller's vaults now — #1157).
+    expect(mockListDocuments).not.toHaveBeenCalled();
+    expect(mockListWikiJobs).not.toHaveBeenCalled();
+    expect(mockListKMSJobs).not.toHaveBeenCalled();
+    expect(mockListDrafts).not.toHaveBeenCalled();
+    expect(mockListDraftJobs).not.toHaveBeenCalled();
+    expect(mockListReindexJobs).not.toHaveBeenCalled();
+    expect(mockVaultState).not.toHaveBeenCalled();
   });
 
-  it("maps kms rows as non-cancellable status rows", async () => {
-    mockVaultState.mockReturnValue({
-      vaults: [{ id: 1 }],
-      loading: false,
-      fetchVaults: vi.fn().mockResolvedValue(undefined),
-    });
-    mockListKMSJobs.mockResolvedValue({ jobs: [kmsJob(11, "running")] });
+  it("maps every family's rows onto ActivityJobRow (wiki error titles, draft active_stage, ingest phase vocabulary, reindex classification, keys)", async () => {
+    mockGetActivityJobs.mockResolvedValue(
+      activityResponse(
+        [
+          // wiki: a failed compile's own (redacted) error text is the title;
+          // a running compile keeps the server title and is cancellable.
+          activityJob({ family: "wiki", id: 7, vault_id: 3, status: "running", title: "Wiki compile" }),
+          activityJob({ family: "wiki", id: 8, vault_id: 3, status: "failed", title: "Wiki compile", error: "compile exploded" }),
+          // kms: status rows are never cancellable.
+          activityJob({ family: "kms", id: 11, vault_id: 3, status: "running", title: "KMS recompile" }),
+          // draft-room: phase prefers active_stage, falling back to status.
+          activityJob({ family: "draft-room", id: 9, draft_id: 5, status: "running", active_stage: "compiling", title: "Q3 report" }),
+          activityJob({ family: "draft-room", id: 10, draft_id: 6, status: "queued", active_stage: null, title: "Launch spec" }),
+          // ingest: phase labels come from the real documentProgress
+          // vocabulary — phase_message outranks phase, phase outranks the
+          // status-derived fallbacks.
+          activityJob({ family: "ingest", id: 1, file_id: "42", vault_id: 1, status: "processing", phase: "embedding", title: "handbook.pdf" }),
+          activityJob({ family: "ingest", id: 2, file_id: "43", vault_id: 1, status: "processing", phase_message: "Chunking document", title: "spec.pdf" }),
+          activityJob({ family: "ingest", id: 3, file_id: "44", vault_id: 1, status: "processing", title: "notes.txt" }),
+          // reindex: terminal classification is status-derived; never
+          // cancellable; the title is the server's.
+          activityJob({ family: "reindex", id: 21, vault_id: null, status: "running", title: "Embedding reindex (vault 4)" }),
+          activityJob({ family: "reindex", id: 22, vault_id: null, status: "failed", title: "Embedding reindex" }),
+        ],
+        "t1",
+        true
+      )
+    );
 
-    const { result } = renderHook(() => useActivityJobs());
+    const { result } = renderHook(() => useActivityJobs({ intervalMs: 8000 }));
 
     await waitFor(
       () => {
-        const kms = result.current.rows.filter((r) => r.family === "kms");
-        expect(kms).toHaveLength(1);
+        expect(result.current.rows).toHaveLength(10);
       },
       { timeout: 8_000 }
     );
-    const row = result.current.rows.find((r) => r.family === "kms");
-    expect(row?.title).toBe("KMS recompile");
-    expect(row?.cancellable).toBe(false);
-    expect(row?.retryable).toBe(false);
-    expect(row?.phase).toBe("running");
-    expect(row?.jobId).toBe(11);
-  });
 
-  it("maps reindex rows (the family backed by the new list route)", async () => {
-    mockListReindexJobs.mockResolvedValue({
-      jobs: [reindexJob(21, "running", 4), reindexJob(22, "failed", null)],
-    });
-
-    const { result } = renderHook(() => useActivityJobs());
-
-    await waitFor(
-      () => {
-        const reindex = result.current.rows.filter((r) => r.family === "reindex");
-        expect(reindex).toHaveLength(2);
-      },
-      { timeout: 8_000 }
-    );
-    const scoped = result.current.rows.find((r) => r.jobId === 21);
-    expect(scoped?.title).toBe("Embedding reindex (vault 4)");
-    expect(scoped?.phase).toBe("running");
-    expect(scoped?.cancellable).toBe(false);
-    const unscoped = result.current.rows.find((r) => r.jobId === 22);
-    expect(unscoped?.title).toBe("Embedding reindex");
-    expect(unscoped?.terminal).toBe(true);
-  });
-
-  it("walks the draft two-hop fan-out and keeps sibling drafts whose job call rejects", async () => {
-    mockListDrafts.mockResolvedValue({
-      items: [
-        { id: 5, title: "Q3 report" },
-        { id: 6, title: "Broken draft" },
-      ],
-      total: 2,
-      page: 1,
-      per_page: 10,
-    });
-    mockListDraftJobs.mockImplementation(async (draftId: number) => {
-      if (draftId === 6) throw new Error("403 draft job read");
-      return {
-        items: [draftJob(9, 5, "running", "compiling")],
-        total: 1,
-        page: 1,
-        per_page: 20,
-      };
-    });
-
-    const { result } = renderHook(() => useActivityJobs());
-
-    await waitFor(
-      () => {
-        const draft = result.current.rows.find((r) => r.family === "draft-room");
-        expect(draft).toBeDefined();
-      },
-      { timeout: 8_000 }
-    );
-    const row = result.current.rows.find((r) => r.family === "draft-room");
-    expect(row?.draftId).toBe(5);
-    expect(row?.jobId).toBe(9);
-    expect(row?.title).toBe("Q3 report");
-    expect(row?.phase).toBe("compiling");
-    expect(row?.cancellable).toBe(true);
-    expect(result.current.rows.filter((r) => r.family === "draft-room")).toHaveLength(1);
-  });
-
-  it("keeps at most three terminal rows per family by global recency (server order is newest-first)", async () => {
-    mockVaultState.mockReturnValue({
-      vaults: [{ id: 1 }],
-      loading: false,
-      fetchVaults: vi.fn().mockResolvedValue(undefined),
-    });
-    const wikiMock = vi.mocked(listWikiJobs);
-    // Real server order: newest-first.
-    wikiMock.mockResolvedValue({
-      jobs: [
-        wikiJob(5, "completed"),
-        wikiJob(4, "completed"),
-        wikiJob(3, "completed"),
-        wikiJob(2, "completed"),
-        wikiJob(1, "running"),
-      ],
-    });
-
-    const { result } = renderHook(() => useActivityJobs());
-
-    await waitFor(
-      () => {
-        const wiki = result.current.rows.filter((r) => r.family === "wiki");
-        expect(wiki).toHaveLength(4);
-      },
-      { timeout: 8_000 }
-    );
     const wiki = result.current.rows.filter((r) => r.family === "wiki");
-    expect(wiki.map((r) => r.key)).toEqual(["wiki-1", "wiki-5", "wiki-4", "wiki-3"]);
+    expect(wiki.map((r) => r.key).sort()).toEqual(["wiki-7", "wiki-8"]);
+    const running = wiki.find((r) => r.key === "wiki-7");
+    expect(running?.title).toBe("Wiki compile");
+    expect(running?.cancellable).toBe(true);
+    expect(running?.retryable).toBe(false);
+    expect(running?.terminal).toBe(false);
+    const failed = wiki.find((r) => r.key === "wiki-8");
+    expect(failed?.title).toBe("compile exploded");
+    expect(failed?.retryable).toBe(true);
+    expect(failed?.terminal).toBe(true);
+
+    const kms = result.current.rows.filter((r) => r.family === "kms");
+    expect(kms.map((r) => r.key)).toEqual(["kms-11"]);
+    expect(kms[0]?.title).toBe("KMS recompile");
+    expect(kms[0]?.phase).toBe("running");
+    expect(kms[0]?.cancellable).toBe(false);
+    expect(kms[0]?.retryable).toBe(false);
+    expect(kms[0]?.jobId).toBe(11);
+
+    const drafts = result.current.rows.filter((r) => r.family === "draft-room");
+    expect(drafts.map((r) => r.key).sort()).toEqual(["draft-5-job-9", "draft-6-job-10"]);
+    const staged = drafts.find((r) => r.key === "draft-5-job-9");
+    expect(staged?.title).toBe("Q3 report");
+    expect(staged?.phase).toBe("compiling");
+    expect(staged?.cancellable).toBe(true);
+    expect(staged?.draftId).toBe(5);
+    expect(staged?.jobId).toBe(9);
+    const stageless = drafts.find((r) => r.key === "draft-6-job-10");
+    expect(stageless?.phase).toBe("queued"); // active_stage ?? status
+
+    const ingest = result.current.rows.filter((r) => r.family === "ingest");
+    expect(ingest.map((r) => r.key).sort()).toEqual(["ingest-42", "ingest-43", "ingest-44"]);
+    const phaseRow = ingest.find((r) => r.fileId === "42");
+    expect(phaseRow?.phase).toBe("embedding"); // real documentProgress vocabulary
+    expect(phaseRow?.cancellable).toBe(true);
+    expect(phaseRow?.retryable).toBe(false);
+    expect(ingest.find((r) => r.fileId === "43")?.phase).toBe("Chunking document"); // message outranks phase
+    expect(ingest.find((r) => r.fileId === "44")?.phase).toBe("Waiting"); // vocabulary fallback
+
+    const reindex = result.current.rows.filter((r) => r.family === "reindex");
+    expect(reindex.map((r) => r.key).sort()).toEqual(["reindex-21", "reindex-22"]);
+    const live = reindex.find((r) => r.jobId === 21);
+    expect(live?.title).toBe("Embedding reindex (vault 4)");
+    expect(live?.phase).toBe("running");
+    expect(live?.terminal).toBe(false);
+    expect(live?.cancellable).toBe(false);
+    const dead = reindex.find((r) => r.jobId === 22);
+    expect(dead?.terminal).toBe(true);
   });
 
-  it("coalesces a refresh issued while a tick is in flight (does not drop it)", async () => {
-    let releaseReindex!: () => void;
-    mockListReindexJobs.mockImplementation(
+  it("retains at most three terminal rows PER FAMILY across a multi-family backlog (one family's backlog cannot spend another's budget)", async () => {
+    // Server order is newest-first per family. Both families carry a full
+    // terminal backlog; a single global retention pass would keep three rows
+    // TOTAL and blank one family — the per-family budget is the guarantee.
+    mockGetActivityJobs.mockResolvedValue(
+      activityResponse([
+        ...[5, 4, 3, 2, 1].map((id) =>
+          activityJob({ family: "wiki", id, vault_id: 3, status: "completed", title: "Wiki compile" })
+        ),
+        ...[5, 4, 3, 2, 1].map((id) =>
+          activityJob({ family: "kms", id, vault_id: 3, status: "completed", title: "KMS recompile" })
+        ),
+      ])
+    );
+
+    const { result } = renderHook(() => useActivityJobs({ intervalMs: 8000 }));
+
+    await waitFor(
+      () => {
+        expect(result.current.rows).toHaveLength(6);
+      },
+      { timeout: 8_000 }
+    );
+    // Each family keeps its OWN three most recent terminal rows (family job
+    // ids are globally autoincrement, so descending id is global recency).
+    const wiki = result.current.rows.filter((r) => r.family === "wiki");
+    expect(wiki.map((r) => r.key)).toEqual(["wiki-5", "wiki-4", "wiki-3"]);
+    expect(wiki.every((r) => r.terminal)).toBe(true);
+    const kms = result.current.rows.filter((r) => r.family === "kms");
+    expect(kms.map((r) => r.key)).toEqual(["kms-5", "kms-4", "kms-3"]);
+    expect(kms.every((r) => r.terminal)).toBe(true);
+  });
+
+  it("keeps live rows uncapped alongside the per-family terminal budget", async () => {
+    mockGetActivityJobs.mockResolvedValue(
+      activityResponse([
+        // Four LIVE wiki rows (beyond the terminal budget of three) plus a
+        // five-row terminal backlog, newest-first.
+        ...[1, 2, 3, 4].map((id) =>
+          activityJob({ family: "wiki", id, vault_id: 3, status: "running", title: "Wiki compile" })
+        ),
+        ...[15, 14, 13, 12, 11].map((id) =>
+          activityJob({ family: "wiki", id, vault_id: 3, status: "completed", title: "Wiki compile" })
+        ),
+      ])
+    );
+
+    const { result } = renderHook(() => useActivityJobs({ intervalMs: 8000 }));
+
+    await waitFor(
+      () => {
+        expect(result.current.rows).toHaveLength(7);
+      },
+      { timeout: 8_000 }
+    );
+    // All live rows survive (never capped), followed by the three most
+    // recent terminal rows by descending job id.
+    expect(result.current.rows.map((r) => r.key)).toEqual([
+      "wiki-1",
+      "wiki-2",
+      "wiki-3",
+      "wiki-4",
+      "wiki-15",
+      "wiki-14",
+      "wiki-13",
+    ]);
+  });
+
+  it("coalesces a refresh issued while a tick is in flight (does not drop it, never dispatches concurrently)", async () => {
+    let releaseAggregate!: () => void;
+    mockGetActivityJobs.mockImplementation(
       () =>
         new Promise((resolve) => {
-          releaseReindex = () => resolve({ jobs: [] });
+          releaseAggregate = () => resolve(activityResponse());
         })
     );
 
-    const { result } = renderHook(() => useActivityJobs());
+    const { result } = renderHook(() => useActivityJobs({ intervalMs: 8000 }));
 
-    // First tick starts; the reindex adapter's fetch is parked in flight.
-    await waitFor(() => expect(mockListReindexJobs).toHaveBeenCalledTimes(1), {
+    // First tick starts; the aggregate fetch is parked in flight.
+    await waitFor(() => expect(mockGetActivityJobs).toHaveBeenCalledTimes(1), {
       timeout: 8_000,
     });
 
-    // refresh() during the in-flight tick must be coalesced, not dropped:
-    // when the parked fetch settles, the chain runs one more full pass.
+    // refresh() during the in-flight tick must be coalesced, not dropped AND
+    // not dispatched concurrently: the count stays at one until the parked
+    // fetch settles, then the chain runs exactly one more pass.
     act(() => {
       result.current.refresh();
     });
+    expect(mockGetActivityJobs).toHaveBeenCalledTimes(1);
     act(() => {
-      releaseReindex();
+      releaseAggregate();
     });
-    await waitFor(() => expect(mockListReindexJobs).toHaveBeenCalledTimes(2), {
+    await waitFor(() => expect(mockGetActivityJobs).toHaveBeenCalledTimes(2), {
       timeout: 8_000,
     });
+    // The coalesced pass is exactly one extra dispatch — no third call (the
+    // next scheduled tick is intervalMs away).
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(mockGetActivityJobs).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps other families alive when the reindex and ingest adapters reject", async () => {
-    // PRR-014 residual legs: per-adapter rejection tolerance for the two
-    // "@/lib/api/core" consumers (reindex = admin-gated; ingest = network).
-    mockListReindexJobs.mockRejectedValue(new Error("403 admin only"));
-    mockListDocuments.mockRejectedValue(new Error("network down"));
-    mockVaultState.mockReturnValue({
-      vaults: [{ id: 1 }],
-      loading: false,
-      fetchVaults: vi.fn().mockResolvedValue(undefined),
+  it("keeps the last snapshot when the aggregate call rejects (no row clearing; chain stays alive)", async () => {
+    vi.useFakeTimers();
+    // First tick lands a live wiki row; every later aggregate call rejects
+    // (403-shaped, network-shaped — the lane does not care: no per-family
+    // degradation and no client-side backoff exist any more).
+    mockGetActivityJobs
+      .mockResolvedValueOnce(
+        activityResponse(
+          [activityJob({ family: "wiki", id: 31, vault_id: 1, status: "running", title: "Wiki compile" })],
+          "t1",
+          true
+        )
+      )
+      .mockRejectedValue(Object.assign(new Error("503 upstream"), { status: 503 }));
+
+    const { result } = renderHook(() => useActivityJobs({ intervalMs: 1000 }));
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
     });
-    const wikiMock = vi.mocked(listWikiJobs);
-    wikiMock.mockResolvedValue({ jobs: [wikiJob(31, "running")] });
+    expect(result.current.rows.map((r) => r.key)).toEqual(["wiki-31"]);
 
-    const { result } = renderHook(() => useActivityJobs());
-
-    await waitFor(
-      () => {
-        expect(result.current.rows.map((r) => r.family)).toEqual(["wiki"]);
-      },
-      { timeout: 8_000 }
-    );
-    expect(result.current.rows[0]?.key).toBe("wiki-31");
-    expect(mockListDocuments).toHaveBeenCalled();
+    // Two more ticks dispatch and reject: rows keep the last good snapshot
+    // instead of clearing, and the chain never stops.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2100);
+    });
+    expect(mockGetActivityJobs.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(result.current.rows.map((r) => r.key)).toEqual(["wiki-31"]);
+    expect(result.current.loading).toBe(false);
   });
 
   it("floors caller-supplied intervals at 1s (no setTimeout(0) hot loop)", async () => {
@@ -473,14 +403,14 @@ describe("useActivityJobs adapters (issue #784)", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    const callsAfterFirstTick = mockListReindexJobs.mock.calls.length;
+    const callsAfterFirstTick = mockGetActivityJobs.mock.calls.length;
     expect(callsAfterFirstTick).toBeGreaterThanOrEqual(1);
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000);
     });
     // 3s at a floored 1s cadence = up to 3 more ticks — NOT the hundreds a
     // setTimeout(fn, 0) hot loop would produce.
-    expect(mockListReindexJobs.mock.calls.length).toBeLessThanOrEqual(
+    expect(mockGetActivityJobs.mock.calls.length).toBeLessThanOrEqual(
       callsAfterFirstTick + 4
     );
     expect(result.current.rows).toEqual([]);
@@ -494,7 +424,7 @@ describe("useActivityJobs adapters (issue #784)", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    const callsAtUnmount = mockListReindexJobs.mock.calls.length;
+    const callsAtUnmount = mockGetActivityJobs.mock.calls.length;
     expect(callsAtUnmount).toBeGreaterThanOrEqual(1);
     unmount();
     // A real (floored) interval would fire within a second if the chain
@@ -502,6 +432,6 @@ describe("useActivityJobs adapters (issue #784)", () => {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 1200));
     });
-    expect(mockListReindexJobs.mock.calls.length).toBe(callsAtUnmount);
+    expect(mockGetActivityJobs.mock.calls.length).toBe(callsAtUnmount);
   });
 });
