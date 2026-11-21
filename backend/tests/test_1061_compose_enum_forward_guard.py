@@ -21,9 +21,13 @@ Dispositions (census, recorded in-file):
   never injects an empty default for them because the bare form forwards only
   what the operator's environment provides).
 - #750-owned consumer-level defects (JWT_ALGORITHM, ADMIN_RATE_LIMIT,
-  VECTOR_METRIC, IMAP_MAILBOX): they PASS construction (verified) and are
-  therefore allowed by this guard — their downstream consumer breakage is
-  tracked by issue #750, NOT certified safe here.
+  VECTOR_METRIC, IMAP_MAILBOX): they PASS construction (verified) and were
+  therefore allowed by this guard — their downstream consumer breakage was
+  tracked by issue #750, NOT certified safe here. FIXED in #750: all four
+  moved to the short pass-through form and left this census; the
+  consumer-level half is now guarded by
+  backend/tests/test_i03_compose_contracts.py
+  (test_validated_str_keys_not_forwarded_with_empty_default).
 - MULTIMODAL_MODEL: empty is a documented meaningful value (not #750-owned).
 
 Build/sidecar variables (HF_TOKEN, VITE_API_URL, and friends) never appear in
@@ -102,8 +106,11 @@ class TestComposeEmptyForwardStartupTolerance:
         """The census itself must stay populated (guards against parser rot).
 
         RED-at-base context: 28 entries at base; DOCUMENT_PARSING_STRATEGY
-        leaves the census (short form) after the fix, so 27 remain. A floor of
-        20 keeps the guard meaningful without pinning exact churn.
+        leaves the census (short form) after the fix, so 27 remain, and
+        #750's fix moves four more validated str keys to the short form
+        (JWT_ALGORITHM, ADMIN_RATE_LIMIT, VECTOR_METRIC, IMAP_MAILBOX),
+        leaving 23. A floor of 20 keeps the guard meaningful without
+        pinning exact churn.
         """
         census = backend_empty_default_forwards()
         assert len(census) >= 20, (
@@ -146,8 +153,10 @@ class TestComposeEmptyForwardStartupTolerance:
         """Injecting the key as "" must NOT break Settings construction.
 
         RED at base for DOCUMENT_PARSING_STRATEGY (enum validator rejects "");
-        stays GREEN for every #750-owned consumer-level key because those pass
-        construction by design.
+        the four #750-owned consumer-level keys have since moved to the
+        short form and left the census (#750) — the parametrize below now
+        covers only keys where "" is a tolerated (not necessarily safe)
+        construction value.
         """
         env = {
             "ADMIN_SECRET_TOKEN": "a" * 40,
