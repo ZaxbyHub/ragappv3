@@ -35,7 +35,6 @@ _SINGLE_ADMIN_TOKEN = "t1025sa-admin-secret-" + "x" * 48
 
 class _ShareHarness:
     """Full-app harness (d07 pattern): own temp DB, get_db override, csrf
-    override, users.get_pool patch, settings save and restore. Single-admin
     mode only — get_current_active_user is NOT overridden so the real
     admin-token path mints the id-0 sentinel principal."""
 
@@ -64,11 +63,7 @@ class _ShareHarness:
         app.dependency_overrides[get_db] = override_get_db
         app.dependency_overrides[csrf_protect] = lambda: "t1025sa-csrf"
 
-        from app.api.routes import users as users_module
 
-        self._users_module = users_module
-        self._orig_get_pool = users_module.get_pool
-        users_module.get_pool = lambda path: self.pool
 
         from app.config import settings
 
@@ -137,7 +132,6 @@ class _ShareHarness:
         app.dependency_overrides.pop(get_db, None)
         app.dependency_overrides.pop(get_current_active_user, None)
         app.dependency_overrides.pop(csrf_protect, None)
-        self._users_module.get_pool = self._orig_get_pool
         for key, value in self._saved.items():
             setattr(self._settings, key, value)
         self.client.close()

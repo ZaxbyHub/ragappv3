@@ -8652,8 +8652,11 @@ def lookup_service_account(conn, key_hash: str):
     # Issue #724 review (F-4): under a degraded boot (migrations_ok=False)
     # the rotation-grace columns may not exist; fall back to the pre-grace
     # 4-column shape (treated as no grace) instead of OperationalError-500ing
-    # every service-account authentication, mirroring the
-    # _fetch_user_row_with_pwc no-such-column convention.
+    # every service-account authentication. (Historically this mirrored the
+    # _fetch_user_row_with_pwc no-such-column convention; #798 AC3 removed
+    # that convention on the password path, so the two degraded-boot
+    # philosophies now deliberately differ — service accounts fail soft
+    # here, password users fail fast in deps.py.)
     try:
         row = conn.execute(
             "SELECT id, name, scopes, revoked_at, key_hash, previous_key_hash, "

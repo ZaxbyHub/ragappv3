@@ -155,12 +155,6 @@ class TestAdminResetUnlocksAccount:
             finally:
                 test_pool.release_connection(conn)
 
-        # Patch get_pool in users module to return our test pool
-        from app.api.routes import users
-
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         # Mutating user endpoints require csrf_protect — override to pass-through
@@ -170,7 +164,6 @@ class TestAdminResetUnlocksAccount:
 
         # Store for cleanup
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
 
@@ -189,8 +182,6 @@ class TestAdminResetUnlocksAccount:
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
 
-        # Restore original get_pool
-        users.get_pool = self.original_get_pool
 
         # Clean up temp directory
         try:

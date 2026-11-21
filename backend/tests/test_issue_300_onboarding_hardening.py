@@ -41,6 +41,7 @@ os.environ["JWT_SECRET_KEY"] = (
 )
 os.environ["USERS_ENABLED"] = "true"
 
+from app.api import deps as deps_mod
 from app.api.routes.auth import router as auth_router
 from app.api.routes.organizations import router as organizations_router
 from app.api.routes.users import router as users_router
@@ -212,16 +213,10 @@ class TestCreateUserForcesPasswordRotation:
 
     def test_created_user_has_must_change_password(self, db_path):
         """Admin-created user has must_change_password=1 in DB after creation."""
-        from app.api.routes import users
-
-        orig_get_pool = users.get_pool
-        from app.models.database import get_pool
-
-        # get_pool will naturally route via settings.sqlite_path to our test DB
-        # (thanks to monkeypatch in fixture). But create_user imports its own
-        # reference to get_pool, so we still need to ensure it's the same.
-        # Since the fixture monkeypatches settings.data_dir, all get_pool calls
-        # in any module will resolve to the test DB file.
+        # create_user takes its connection from the request-scoped
+        # Depends(get_db) dependency (#798 AC4), which resolves get_pool
+        # through deps; the fixture's monkeypatched settings.data_dir makes
+        # every such call resolve to the test DB file.
 
         app = _build_app(users_router)
 

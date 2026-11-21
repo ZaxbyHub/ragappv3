@@ -16,7 +16,8 @@ Interleavings, per the approved plan (rev 6):
 - Cancellation at the await while the worker is blocked mid-transaction,
   then released to fail inside the transaction: rows survive -> restore;
   CancelledError propagates; the connection is not released before the
-  worker settles.
+  worker settles (release modeled by the test's request-scope finally,
+  mirroring the Depends(get_db) teardown in production).
 - Cancellation at the await, worker completes the commit afterwards:
   tombstones stay discarded (startup reconcile owns them).
 - Cleanup failures (rollback raises inside the backstop; restore_purge
@@ -45,6 +46,7 @@ import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
+from app.api import deps as deps_mod
 from app.api.routes import users as users_mod
 from app.api.routes.users import delete_user
 from app.config import settings
@@ -236,8 +238,8 @@ class _OutcomesEnv:
         assert self.storage.exists(self.input_relpath)
         self.conn = _ScriptedConn(self.real_pool.get_connection(), **conn_kwargs)
         self.facade = _ReleaseTrackingPool(self.real_pool, self.conn)
-        self._saved_get_pool = users_mod.get_pool
-        users_mod.get_pool = lambda _path: self.facade
+        self._saved_get_pool = deps_mod.get_pool
+        deps_mod.get_pool = lambda _path: self.facade
         self._saved_data_dir = settings.data_dir
         settings.data_dir = tmp_path
 
@@ -253,7 +255,7 @@ class _OutcomesEnv:
         return self.storage.exists(self.input_relpath)
 
     def close(self) -> None:
-        users_mod.get_pool = self._saved_get_pool
+        deps_mod.get_pool = self._saved_get_pool
         settings.data_dir = self._saved_data_dir
         self.real_pool.close_all()
         _pool_cache.clear()
@@ -264,7 +266,7 @@ def test_value_error_after_delete_restores_purge(tmp_path: Path) -> None:
     env = _OutcomesEnv(tmp_path, raise_after_user_delete=ValueError)
     try:
         with pytest.raises(ValueError):
-            asyncio.run(delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t"))
+            asyncio.run(delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t", db=env.conn))
         assert env.rows_survive(), "rollback must keep the user row"
         assert env.input_live(), "the backstop must restore the tombstoned bytes"
     finally:
@@ -291,7 +293,7 @@ def test_queued_cancel_before_entry_restores_without_waiting(
 
         async def scenario() -> None:
             task = asyncio.create_task(
-                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t")
+                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t", db=env.conn)
             )
             await asyncio.sleep(0.05)  # route submits its item behind the blocker
             task.cancel()
@@ -320,14 +322,19 @@ def test_cancel_at_await_waits_for_worker_then_restores(tmp_path: Path) -> None:
 
         async def drive() -> None:
             task = asyncio.create_task(
-                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t")
+                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t", db=env.conn)
             )
-            while not env.conn.after_delete_ran.is_set():
-                await asyncio.sleep(0.01)
-            await asyncio.sleep(0.05)  # backstop parks on the settle-wait
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            try:
+                while not env.conn.after_delete_ran.is_set():
+                    await asyncio.sleep(0.01)
+                await asyncio.sleep(0.05)  # backstop parks on the settle-wait
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                # Request-scoped release (the Depends(get_db) finally in
+                # production): after the coroutine settles, on any outcome.
+                env.facade.release_connection(env.conn)
 
         async def runner() -> None:
             task = asyncio.create_task(drive())
@@ -357,7 +364,7 @@ def test_cancel_at_await_worker_commits_keeps_tombstones(tmp_path: Path) -> None
 
         async def drive() -> None:
             task = asyncio.create_task(
-                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t")
+                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t", db=env.conn)
             )
             while not env.conn.after_delete_ran.is_set():
                 await asyncio.sleep(0.01)
@@ -395,7 +402,7 @@ def test_restore_failure_logs_and_original_exception_wins(tmp_path: Path) -> Non
             ),
             pytest.raises(ValueError),
         ):
-            asyncio.run(delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t"))
+            asyncio.run(delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t", db=env.conn))
     finally:
         env.close()
 
@@ -413,7 +420,7 @@ def test_rollback_failure_does_not_replace_primary_exception(
     )
     try:
         with pytest.raises(KeyboardInterrupt):
-            asyncio.run(delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t"))
+            asyncio.run(delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t", db=env.conn))
         assert env.rows_survive()
         assert env.input_live(), "restore still runs after a failed rollback"
     finally:
@@ -459,7 +466,7 @@ def test_executor_submit_failure_restores_purge(tmp_path: Path, monkeypatch: pyt
         # (the reverted shape) the RuntimeError propagates instead — either
         # way the tombstones must be restored, which is the discriminator.
         with pytest.raises((HTTPException, RuntimeError)):
-            asyncio.run(delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t"))
+            asyncio.run(delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t", db=env.conn))
         assert env.rows_survive(), "the delete did not commit"
         assert env.input_live(), "a submit failure must still restore the tombstones"
     finally:
@@ -472,9 +479,12 @@ def test_second_cancel_during_settle_wait_is_drained_not_abandoning(tmp_path: Pa
     SECOND cancellation delivered while the backstop waits for the detached
     worker no longer aborts the wait — the settle-wait is DRAINED, so
     settlement is observed, the (non-committed) restore runs, and only then
-    does the original CancelledError propagate. Containment still holds: the
-    worker reaches its terminal outcome, the connection is released exactly
-    once, and only AFTER settlement."""
+    does the original CancelledError propagate. Containment still holds:
+    the worker reaches its terminal outcome, and the connection is
+    released exactly once, only AFTER settlement (release modeled by the
+    test's own request-scope finally, mirroring the Depends(get_db)
+    teardown in production — the assertions still catch an early or
+    double release by the route)."""
     release = threading.Event()
     env = _OutcomesEnv(
         tmp_path,
@@ -494,7 +504,7 @@ def test_second_cancel_during_settle_wait_is_drained_not_abandoning(tmp_path: Pa
 
         async def drive() -> None:
             task = asyncio.create_task(
-                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t")
+                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t", db=env.conn)
             )
             while not env.conn.after_delete_ran.is_set():
                 await asyncio.sleep(0.01)
@@ -511,8 +521,13 @@ def test_second_cancel_during_settle_wait_is_drained_not_abandoning(tmp_path: Pa
             # observes settlement, the restore runs, and the route's
             # original cancellation propagates only afterwards.
             release.set()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                # Request-scoped release (the Depends(get_db) finally in
+                # production): after the coroutine settles, on any outcome.
+                env.facade.release_connection(env.conn)
 
         asyncio.run(drive())
         assert hook_done_at_second_cancel == [False], (

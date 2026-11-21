@@ -203,15 +203,7 @@ class TestUserGroupMembershipSetup:
             finally:
                 test_pool.release_connection(conn)
 
-        # Patch get_pool in users module to return our test pool
-        from app.api.routes import users
-
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
-        # Also patch deps.get_pool for evaluate_policy
         from app.api import deps
-
         original_deps_pool = deps.get_pool
         deps.get_pool = lambda path: test_pool
 
@@ -219,7 +211,6 @@ class TestUserGroupMembershipSetup:
 
         # Store for cleanup
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
         self.original_deps_pool = original_deps_pool
 
         self.client = TestClient(app)
@@ -237,8 +228,6 @@ class TestUserGroupMembershipSetup:
         from app.config import settings as _app_settings
         _app_settings.users_enabled = self._prev_users_enabled
 
-        # Restore original get_pool
-        users.get_pool = self.original_get_pool
         deps.get_pool = self.original_deps_pool
         self.test_pool.close_all()
 
@@ -638,7 +627,6 @@ class TestVaultGroupMembershipSetup:
             finally:
                 test_pool.release_connection(conn)
 
-        # Patch get_pool in deps module
         from app.api import deps
 
         original_deps_pool = deps.get_pool
@@ -665,7 +653,6 @@ class TestVaultGroupMembershipSetup:
         from app.config import settings as _app_settings
         _app_settings.users_enabled = self._prev_users_enabled
 
-        # Restore original get_pool
         deps.get_pool = self.original_deps_pool
         self.test_pool.close_all()
 

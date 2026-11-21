@@ -62,7 +62,8 @@ class _FailingExecuteProxy:
 
 class _D07Harness:
     """Full-app harness (phase2-probe pattern): own temp DB, get_db override,
-    csrf override, users.get_pool patch, settings save and restore."""
+    settings save and restore.
+    """
 
     def __init__(self, users_enabled: bool):
         self.temp_dir = tempfile.mkdtemp(prefix="d07_")
@@ -105,11 +106,7 @@ class _D07Harness:
         app.dependency_overrides[get_db] = override_get_db
         app.dependency_overrides[csrf_protect] = lambda: "d07-csrf"
 
-        from app.api.routes import users as users_module
 
-        self._users_module = users_module
-        self._orig_get_pool = users_module.get_pool
-        users_module.get_pool = lambda path: self.pool
 
         from app.config import settings
 
@@ -175,7 +172,6 @@ class _D07Harness:
         app.dependency_overrides.pop(get_current_active_user, None)
         app.dependency_overrides.pop(csrf_protect, None)
         app.dependency_overrides.pop(get_vector_store, None)
-        self._users_module.get_pool = self._orig_get_pool
         for key, value in self._saved.items():
             setattr(self._settings, key, value)
         self.client.close()

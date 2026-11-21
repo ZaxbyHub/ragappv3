@@ -33,10 +33,9 @@ from app.security import csrf_protect
 
 
 class _AdoptionHarness:
-    """Full-app harness (d07 pattern): own temp DB, get_db override, csrf
-    override, users.get_pool patch, settings save and restore. Multi-user
-    mode with a MUTABLE acting-user dict so each test can act as a different
-    principal."""
+    """Full-app harness (d07 pattern): own temp DB, get_db override, settings
+    save and restore, and a MUTABLE acting-user dict so each test can act as
+    a different principal."""
 
     def __init__(self):
         self.temp_dir = tempfile.mkdtemp(prefix="t1003_")
@@ -63,11 +62,7 @@ class _AdoptionHarness:
         app.dependency_overrides[get_db] = override_get_db
         app.dependency_overrides[csrf_protect] = lambda: "t1003-csrf"
 
-        from app.api.routes import users as users_module
 
-        self._users_module = users_module
-        self._orig_get_pool = users_module.get_pool
-        users_module.get_pool = lambda path: self.pool
 
         from app.config import settings
 
@@ -144,7 +139,6 @@ class _AdoptionHarness:
         app.dependency_overrides.pop(get_db, None)
         app.dependency_overrides.pop(get_current_active_user, None)
         app.dependency_overrides.pop(csrf_protect, None)
-        self._users_module.get_pool = self._orig_get_pool
         for key, value in self._saved.items():
             setattr(self._settings, key, value)
         self.client.close()

@@ -20,7 +20,7 @@ from app.api.deps import (
 )
 from app.api.routes.auth import async_hash_password
 from app.config import settings
-from app.models.database import get_pool, transaction_context
+from app.models.database import transaction_context
 from app.security import csrf_protect
 from app.services.auth_service import password_strength_check
 from app.services.authz_policy import (
@@ -199,6 +199,7 @@ class UserGroupResponse(BaseModel):
 async def create_user(
     request: Request,
     body: CreateUserRequest,
+    db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_admin_role),
     _csrf_token: str = Depends(csrf_protect),
 ):
@@ -219,8 +220,7 @@ async def create_user(
     # Hash the password
     hashed_password = await async_hash_password(body.password)
 
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
 
     try:
         # Check username uniqueness (case-insensitive)
@@ -282,7 +282,8 @@ async def create_user(
             detail="An internal error occurred. Please try again later.",
         ) from exc
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.get("", include_in_schema=False)
@@ -293,11 +294,11 @@ async def list_users(
         100, ge=1, le=1000, description="Rows to return (1-1000; matches the vault-list cap)"
     ),
     q: str | None = None,
+    db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_role("admin")),
 ):
     """List all users (admin/superadmin only). Optional ?q= search filter."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
 
     try:
         if q:
@@ -330,17 +331,18 @@ async def list_users(
 
         return {"users": users, "total": total}
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.get("/{user_id}")
 async def get_user(
     user_id: int,
+    db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_role("admin")),
 ):
     """Get user details (admin/superadmin only)."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
 
     try:
         cursor = await asyncio.to_thread(conn.execute, "SELECT id, username, full_name, role, is_active, created_at FROM users WHERE id = ?", (user_id,))
@@ -358,7 +360,8 @@ async def get_user(
             "created_at": row[5],
         }
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.patch("/{user_id}")
@@ -617,6 +620,7 @@ async def update_user_role(
     user_id: int,
     request: Request,
     body: UpdateRoleRequest,
+    db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_role("superadmin")),
     _csrf_token: str = Depends(csrf_protect),
 ):
@@ -627,8 +631,7 @@ async def update_user_role(
     # the work here.
     assert_can_assign_role(user.get("role"), None, body.role)
 
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
 
     try:
         cursor = await asyncio.to_thread(conn.execute, "SELECT role FROM users WHERE id = ?", (user_id,))
@@ -672,7 +675,8 @@ async def update_user_role(
             "role": body.role,
         }
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.patch("/{user_id}/active")
@@ -680,6 +684,7 @@ async def update_user_active(
     user_id: int,
     request: Request,
     body: UpdateActiveRequest,
+    db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_role("admin")),
     _csrf_token: str = Depends(csrf_protect),
 ):
@@ -689,8 +694,7 @@ async def update_user_active(
     prevents operational lockout. Self-deactivation is prevented by an explicit guard
     before the database operation.
     """
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
 
     try:
         # Cannot deactivate your own account
@@ -767,7 +771,8 @@ async def update_user_active(
             "is_active": body.is_active,
         }
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 def _covered_vault_ids(conn: sqlite3.Connection, vault_ids) -> set:
@@ -873,13 +878,13 @@ def _refuse_user_delete_orphaning_vaults(orphaned_vaults: List[int]) -> None:
 async def delete_user(
     user_id: int,
     request: Request,
+    db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_role("superadmin")),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Delete user (superadmin only). Cannot delete last superadmin or self.
     Refuses 400 naming vaults where the user is the last effective admin."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
 
     try:
         cursor = await asyncio.to_thread(conn.execute, "SELECT role, username FROM users WHERE id = ?", (user_id,))
@@ -1301,17 +1306,18 @@ async def delete_user(
 
         return {"message": "User deleted", "user_id": user_id}
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.get("/{user_id}/organizations")
 async def get_user_organizations(
     user_id: int,
+    db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_role("admin")),
 ):
     """Get all organizations a user belongs to (admin/superadmin only)."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         cursor = await asyncio.to_thread(conn.execute, "SELECT id FROM users WHERE id = ?", (user_id,))
         if not await asyncio.to_thread(cursor.fetchone):
@@ -1347,7 +1353,8 @@ async def get_user_organizations(
             })
         return {"organizations": orgs}
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.put("/{user_id}/organizations")
@@ -1355,6 +1362,7 @@ async def update_user_organizations(
     user_id: int,
     request: Request,
     body: UserOrgsUpdateRequest,
+    db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_role("admin")),
     _csrf_token: str = Depends(csrf_protect),
 ):
@@ -1377,8 +1385,7 @@ async def update_user_organizations(
             ),
         )
 
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
 
     def _update_orgs():
         # Verify user exists
@@ -1594,17 +1601,18 @@ async def update_user_organizations(
         await drained_unit(_unit())
         return result
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.get("/{user_id}/groups")
 async def get_user_groups(
     user_id: int,
+    db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_role("admin")),
 ):
     """Get all groups a user is a member of (admin/superadmin only)."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
 
     try:
         # Verify user exists
@@ -1648,7 +1656,8 @@ async def get_user_groups(
 
         return {"groups": groups}
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.put("/{user_id}/groups")
@@ -1656,6 +1665,7 @@ async def update_user_groups(
     user_id: int,
     request: Request,
     body: UserGroupsUpdateRequest,
+    db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_role("admin")),
     _csrf_token: str = Depends(csrf_protect),
 ):
@@ -1663,8 +1673,7 @@ async def update_user_groups(
 
     Validates that all groups exist and that the user is a member of each group's organization.
     """
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
 
     def _update_groups():
         # Verify user exists
@@ -1888,4 +1897,5 @@ async def update_user_groups(
         await drained_unit(_unit())
         return {"groups": groups}
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)

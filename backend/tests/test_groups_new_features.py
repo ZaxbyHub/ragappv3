@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS users (
     must_change_password INTEGER NOT NULL DEFAULT 0,
     failed_attempts INTEGER NOT NULL DEFAULT 0,
     locked_until TIMESTAMP,
-    org_id INTEGER
+    org_id INTEGER,
+    password_changed_at REAL NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS organizations (
