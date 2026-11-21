@@ -6,9 +6,9 @@
 # checks (c9/c28) that exercise the real vector store.
 # Upper bounds mirror requirements.txt so CI resolves the same versions
 # (issue #404 / #391).
-fastapi>=0.162.4,<1.0
+fastapi>=0.163.2,<1.0
 uvicorn[standard]>=0.54.0,<1.0
-python-multipart>=0.0.33,<1.0
+python-multipart>=0.0.34,<1.0
 httpx>=0.26.0,<1.0
 pydantic>=2.14.3,<3.0
 pydantic-settings>=2.16.2,<3.0
