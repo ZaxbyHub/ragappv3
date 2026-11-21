@@ -491,3 +491,76 @@ class TestThreadOffloadWiring:
             "the SQLite snapshot collection ran on the event-loop thread "
             "(sync revert of the to_thread offload)"
         )
+
+
+class TestTerminalSettleRace:
+    """Stage B reviewer round (F-002): the live and terminal reads are
+    separate snapshots — a live row that SETTLES between them appears in
+    both, and filtering it after a LIMIT-remaining read would leave the
+    terminal remainder underfilled. The proxy connection flips the live row
+    to completed right before the WIKI terminal query executes, reproducing
+    the inter-read settle; the fix (over-fetch by |live|, filter, slice)
+    must still fill exactly `remaining` distinct terminal rows."""
+
+    def test_settling_live_row_does_not_underfill_remainder(self, route_env):
+        import json
+
+        import app.api.routes.activity as activity_module
+
+        for _ in range(9):
+            route_env.seed_queue_job("wiki", VAULT_A, status="completed")
+        live_id = route_env.seed_queue_job("wiki", VAULT_A, status="running")
+
+        class _SettleProxy:
+            """Flips the live row to completed just before the WIKI terminal
+            query executes (the inter-read settle)."""
+
+            def __init__(self, conn, live_id):
+                self._conn = conn
+                self._live_id = live_id
+                self.flips = 0
+
+            def execute(self, sql, params=()):
+                if (
+                    self.flips == 0
+                    and "queue = 'wiki'" in sql
+                    and "'completed'" in sql
+                ):
+                    self._conn.execute(
+                        "UPDATE jobs SET status = 'completed' WHERE id = ?",
+                        (self._live_id,),
+                    )
+                    self._conn.commit()
+                    self.flips += 1
+                return self._conn.execute(sql, params)
+
+            def commit(self):
+                return self._conn.commit()
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        conn = route_env.pool.get_connection()
+        try:
+            proxy = _SettleProxy(conn, live_id)
+            rows, _windows = activity_module._collect_snapshot(
+                db=proxy,
+                vault_json=json.dumps([VAULT_A]),
+                is_admin=False,
+                caller_id=MEMBER_ID,
+                limit=5,
+            )
+        finally:
+            route_env.pool.release_connection(conn)
+
+        wiki_rows = [r for r in rows if r.family == "wiki"]
+        # Live row (read as running, id 10) + exactly `remaining`=4 distinct
+        # terminal rows — the vacated slot refilled from older history
+        # (ids 9,8,7,6; the mutant's LIMIT-4 read misses id 6).
+        assert len(wiki_rows) == 5, (
+            f"family window must hold exactly limit=5 rows, got {len(wiki_rows)}"
+        )
+        wiki_ids = {r.id for r in wiki_rows}
+        assert wiki_ids == {10, 9, 8, 7, 6}, (
+            f"settled live row must not underfill the remainder: {sorted(wiki_ids)}"
+        )

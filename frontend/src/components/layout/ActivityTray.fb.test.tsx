@@ -819,6 +819,68 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
     });
   });
 
+  // Stage B reviewer round (R8 ownership): focusing a row control and then
+  // DELIBERATELY moving to another tray control (the Hide button — a
+  // connected in-tray node) must transfer focus ownership; a later poll
+  // removal of the row restores NOTHING and focus stays on Hide.
+  it("never steals focus from a deliberate in-tray move when the row later drops", async () => {
+    hookRows = [
+      makeRow({
+        family: "wiki",
+        key: "wiki-40",
+        title: "Wiki compile",
+        cancellable: true,
+        jobId: 40,
+        vaultId: 3,
+      }),
+      makeRow({ family: "kms", key: "kms-41", title: "KMS recompile" }),
+    ];
+    const { rerender } = render(
+      <QueryClientProvider
+        client={
+          new QueryClient({
+            defaultOptions: { queries: { retry: false } },
+          })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
+
+    const cancel = within(rowByFamily("wiki")).getByRole("button", {
+      name: /cancel/i,
+    });
+    act(() => cancel.focus());
+    expect(document.activeElement).toBe(cancel);
+
+    // Deliberate move WITHIN the tray: concrete relatedTarget inside the
+    // Activity section (row -> Hide). The marker stays in-tray by design,
+    // but the focused control is now Hide — not the row.
+    const hide = screen.getByRole("button", { name: /hide/i });
+    act(() => hide.focus());
+    expect(document.activeElement).toBe(hide);
+
+    // Poll tick removes the focused row; focus must STAY on Hide.
+    hookRows = [
+      makeRow({ family: "kms", key: "kms-41", title: "KMS recompile" }),
+    ];
+    rerender(
+      <QueryClientProvider
+        client={
+          new QueryClient({
+            defaultOptions: { queries: { retry: false } },
+          })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(document.activeElement).toBe(hide);
+  });
+
   it("never imports the client upload store (server-sourced constraint tripwire)", () => {
     const traySource = readFileSync(
       path.join(

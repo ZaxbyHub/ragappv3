@@ -437,12 +437,20 @@ def _collect_snapshot(
         # row that settles between them appears in BOTH results, so the id
         # filter below removes the duplicate (and keeps the change token
         # stable). Set hoisted once — r1-review CS-005 disposition.
+        # Over-fetch by the live-row count (Stage B reviewer round): a live
+        # row that settles between the two reads lands INSIDE the terminal
+        # window, and filtering it after a LIMIT-remaining read would leave
+        # the remainder underfilled. Fetching up to remaining + |live| newest
+        # terminal rows, filtering, then slicing restores the exact bound.
         live_ids = {row["id"] for row in live}
         terminal = [
             r
-            for r in run(terminal_sql, terminal_params[:-1] + (remaining,))
+            for r in run(
+                terminal_sql,
+                terminal_params[:-1] + (remaining + len(live_ids),),
+            )
             if r["id"] not in live_ids
-        ]
+        ][:remaining]
         return live + terminal
 
     # --- ingest (the documents surface is always on) --------------------------

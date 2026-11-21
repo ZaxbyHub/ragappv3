@@ -253,17 +253,17 @@ export function ActivityTray() {
     const prevKeys = prevRowKeysRef.current;
     const currentKeys = new Set(rows.map((r) => r.key));
     const focusedKey = focusedKeyRef.current;
-    // R8 (r2 critic): restore only when focus has nowhere better to be —
-    // nowhere (null), body (the node-removal case), a DETACHED node (jsdom
-    // can leave activeElement pointing at the removed row button; a real
-    // browser moves it to body), or still inside the tray. Never yank focus
-    // out of a connected element (e.g. the composer).
+    // R8 (r2 critic + Stage B round): restore only when focus has nowhere
+    // better to be — nowhere (null), body (the node-removal case), or a
+    // DETACHED node (jsdom leaves activeElement on the removed row control;
+    // a real browser moves it to body). A CONNECTED in-tray element is a
+    // deliberate move (e.g. row -> Hide) and is NEVER stolen from — the
+    // removed-row case can only present as detached/body/null.
     const active = document.activeElement;
     const focusCleared =
       active === null ||
       active === document.body ||
-      !(active instanceof Node && active.isConnected) ||
-      (active instanceof Node && sectionRef.current?.contains(active));
+      !(active instanceof Node && active.isConnected);
     if (
       focusedKey &&
       !currentKeys.has(focusedKey) &&

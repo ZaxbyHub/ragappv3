@@ -166,14 +166,15 @@ export function useJobStatus(family: JobFamily, opts: UseJobStatusOptions) {
 // ---------------------------------------------------------------------------
 // Activity tray aggregation (issue #784, [Workstream M] PR 4 of 4)
 //
-// The tray's data source: one poll loop over the five family adapters, each
-// reusing the family's existing server list client (never the client upload
-// store). Mirrors the single-job hook's discipline above: setTimeout chain,
-// never setInterval; API clients are imported (dynamic) and dereferenced
-// ONLY at poll time; a failed aggregate request retains the previous
-// snapshot for one tick instead of throwing (an authorization failure for
-// a family the caller cannot see is an ordinary "not visible to this
-// user", not an error).
+// The tray's data source: one poll loop over ONE aggregate endpoint —
+// getActivityJobs (GET /api/activity/jobs, audit 1115-1157-1158) — never
+// the per-family fan-out and never the client upload store. Mirrors the
+// single-job hook's discipline above: setTimeout chain, never setInterval;
+// API clients are imported (dynamic) and dereferenced ONLY at poll time;
+// a failed aggregate request retains the last good snapshot — there is no
+// one-tick expiry, the snapshot is replaced only by a successful fetch (an
+// authorization failure for content the caller cannot see is an ordinary
+// "not visible to this user", not an error).
 // ---------------------------------------------------------------------------
 
 /** One normalized job row the Activity tray renders, whatever the family. */
