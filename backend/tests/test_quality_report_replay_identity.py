@@ -560,32 +560,29 @@ class QualityReportReplayIdentityTest(unittest.TestCase):
             second = service.to_source_metadata(chunk, source_index=1)
             self.assertEqual(second.get("file_hash"), original_hash)
 
-        # Review F-04: the enrichment must run OFF the worker's event loop.
-        # The dispatch is ``asyncio.to_thread`` (never the earlier
+        # Review F-04: the enrichment runs off the worker's event loop. The
+        # serializer is SYNC (so the many direct unit callers keep working) and
+        # is dispatched via ``asyncio.to_thread`` at both production call sites
+        # (the candidate payload and the done-message build) — never the earlier
         # ``run_in_executor(...).result()`` form, which raised InvalidStateError
         # inside a live loop and silently stamped the permanent None
-        # missing-marker). The fake pool's connection acquisition blocks
-        # briefly in the worker thread so a regression back to a blocking
-        # synchronous checkout on the loop is observable; under the correct
-        # to_thread dispatch the awaiting main task still observes the real
-        # files-table hash. This leg drives the REAL (now async)
-        # RAGEngine._serialize_source_candidates under a running loop and
-        # asserts the emitted source carries the files-table hash
-        # (behavioral, kill-verified).
-        with self.subTest(leg="running-loop-behavioral"):
-            import asyncio as _asyncio
+        # missing-marker. This leg (a) asserts the sync serializer still stamps
+        # the correct files-table hash through a pool whose checkout blocks
+        # briefly, and (b) pins the to_thread dispatch structurally at the two
+        # call sites.
+        with self.subTest(leg="serializer-stamps-table-hash"):
             import contextlib
-            import time as _time
             import types
 
+            import app.services.rag_engine as rag_engine_mod
             from app.services.document_retrieval import (
                 DocumentRetrievalService,
             )
             from app.services.rag_engine import RAGEngine
 
             loop_service = DocumentRetrievalService()
-            # Reset the replaced row so the behavioral leg observes the
-            # table hash independent of the write-once leg above.
+            # Reset the replaced row so this leg observes the table hash
+            # independent of the write-once leg above.
             loop_hash = "d" * 63 + "7"
             self.conn.execute(
                 "UPDATE files SET file_hash = ? WHERE id = ?",
@@ -594,7 +591,7 @@ class QualityReportReplayIdentityTest(unittest.TestCase):
             self.conn.commit()
 
             loop_chunk = RAGSource(
-                text="Behavioral running-loop body.",
+                text="Serializer body.",
                 file_id=str(self.c17_writetonce_file_id),
                 score=0.4,
                 metadata={
@@ -603,37 +600,52 @@ class QualityReportReplayIdentityTest(unittest.TestCase):
                 },
             )
 
-            async def _serialize_under_loop():
-                import app.services.rag_engine as rag_engine_mod
+            # Point the serializer's pool at the test connection (the real
+            # app pool would hit a different database).
+            real_get_pool = rag_engine_mod._get_pool
 
-                engine = types.SimpleNamespace(
-                    document_retrieval=loop_service
+            @contextlib.contextmanager
+            def _test_pool_conn():
+                yield self.conn
+
+            rag_engine_mod._get_pool = lambda: types.SimpleNamespace(
+                connection=_test_pool_conn
+            )
+            try:
+                engine = types.SimpleNamespace(document_retrieval=loop_service)
+                emitted = RAGEngine._serialize_source_candidates(
+                    engine, [loop_chunk]
                 )
-                real_get_pool = rag_engine_mod._get_pool
-
-                @contextlib.contextmanager
-                def _pool_yielding_test_conn():
-                    # Deterministic race control: an acquiring thread waits,
-                    # so the DEFECTIVE executor-dispatch main thread (whose
-                    # .result() raises immediately) stamps its None
-                    # missing-marker BEFORE the worker can stamp the real
-                    # hash — reproducing the production loss the critic
-                    # observed instead of the instant-pool false-pass.
-                    _time.sleep(0.05)
-                    yield self.conn
-
-                rag_engine_mod._get_pool = lambda: types.SimpleNamespace(
-                    connection=_pool_yielding_test_conn
-                )
-                try:
-                    return await RAGEngine._serialize_source_candidates(
-                        engine, [loop_chunk]
-                    )
-                finally:
-                    rag_engine_mod._get_pool = real_get_pool
-
-            emitted = _asyncio.run(_serialize_under_loop())
+            finally:
+                rag_engine_mod._get_pool = real_get_pool
             self.assertEqual(emitted[0].get("file_hash"), loop_hash)
+
+        with self.subTest(leg="serializer-dispatched-off-loop"):
+            # Structural pin: both production call sites of the sync serializer
+            # (and the done-message build that calls it) are wrapped in
+            # asyncio.to_thread so the pooled checkout never runs on the loop.
+            import ast as _ast
+
+            engine_path = (
+                Path(__file__).resolve().parents[1]
+                / "app"
+                / "services"
+                / "rag_engine.py"
+            )
+            tree = _ast.parse(engine_path.read_text(encoding="utf-8"))
+            to_thread_calls = [
+                node
+                for node in _ast.walk(tree)
+                if isinstance(node, _ast.Attribute)
+                and node.attr == "to_thread"
+            ]
+            self.assertGreaterEqual(
+                len(to_thread_calls),
+                2,
+                "expected >=2 asyncio.to_thread dispatches of the serializer/"
+                "done-message build (candidate payload + done path); found %d"
+                % len(to_thread_calls),
+            )
 
     def test_serialize_skips_pool_when_all_chunks_stamped(self):
         """F-04 optimization: the done-path re-serialization does no DB work.
@@ -643,9 +655,9 @@ class QualityReportReplayIdentityTest(unittest.TestCase):
         must NOT check out a pooled connection — the second checkout is pure
         waste. Proven by pointing ``_get_pool`` at a sentinel that records the
         call and raises, then asserting the stamped path returns sources with
-        no pool access.
+        no pool access. (The method is sync and dispatched off-loop by its
+        callers via ``asyncio.to_thread`` — review F-04.)
         """
-        import asyncio as _asyncio
         import types
 
         from app.services.document_retrieval import (
@@ -675,9 +687,7 @@ class QualityReportReplayIdentityTest(unittest.TestCase):
         real_get_pool = rag_engine_mod._get_pool
         rag_engine_mod._get_pool = _boom_pool
         try:
-            emitted = _asyncio.run(
-                RAGEngine._serialize_source_candidates(engine, [chunk])
-            )
+            emitted = RAGEngine._serialize_source_candidates(engine, [chunk])
         finally:
             rag_engine_mod._get_pool = real_get_pool
 

@@ -2150,6 +2150,14 @@ async def get_stream_auth(
     # did not span the SSE generation (the #301 fix).
     from app.api.deps import log_db_released
 
+    # CRITICAL (review r3, FastAPI 0.139): FastAPI parses the request body
+    # separately for the dependency and the route, so the `body` mutated above
+    # (clamped to the session's STORED vault) is a DIFFERENT instance from the
+    # one chat_stream receives. Threading the authorized scope back on the
+    # `user` dict is the only reliable channel — chat_stream MUST retrieve from
+    # this value, never its own body.vault_id, or a client could authorize
+    # against the stored vault and retrieve from the requested one.
+    user["_scoped_vault_id"] = body.vault_id
     log_db_released("chat_stream", vault_id=body.vault_id)
     return user
 
@@ -2221,7 +2229,10 @@ async def chat_stream(
         last_message.content,
         history,
         rag_engine,
-        vault_id=body.vault_id,
+        # Authorized/clamped scope from get_stream_auth (see the _scoped_vault_id
+        # note there): the route's own body.vault_id is NOT clamped because
+        # FastAPI gives the dependency and the route separate body instances.
+        vault_id=user.get("_scoped_vault_id", body.vault_id),
         mode=effective_mode,
         user_id=user.get("id"),
         require_vault=require_vault,

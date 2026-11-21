@@ -353,8 +353,18 @@ class QualityIdempotencyMigrationTest(unittest.TestCase):
             " WHERE migration_name ="
             " 'migrate_add_quality_idempotency_indexes'"
         ).fetchone()[0]
+        # The newest journal row must carry the actual discarded-row counts,
+        # not just a bare success marker (review r2: count the deletion audit).
+        detail = conn.execute(
+            "SELECT detail FROM migration_journal"
+            " WHERE migration_name ="
+            " 'migrate_add_quality_idempotency_indexes'"
+            " ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()[0]
         conn.close()
         self.assertEqual(after, before + 1, "the dirty convergence must journal")
+        self.assertIn("deleted=1", detail, f"journal must record the report deletion count: {detail!r}")
+        self.assertIn("eval cases deleted=0", detail, f"journal must record the case deletion count: {detail!r}")
 
     def test_uniqueness_enforced_post_migration(self):
         db_path = self._db()
@@ -562,6 +572,7 @@ class StreamAuthClampDirectTest(unittest.TestCase):
         self.addCleanup(self.pool.close_all)
         app.state.db_pool = self.pool
         self.addCleanup(setattr, app.state, "db_pool", None)
+        self.client = TestClient(app, raise_server_exceptions=False)
 
     def _run_auth(self, body):
         from app.api.routes.chat import get_stream_auth
@@ -617,6 +628,91 @@ class StreamAuthClampDirectTest(unittest.TestCase):
         with self.assertRaises(HTTPException) as ctx:
             self._run_auth(body)
         self.assertEqual(ctx.exception.status_code, 403)
+
+    def _run_chat_stream(self, body, user):
+        """Drive chat_stream directly with the auth user dict, capturing the
+        vault_id handed to stream_chat_response. require_mode_configured is
+        patched off (model config is irrelevant to the scope-binding contract)."""
+        import asyncio
+
+        import app.api.routes.chat as chat_mod
+
+        captured = {}
+        from fastapi.responses import StreamingResponse
+
+        def _cap(*_a, **kwargs):
+            captured["vault_id"] = kwargs.get("vault_id")
+            return StreamingResponse(iter(["x"]), media_type="text/event-stream")
+
+        original = chat_mod.stream_chat_response
+        chat_mod.stream_chat_response = _cap
+        original_mode_check = chat_mod.require_mode_configured
+        chat_mod.require_mode_configured = lambda _mode: None
+        try:
+            scope = {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/chat/stream",
+                "headers": [],
+                "query_string": b"",
+            }
+            request = Request(scope)
+            request.scope["app"] = app
+            asyncio.run(
+                chat_mod.chat_stream(
+                    request,
+                    body,
+                    rag_engine=object(),
+                    user=user,
+                    _csrf_token="t",
+                    _=None,
+                )
+            )
+        finally:
+            chat_mod.stream_chat_response = original
+            chat_mod.require_mode_configured = original_mode_check
+        return captured
+
+    def test_clamped_scope_reaches_retrieval(self):
+        # Retrieval-bound proof (review r3): the clamp must not only authorize
+        # against the stored vault -- the STORED vault must be the one the
+        # retrieval path actually uses. FastAPI gives get_stream_auth and
+        # chat_stream SEPARATE body instances (verified: a dependency mutating
+        # its body is invisible to the route), so the authorized scope is
+        # threaded back on the user dict via _scoped_vault_id. This runs the
+        # REAL get_stream_auth, then feeds its user dict to the REAL
+        # chat_stream and asserts retrieval is scoped to V1, not the requested
+        # V3. Without the _scoped_vault_id propagation chat_stream would read
+        # its own unclamped body.vault_id == V3.
+        self._patch_user(MEMBER_USER)
+        body = ChatStreamRequest(
+            messages=[{"role": "user", "content": "hi"}],
+            vault_id=V3,
+            session_id=SESSION_7,
+        )
+        user = self._run_auth(body)  # get_stream_auth clamps + stamps scope
+        self.assertEqual(user["_scoped_vault_id"], V1)
+        captured = self._run_chat_stream(body, user)
+        self.assertEqual(captured.get("vault_id"), V1)
+
+    def test_no_scope_key_falls_back_to_body_vault(self):
+        # Backward-compat guard: if _scoped_vault_id is absent (an older
+        # get_stream_auth), chat_stream uses its own body.vault_id. Construct
+        # the body/user directly (no get_stream_auth clamp) so body.vault_id is
+        # the value under test.
+        body = ChatStreamRequest(
+            messages=[{"role": "user", "content": "hi"}],
+            vault_id=V2,
+            session_id=SESSION_7,
+        )
+        user = {
+            "id": MEMBER_USER["id"],
+            "role": "member",
+            "_include_global_memories": False,
+            "_can_write_memory": True,
+        }
+        captured = self._run_chat_stream(body, user)
+        self.assertEqual(captured.get("vault_id"), V2)
 
 
 if __name__ == "__main__":

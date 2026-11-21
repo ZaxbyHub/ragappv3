@@ -284,6 +284,7 @@ describe("session vault scope for follow-up sends (issue #1153 AC5)", () => {
         inputError: null,
         expandedSources: new Set(),
         activeChatId: null,
+        activeSessionVaultId: null,
         pendingTurnPersist: null,
         messageEditVersions: {},
         activeEditVersion: {},

@@ -2321,7 +2321,9 @@ class RAGEngine:
             yield {
                 "type": "evidence_candidates",
                 "version": 1,
-                "candidates": await self._serialize_source_candidates(relevant_chunks),
+                "candidates": await asyncio.to_thread(
+                    self._serialize_source_candidates, relevant_chunks
+                ),
             }
 
             # Build messages using prompt builder service.
@@ -2489,7 +2491,10 @@ class RAGEngine:
 
         # Yield done message with sources. Pass cited_labels so that
         # memories_used contains only memories the assistant actually cited.
-        done_msg = await self._build_done_message(
+        # _build_done_message (and the file-hash SELECT it runs) is sync, so it
+        # is dispatched off the event loop — review F-04.
+        done_msg = await asyncio.to_thread(
+            self._build_done_message,
             relevant_chunks,
             memories,
             score_type,
@@ -3926,7 +3931,7 @@ class RAGEngine:
             out.append(candidate)
         return out
 
-    async def _serialize_source_candidates(
+    def _serialize_source_candidates(
         self, relevant_chunks: List[RAGSource]
     ) -> List[Dict[str, Any]]:
         """Serialize chunks exactly as done.sources does: to_source_metadata
@@ -3941,15 +3946,11 @@ class RAGEngine:
         can never refresh a snapshot the first (candidates) took before a
         files-table replacement.
 
-        The enrichment is ONE batched SELECT (an IN clause over the final
-        chunk list's distinct file ids). It runs in ``asyncio.to_thread`` so it
-        never blocks the worker's event loop (issue #1153/#800 review F-04): an
-        earlier revision called the synchronous pool checkout directly from the
-        async stream generator, and under pool exhaustion ``pool.get`` waits up
-        to ~15s on the loop, stalling every concurrent request; a ``to_thread``
-        dispatch (not ``run_in_executor(...).result()``) is what keeps the loop
-        free without the InvalidStateError that the direct-future form raised
-        inside a running loop (final-critic round 1).
+        This does a synchronous pooled SELECT, so it MUST be dispatched off the
+        event loop by the caller (``asyncio.to_thread`` at both call sites —
+        issue #1153/#800 review F-04): an earlier revision ran it directly in the
+        async stream generator and under pool exhaustion ``pool.get`` waited up
+        to ~15s on the loop, stalling every concurrent request.
 
         When every chunk already carries the write-once ``_file_hash`` key
         (the done path re-serializes the same chunk objects the candidate path
@@ -3959,14 +3960,8 @@ class RAGEngine:
         if any("_file_hash" not in chunk.metadata for chunk in relevant_chunks):
             try:
                 pool = _get_pool()
-
-                def _enrich() -> None:
-                    # Entered inside the worker thread so the pooled connection
-                    # is checked out and released off the event loop (F-04).
-                    with pool.connection() as conn:
-                        attach_file_hashes(relevant_chunks, conn)
-
-                await asyncio.to_thread(_enrich)
+                with pool.connection() as conn:
+                    attach_file_hashes(relevant_chunks, conn)
             except Exception as exc:  # noqa: BLE001 — defensive
                 # Enrichment must never break serialization: unenriched chunks
                 # keep the explicit missing-marker (None) instead.
@@ -3979,7 +3974,7 @@ class RAGEngine:
             for idx, chunk in enumerate(relevant_chunks)
         ]
 
-    async def _build_done_message(
+    def _build_done_message(
         self,
         relevant_chunks: List[RAGSource],
         memories: List[Any],
@@ -4034,7 +4029,7 @@ class RAGEngine:
         # Split into primary and supporting (same split as prompt builder)
         primary_count = calculate_primary_count(len(relevant_chunks))
 
-        sources = await self._serialize_source_candidates(relevant_chunks)
+        sources = self._serialize_source_candidates(relevant_chunks)
         for idx, source_meta in enumerate(sources):
             source_meta["evidence_type"] = (
                 "primary" if idx < primary_count else "supporting"
