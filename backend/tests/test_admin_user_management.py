@@ -87,7 +87,6 @@ class TestUpdateUser:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
 
         app.dependency_overrides[deps.get_db] = override_get_db
 
@@ -332,7 +331,6 @@ class TestAdminResetPassword:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
 
         app.dependency_overrides[deps.get_db] = override_get_db
 
@@ -553,7 +551,6 @@ class TestUpdateUserActiveStatus:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
 
         app.dependency_overrides[deps.get_db] = override_get_db
 
@@ -804,7 +801,6 @@ class TestActiveStatusWithMultipleAdmins:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
 
         app.dependency_overrides[deps.get_db] = override_get_db
 

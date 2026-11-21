@@ -380,10 +380,11 @@ class _FailingCommitConnProxy:
 
 class _FailingCommitPool:
     """Wraps a real connection pool, handing out ``_FailingCommitConnProxy``
-    connections. ``users.py::delete_user`` gets its connection via
-    ``app.models.database.get_pool`` directly rather than the ``get_db``
-    FastAPI dependency, so it needs this pool-level wrapper instead of a
-    dependency override to exercise the same forced-commit-failure path."""
+    connections. ``users.py::delete_user`` takes its connection from the
+    request-scoped ``get_db`` dependency (#798 AC4), so a forced
+    commit-failure is injected by swapping the harness pool that the
+    ``get_db`` override reads (``self._connection_pool``) for this wrapper
+    for the duration of the request."""
 
     def __init__(self, real_pool) -> None:
         self._real_pool = real_pool

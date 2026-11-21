@@ -83,7 +83,6 @@ class TestUserRoutes:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
 
         app.dependency_overrides[deps.get_db] = override_get_db
 
