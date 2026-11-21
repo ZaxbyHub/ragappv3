@@ -560,20 +560,32 @@ class QualityReportReplayIdentityTest(unittest.TestCase):
             second = service.to_source_metadata(chunk, source_index=1)
             self.assertEqual(second.get("file_hash"), original_hash)
 
-        # Final-critic round-1 finding: the enrichment must actually RUN
-        # inside a running event loop. The earlier executor dispatch
-        # (run_in_executor(...).result() inside a live loop) always raised
-        # InvalidStateError, silently stamping the permanent None
-        # missing-marker in production. This leg drives the REAL
-        # RAGEngine._serialize_source_candidates — the production seam both
-        # the candidates and done serializations flow through — under a
-        # running loop and asserts the emitted source carries the
-        # files-table hash (behavioral, not structural).
+        # Final-critic round-1 finding + 4.5 delta-review round-2 finding:
+        # the enrichment must actually RUN inside a running event loop AND
+        # the leg must KILL the original defect. The earlier executor
+        # dispatch (run_in_executor(...).result() inside a live loop) always
+        # raised InvalidStateError, silently stamping the permanent None
+        # missing-marker in production; with an INSTANT fake pool the
+        # executor worker could win the write-once race and false-pass, so
+        # the fake pool's connection acquisition blocks briefly: under the
+        # defective executor dispatch the main thread's except-branch
+        # None-stamp lands first (emitted None -> RED), while the fixed
+        # synchronous call is unaffected apart from the deliberate delay.
+        # This leg drives the REAL RAGEngine._serialize_source_candidates
+        # under a running loop and asserts the emitted source carries the
+        # files-table hash (behavioral, not structural, kill-verified).
         with self.subTest(leg="running-loop-behavioral"):
             import asyncio as _asyncio
+            import contextlib
+            import time as _time
             import types
 
+            from app.services.document_retrieval import (
+                DocumentRetrievalService,
+            )
             from app.services.rag_engine import RAGEngine
+
+            loop_service = DocumentRetrievalService()
             # Reset the replaced row so the behavioral leg observes the
             # table hash independent of the write-once leg above.
             loop_hash = "d" * 63 + "7"
@@ -594,17 +606,22 @@ class QualityReportReplayIdentityTest(unittest.TestCase):
             )
 
             async def _serialize_under_loop():
-                import contextlib
-
                 import app.services.rag_engine as rag_engine_mod
 
                 engine = types.SimpleNamespace(
-                    document_retrieval=service
+                    document_retrieval=loop_service
                 )
                 real_get_pool = rag_engine_mod._get_pool
 
                 @contextlib.contextmanager
                 def _pool_yielding_test_conn():
+                    # Deterministic race control: an acquiring thread waits,
+                    # so the DEFECTIVE executor-dispatch main thread (whose
+                    # .result() raises immediately) stamps its None
+                    # missing-marker BEFORE the worker can stamp the real
+                    # hash — reproducing the production loss the critic
+                    # observed instead of the instant-pool false-pass.
+                    _time.sleep(0.05)
                     yield self.conn
 
                 rag_engine_mod._get_pool = lambda: types.SimpleNamespace(
