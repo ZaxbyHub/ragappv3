@@ -138,12 +138,17 @@ def environment_fingerprint(
     JSON-serialized model identity, ``config_hash`` from a JSON-serialized
     config snapshot, and ``corpus_hash`` from the sorted resource ids — all
     deterministic for identical inputs.
+
+    ``release_id`` is coerced to the ``"unknown"`` marker when it is None so a
+    run with no resolvable git/env id still produces a stable fingerprint
+    instead of crashing on ``None.encode`` (review r2; the persistence path
+    resolves this off the loop, this is the boundary guard).
     """
     def _digest(payload: str) -> str:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     return {
-        "code_hash": _digest(release_id),
+        "code_hash": _digest(release_id or "unknown"),
         "model_hash": _digest(
             json.dumps(model_identity, sort_keys=True, separators=(",", ":"))
         ),

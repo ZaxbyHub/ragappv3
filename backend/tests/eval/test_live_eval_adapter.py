@@ -36,6 +36,7 @@ from app.services.eval_adapter import (
     RunResult,
     _get_release_id,
 )
+from app.services.eval_compare import environment_fingerprint
 
 #: Fixed release_id injected into all score_run calls in unit tests.
 _FIXED_RELEASE_ID = "test-run-abc123"
@@ -493,6 +494,23 @@ class TestReleaseId:
 
         monkeypatch.setenv("APP_RELEASE_ID", "ci-build-99")
         assert _get_release_id() == "ci-build-99"
+
+
+class TestFingerprintReleaseIdNoneSafe(unittest.TestCase):
+    """r2: the environment fingerprint hashes its release_id, so a None
+    (unresolved git + no env override) must be coerced before hashing, not
+    passed to hashlib (which raises on None.encode)."""
+
+    def test_fingerprint_tolerates_none_release_id(self):
+        fp = environment_fingerprint(
+            release_id=None,
+            model_identity={"model": "m", "release_id": "unknown"},
+            config_snapshot={"top_k": 10},
+            resource_ids=["a", "b"],
+        )
+        # Does not raise on None; code_hash is a stable 64-char hex digest.
+        self.assertIn("code_hash", fp)
+        self.assertEqual(len(fp["code_hash"]), 64)
 
 
 class TestDuplicateIdRejection(unittest.TestCase):

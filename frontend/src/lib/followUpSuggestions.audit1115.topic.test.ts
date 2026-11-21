@@ -181,7 +181,10 @@ describe("deriveFollowUps topic source (issue #1153 AC6)", () => {
         "# Coolant interval\nThe coolant is 60,000 km for turbo engines.",
         [],
       );
-      expect(chips.join(" ")).not.toMatch(/^#/);
+      // The heading marker must not survive into the embedded topic (the chip
+      // is templated "…around <topic>?", so a leak lands mid-string, not at
+      // the start — assert on the marker itself, not a leading ^#).
+      expect(chips.join(" ")).not.toContain("#");
       expect(chips.some((c) => /coolant interval/i.test(c))).toBe(true);
     });
   });

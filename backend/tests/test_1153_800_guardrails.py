@@ -291,12 +291,12 @@ class QualityIdempotencyMigrationTest(unittest.TestCase):
             "INSERT INTO chat_messages (id, session_id, role, content, turn_id, seq)"
             " VALUES (100, 1, 'assistant', 'a', 't1', 2)"
         )
-        # Canonical (id 10) has a BLANK note; the duplicate (id 11) carries the
-        # only commentary.
+        # Canonical (id 10) has a NULL note; the duplicate (id 11) carries the
+        # only commentary. (A second leg below covers the empty-string form.)
         conn.execute(
             "INSERT INTO quality_reports (id, session_id, message_id, category,"
             " turn_id, seq, config_ref, note) VALUES (10, 1, 100, 'cat', 't1', 2,"
-            " 'r', '')"
+            " 'r', NULL)"
         )
         conn.execute(
             "INSERT INTO quality_reports (id, session_id, message_id, category,"
