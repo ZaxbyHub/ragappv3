@@ -418,16 +418,22 @@ def _merge_list_markers(fragments: List[str]) -> List[str]:
         # detached marker belongs to the NEXT fragment, not this one.
         tail_match = _TRAILING_MARKER_RE.search(piece)
         if tail_match:
-            # Append the detached tail AFTER any marker already pending so a
-            # run of list markers keeps its order ("1. 2." not "2. 1.").
-            pending_prefix = (
-                pending_prefix + " " + tail_match.group(1)
-            ).strip()
-            piece = piece[: tail_match.start()].rstrip()
-            if not piece:
-                continue
-            # The current piece keeps its sentence text WITHOUT the marker.
-            out.append(piece)
+            header = piece[: tail_match.start()].rstrip()
+            trailing = tail_match.group(1)
+            if header:
+                # Attach any markers already pending to THIS header sentence
+                # (preserving document order), then carry the dangling
+                # trailing marker to the next fragment. This keeps a leading
+                # "1." with its "Intro:" header instead of moving it past the
+                # header text (review r2: "1. Intro:" not "Intro:", "1. 2. …").
+                out.append(
+                    (pending_prefix + " " + header) if pending_prefix else header
+                )
+                pending_prefix = trailing
+            else:
+                # No header text: the dangling marker continues the pending
+                # run, keeping any earlier pending markers in order.
+                pending_prefix = (pending_prefix + " " + trailing).strip()
             continue
         if _LIST_MARKER_RE.match(piece):
             # Standalone marker: append to the pending run (preserving order)

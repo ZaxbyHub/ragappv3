@@ -65,9 +65,11 @@ const ANSWER_OPENERS = [
 
 function stripAnswerChrome(text: string): string {
   return text
-    // Citation labels: [S1] [M2] [A1] (and multi-digit).
-    .replace(/\[[SMA]\d+\]/gi, "")
-    // Inline markdown emphasis / code delimiters.
+    // Citation labels the backend emits: [S#] source, [M#] memory, [W#] wiki,
+    // [K#] KMS, [D#] document (citation_validator's allowed set), multi-digit.
+    .replace(/\[[SMWKD]\d+\]/gi, "")
+    // Markdown headings ("# Title") and inline emphasis / code delimiters.
+    .replace(/^#{1,6}\s+/gm, "")
     .replace(/(\*\*|\*|`)/g, "")
     .replace(/\s+/g, " ")
     .trim();

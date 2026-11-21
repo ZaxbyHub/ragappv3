@@ -3330,11 +3330,15 @@ def migrate_add_quality_idempotency_indexes(sqlite_path: str) -> None:
         ):
             return
         conn.execute("BEGIN IMMEDIATE")
-        # 0. Merge differing reviewer notes from duplicate reports into the
-        #    canonical (lowest-id) report of each (message_id, category)
-        #    identity, so a discarded report's note is preserved on the row
-        #    that survives. Only canonical rows with more than one distinct
-        #    non-empty note are touched (rerun-safe no-op once converged).
+        # 0. Merge reviewer notes from duplicate reports into the canonical
+        #    (lowest-id) report of each (message_id, category) identity, so a
+        #    discarded report's note is preserved on the row that survives.
+        #    The aggregate collects every DISTINCT non-empty note across the
+        #    whole identity (canonical included), so a blank/NULL canonical
+        #    note does NOT hide a duplicate's sole note — that case is exactly
+        #    what the ">1 distinct note" guard got wrong (review r2). Only
+        #    canonical rows that HAVE a duplicate are touched, so a converged
+        #    database (one report per identity) is a no-op.
         conn.execute(
             """
             UPDATE quality_reports
@@ -3352,11 +3356,9 @@ def migrate_add_quality_idempotency_indexes(sqlite_path: str) -> None:
                 SELECT MIN(id) FROM quality_reports GROUP BY message_id, category
             )
             AND (
-                SELECT COUNT(DISTINCT qr2.note)
-                FROM quality_reports qr2
-                WHERE qr2.message_id = quality_reports.message_id
-                  AND qr2.category = quality_reports.category
-                  AND TRIM(qr2.note) != ''
+                SELECT COUNT(*) FROM quality_reports qr3
+                WHERE qr3.message_id = quality_reports.message_id
+                  AND qr3.category = quality_reports.category
             ) > 1
             """
         )

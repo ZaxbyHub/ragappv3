@@ -352,6 +352,15 @@ class ListMarkerFoldOrderTest(unittest.TestCase):
             ["1. Zebras migrate."],
         )
 
+    def test_pending_marker_stays_with_its_header(self):
+        # Review r2: a pending standalone marker must attach to the NEXT
+        # fragment's header text, not be carried past it with a later marker.
+        # "1." + "Intro:\\n2." + "Claim." → ["1. Intro:", "2. Claim."].
+        self.assertEqual(
+            _merge_list_markers(["1.", "Intro:\n2.", "Claim."]),
+            ["1. Intro:", "2. Claim."],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -477,6 +477,23 @@ class TestReleaseId:
         )
         assert _get_release_id() == "ci-build-42"
 
+    def test_release_id_empty_git_output_falls_through_to_env(self, monkeypatch):
+        """A successful git with EMPTY stdout must not shadow the env override
+        (review r2): it falls through to APP_RELEASE_ID, then to None."""
+        import subprocess
+
+        class _Empty:
+            returncode = 0
+            stdout = "   \n"
+
+        monkeypatch.delenv("APP_RELEASE_ID", raising=False)
+        monkeypatch.delenv("APP_VERSION", raising=False)
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Empty())
+        assert _get_release_id() is None
+
+        monkeypatch.setenv("APP_RELEASE_ID", "ci-build-99")
+        assert _get_release_id() == "ci-build-99"
+
 
 class TestDuplicateIdRejection(unittest.TestCase):
     """EVAL-002 (issue #237): id-keyed association requires unique ids."""

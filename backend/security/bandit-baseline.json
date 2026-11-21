@@ -569,7 +569,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 7298,
+      "loc": 7296,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -829,7 +829,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 622,
+      "loc": 624,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3873,7 +3873,7 @@
       "test_name": "blacklist"
     },
     {
-      "code": "230     try:\n231         result = subprocess.run(\n232             [\"git\", \"rev-parse\", \"--short\", \"HEAD\"],\n233             capture_output=True,\n234             text=True,\n235             timeout=10,\n236             cwd=settings.data_dir.parent,  # repo root\n237         )\n238         if result.returncode == 0:\n",
+      "code": "230     try:\n231         result = subprocess.run(\n232             [\"git\", \"rev-parse\", \"--short\", \"HEAD\"],\n233             capture_output=True,\n234             text=True,\n235             timeout=10,\n236             cwd=settings.data_dir.parent,  # repo root\n237         )\n238         # A successful git with non-empty output is the release id. An empty\n",
       "col_offset": 17,
       "end_col_offset": 9,
       "filename": "backend/app/services/eval_adapter.py",
@@ -3899,7 +3899,7 @@
       "test_name": "start_process_with_partial_path"
     },
     {
-      "code": "230     try:\n231         result = subprocess.run(\n232             [\"git\", \"rev-parse\", \"--short\", \"HEAD\"],\n233             capture_output=True,\n234             text=True,\n235             timeout=10,\n236             cwd=settings.data_dir.parent,  # repo root\n237         )\n238         if result.returncode == 0:\n",
+      "code": "230     try:\n231         result = subprocess.run(\n232             [\"git\", \"rev-parse\", \"--short\", \"HEAD\"],\n233             capture_output=True,\n234             text=True,\n235             timeout=10,\n236             cwd=settings.data_dir.parent,  # repo root\n237         )\n238         # A successful git with non-empty output is the release id. An empty\n",
       "col_offset": 17,
       "end_col_offset": 9,
       "filename": "backend/app/services/eval_adapter.py",

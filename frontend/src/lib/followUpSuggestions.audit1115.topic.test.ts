@@ -166,6 +166,24 @@ describe("deriveFollowUps topic source (issue #1153 AC6)", () => {
       );
       expect(chips.some((c) => /coolant interval/i.test(c))).toBe(true);
     });
+
+    it("strips wiki and KMS citation labels, not just source/memory", () => {
+      const chips = deriveFollowUps(
+        "The coolant interval is 60,000 km [W1] for turbo engines [K2].",
+        [],
+      );
+      expect(chips.join(" ")).not.toMatch(/\[[WK]\d+\]/);
+      expect(chips.some((c) => /coolant interval/i.test(c))).toBe(true);
+    });
+
+    it("strips a markdown heading from the topic", () => {
+      const chips = deriveFollowUps(
+        "# Coolant interval\nThe coolant is 60,000 km for turbo engines.",
+        [],
+      );
+      expect(chips.join(" ")).not.toMatch(/^#/);
+      expect(chips.some((c) => /coolant interval/i.test(c))).toBe(true);
+    });
   });
 
   describe("production call site: the pane derives the topic from the assistant answer", () => {

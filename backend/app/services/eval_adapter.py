@@ -235,8 +235,11 @@ def _get_release_id() -> Optional[str]:
             timeout=10,
             cwd=settings.data_dir.parent,  # repo root
         )
-        if result.returncode == 0:
-            return result.stdout.strip() or None
+        # A successful git with non-empty output is the release id. An empty
+        # output (checked-out detached/short form produced nothing) is NOT a
+        # hit — fall through to the env overrides rather than shadowing them.
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
     except Exception as exc:
         logger.warning("Failed to get git commit hash: %s", exc)
     # Env-var fallback for containerized deployments (stable config — safe to cache).
@@ -504,8 +507,12 @@ class LiveEvalAdapter:
                 )
             )
 
-        # Compute release_id off the event loop (subprocess/git call).
-        release_id = await asyncio.to_thread(_get_release_id)
+        # Compute release_id off the event loop (subprocess/git call). A
+        # total failure (git unavailable AND no env override) yields None
+        # from _get_release_id; the persistence/fingerprint path needs a
+        # string, so fall back to the 'unknown' marker HERE (this path does
+        # not cache — issue #800 AC4 is the quality-report _config_ref only).
+        release_id = await asyncio.to_thread(_get_release_id) or "unknown"
 
         # Delegate to score_run for metric computation (injecting progress events).
         # score_run uses effective_top_k for both the nDCG/recall cutoff and the

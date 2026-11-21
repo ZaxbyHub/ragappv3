@@ -274,17 +274,87 @@ class QualityIdempotencyMigrationTest(unittest.TestCase):
         self.assertIn("second reviewer note", note)
         # The duplicate report row is gone; one canonical row remains.
         self.assertEqual(remaining, 1)
-        # F-03 observability: the convergence is journaled, not silent.
-        journal = sqlite3.connect(db_path)
-        row = journal.execute(
-            "SELECT phase, outcome FROM migration_journal"
+
+    def test_blank_canonical_note_is_filled_from_duplicate(self):
+        """F-03 r2: a duplicate's sole non-empty note survives even when the
+        canonical (kept) row's note is NULL/blank — the old '>1 distinct note'
+        guard skipped the merge and deleted it."""
+        db_path = self._db()
+        init_db(db_path)
+        run_migrations(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute("DROP INDEX IF EXISTS idx_quality_reports_message_category")
+        conn.execute("DROP INDEX IF EXISTS idx_quality_eval_cases_report_unique")
+        conn.execute("INSERT INTO vaults (id, name) VALUES (501, 'mv')")
+        conn.execute("INSERT INTO chat_sessions (id, vault_id) VALUES (1, 501)")
+        conn.execute(
+            "INSERT INTO chat_messages (id, session_id, role, content, turn_id, seq)"
+            " VALUES (100, 1, 'assistant', 'a', 't1', 2)"
+        )
+        # Canonical (id 10) has a BLANK note; the duplicate (id 11) carries the
+        # only commentary.
+        conn.execute(
+            "INSERT INTO quality_reports (id, session_id, message_id, category,"
+            " turn_id, seq, config_ref, note) VALUES (10, 1, 100, 'cat', 't1', 2,"
+            " 'r', '')"
+        )
+        conn.execute(
+            "INSERT INTO quality_reports (id, session_id, message_id, category,"
+            " turn_id, seq, config_ref, note) VALUES (11, 1, 100, 'cat', 't1', 2,"
+            " 'r', 'second reviewer note')"
+        )
+        conn.commit()
+        conn.close()
+        run_migrations(db_path)
+        conn = sqlite3.connect(db_path)
+        note = conn.execute(
+            "SELECT note FROM quality_reports WHERE id = 10"
+        ).fetchone()[0]
+        conn.close()
+        self.assertIn("second reviewer note", note)
+
+    def test_convergence_is_journaled_with_counts(self):
+        """F-03 r2: the dirty convergence records a NEW journal row (the
+        assertion must not be satisfied by the clean setUp migration)."""
+        db_path = self._db()
+        init_db(db_path)
+        run_migrations(db_path)  # clean: no duplicates to converge
+        conn = sqlite3.connect(db_path)
+        before = conn.execute(
+            "SELECT COUNT(*) FROM migration_journal"
             " WHERE migration_name ="
             " 'migrate_add_quality_idempotency_indexes'"
-        ).fetchone()
-        journal.close()
-        self.assertIsNotNone(row, "migration outcome must be journaled")
-        self.assertEqual(row[0], "succeeded")
-        self.assertEqual(row[1], "ok")
+        ).fetchone()[0]
+        conn.close()
+        # Seed a duplicate so the next run performs a real convergence.
+        conn = sqlite3.connect(db_path)
+        conn.execute("DROP INDEX IF EXISTS idx_quality_reports_message_category")
+        conn.execute("DROP INDEX IF EXISTS idx_quality_eval_cases_report_unique")
+        conn.execute("INSERT INTO vaults (id, name) VALUES (501, 'mv')")
+        conn.execute("INSERT INTO chat_sessions (id, vault_id) VALUES (1, 501)")
+        conn.execute(
+            "INSERT INTO chat_messages (id, session_id, role, content, turn_id, seq)"
+            " VALUES (100, 1, 'assistant', 'a', 't1', 2)"
+        )
+        conn.execute(
+            "INSERT INTO quality_reports (id, session_id, message_id, category,"
+            " turn_id, seq, config_ref) VALUES (10, 1, 100, 'cat', 't1', 2, 'r')"
+        )
+        conn.execute(
+            "INSERT INTO quality_reports (id, session_id, message_id, category,"
+            " turn_id, seq, config_ref) VALUES (11, 1, 100, 'cat', 't1', 2, 'r')"
+        )
+        conn.commit()
+        conn.close()
+        run_migrations(db_path)
+        conn = sqlite3.connect(db_path)
+        after = conn.execute(
+            "SELECT COUNT(*) FROM migration_journal"
+            " WHERE migration_name ="
+            " 'migrate_add_quality_idempotency_indexes'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(after, before + 1, "the dirty convergence must journal")
 
     def test_uniqueness_enforced_post_migration(self):
         db_path = self._db()
