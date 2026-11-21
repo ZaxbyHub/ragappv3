@@ -16,6 +16,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
+import { StrictMode } from "react";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -96,6 +97,14 @@ function makeRow(overrides: Partial<RowLike> = {}): RowLike {
 }
 
 let hookRows: RowLike[];
+
+function rowByTitle(title: string): HTMLElement {
+  const row = screen
+    .getAllByRole("listitem")
+    .find((li) => li.textContent?.includes(title));
+  expect(row, `no listitem row found for title ${title}`).toBeDefined();
+  return row as HTMLElement;
+}
 
 function rowByFamily(family: string): HTMLElement {
   const row = screen
@@ -236,7 +245,7 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
         vaultId: 3,
       }),
     ];
-    render(
+    const { rerender } = render(
       <QueryClientProvider
         client={
           new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -440,12 +449,17 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
       within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }),
     );
     // Resolve the click's async continuation so the button is re-enabled
-    // (mockCancelWikiJob resolves in beforeEach) and focus sits on it.
-    await waitFor(() => {
-      expect(
-        document.activeElement?.closest('[aria-label="Activity"]'),
-      ).not.toBeNull();
+    // (mockCancelWikiJob resolves in beforeEach). The in-flight disable can
+    // clear activeElement to body in jsdom, so REFOCUS explicitly — the
+    // pre-removal state must be deterministic, not timing-dependent.
+    const cancelControl = within(rowByFamily("wiki")).getByRole("button", {
+      name: /cancel/i,
     });
+    await waitFor(() => expect(cancelControl).toBeEnabled());
+    act(() => cancelControl.focus());
+    // #1158 planning-pin: show focus on the SPECIFIC row control immediately
+    // before the removal — "somewhere in the tray" is not the contract.
+    expect(document.activeElement).toBe(cancelControl);
 
     // Poll tick: the focused row vanishes (cancelled rows drop from the
     // pending/processing windows the adapters poll).
@@ -467,12 +481,47 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
       expect(document.activeElement).toBe(header);
     });
 
-    // Negative case: focus outside the tray is NOT stolen by the guard.
-    const outside = screen.getByRole("button", { name: /activity/i });
-    outside.blur();
+    // Negative case (#1158 focus machine): a ROW is focused, focus then
+    // moves DELIBERATELY to an external control (a concrete relatedTarget
+    // outside the tray), and only then does the poll remove the focused
+    // row — the guard must NOT steal focus back to the header.
+    const wikiRow = makeRow({
+      family: "wiki",
+      key: "wiki-7",
+      title: "Wiki compile",
+      cancellable: true,
+      jobId: 7,
+      vaultId: 3,
+    });
+    hookRows = [wikiRow, makeRow({ family: "kms", key: "kms-11", title: "KMS recompile" })];
+    rerender(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
+    const externalCancel =
+      within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i });
+    await user.click(externalCancel);
+    // jsdom's in-flight disable clears activeElement to body, and when the
+    // re-enable lands after user.click's act envelope nothing refocuses the
+    // re-enabled button — the same gap the positive fixture refocuses
+    // around. Make the pre-blur state explicit (deterministic, not
+    // timing-dependent).
+    await waitFor(() => expect(externalCancel).toBeEnabled());
+    act(() => externalCancel.focus());
+    await waitFor(() => {
+      expect(document.activeElement).toBe(externalCancel);
+    });
     const bodyTarget = document.createElement("button");
     document.body.appendChild(bodyTarget);
-    bodyTarget.focus();
+    // A real user event (not .focus()) so the focusout carries a concrete
+    // external relatedTarget — the deliberate-move signature.
+    await user.click(bodyTarget);
+    // Poll tick removes the previously focused row: external focus stays.
     hookRows = [];
     rerender(
       <QueryClientProvider
@@ -485,6 +534,351 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
     );
     expect(document.activeElement).toBe(bodyTarget);
     bodyTarget.remove();
+  });
+
+  // R8 (r2, execution-proven): a deadzone/body click blurs the focused row
+  // control with a NULL relatedTarget — the same signature as node removal.
+  // The tray must disambiguate (node still connected = deliberate blur), so
+  // a later poll-tick removal never yanks focus from where the user moved
+  // it (here: an outside input).
+  it("does not steal focus after a deliberate body-click blur when the focused row later drops", async () => {
+    const user = userEvent.setup();
+    hookRows = [
+      makeRow({
+        family: "wiki",
+        key: "wiki-12",
+        title: "Wiki compile",
+        cancellable: true,
+        jobId: 12,
+        vaultId: 3,
+      }),
+    ];
+    const { rerender } = render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
+
+    const cancel = within(rowByFamily("wiki")).getByRole("button", {
+      name: /cancel/i,
+    });
+    await user.click(cancel);
+    const r8Cancel = within(rowByFamily("wiki")).getByRole("button", {
+      name: /cancel/i,
+    });
+    await waitFor(() => expect(r8Cancel).toBeEnabled());
+    act(() => r8Cancel.focus());
+    expect(document.activeElement).toBe(r8Cancel);
+
+    // Deadzone-click blur: focusout with a NULL relatedTarget while the
+    // blurred node stays connected (the browser's non-focusable-click
+    // signature; jsdom does not move focus on body clicks, so the events
+    // are dispatched directly, mirroring the executed Chrome probe).
+    cancel.dispatchEvent(
+      new FocusEvent("focusout", { relatedTarget: null, bubbles: true }),
+    );
+    (cancel as HTMLButtonElement).blur();
+    // Flush the tray's disambiguation macrotask: the still-connected node
+    // marks the blur deliberate and clears the in-tray marker.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const outside = document.createElement("input");
+    document.body.appendChild(outside);
+    outside.focus();
+    expect(document.activeElement).toBe(outside);
+
+    // Poll tick removes the stale-focused row: focus must stay put.
+    hookRows = [];
+    rerender(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
+    expect(document.activeElement).toBe(outside);
+    outside.remove();
+  });
+
+  // r1-critic F-4: the guard's refs are read/written inside the effect (no
+  // render-phase writes), so a StrictMode double render cannot make
+  // prev == current and silently disable restoration.
+  it("restores focus under StrictMode when the focused row is removed", async () => {
+    const user = userEvent.setup();
+    hookRows = [
+      makeRow({
+        family: "wiki",
+        key: "wiki-13",
+        title: "Wiki compile",
+        cancellable: true,
+        jobId: 13,
+        vaultId: 3,
+      }),
+    ];
+    const { rerender } = render(
+      <StrictMode>
+        <QueryClientProvider
+          client={
+            new QueryClient({ defaultOptions: { queries: { retry: false } } })
+          }
+        >
+          <ActivityTray />
+        </QueryClientProvider>
+      </StrictMode>,
+    );
+
+    await user.click(
+      within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }),
+    );
+    const smCancel = within(rowByFamily("wiki")).getByRole("button", {
+      name: /cancel/i,
+    });
+    await waitFor(() => expect(smCancel).toBeEnabled());
+    act(() => smCancel.focus());
+    expect(document.activeElement).toBe(smCancel);
+
+    hookRows = [];
+    rerender(
+      <StrictMode>
+        <QueryClientProvider
+          client={
+            new QueryClient({ defaultOptions: { queries: { retry: false } } })
+          }
+        >
+          <ActivityTray />
+        </QueryClientProvider>
+      </StrictMode>,
+    );
+
+    const header = screen.getByRole("button", { name: /activity/i });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(header);
+    });
+  });
+
+  // R8 (Stage B): a null-blur disambiguation callback scheduled for row A
+  // must not clear the marker after row B has already received focus — a
+  // stale callback would disable B's later restoration.
+  it("keeps the in-tray marker when a newer row focuses before an older blur callback fires", async () => {
+    const user = userEvent.setup();
+    hookRows = [
+      makeRow({
+        family: "wiki",
+        key: "wiki-20",
+        title: "Wiki compile A",
+        cancellable: true,
+        jobId: 20,
+        vaultId: 3,
+      }),
+      makeRow({
+        family: "wiki",
+        key: "wiki-21",
+        title: "Wiki compile B",
+        cancellable: true,
+        jobId: 21,
+        vaultId: 3,
+      }),
+    ];
+    const { rerender } = render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
+
+    const cancelA = within(rowByTitle("Wiki compile A")).getByRole("button", {
+      name: /cancel/i,
+    });
+    await user.click(cancelA);
+    await waitFor(() => expect(cancelA).toBeEnabled());
+    act(() => cancelA.focus());
+    expect(document.activeElement).toBe(cancelA);
+
+    // Blur row A with a null relatedTarget (schedules the callback).
+    cancelA.dispatchEvent(
+      new FocusEvent("focusout", { relatedTarget: null, bubbles: true }),
+    );
+    // A SECOND null blur pends from the tray itself (header focuses then
+    // blurs with null — its focusout also bubbles through the section), so
+    // TWO callbacks are pending when B focuses. The in-tray focus must
+    // cancel BOTH (r2-reviewer multi-callback sequence).
+    const header = screen.getByRole("button", { name: /activity/i });
+    act(() => header.focus());
+    header.dispatchEvent(
+      new FocusEvent("focusout", { relatedTarget: null, bubbles: true }),
+    );
+
+    // Row B receives focus BEFORE either callback fires (cancel both).
+    const cancelB = within(rowByTitle("Wiki compile B")).getByRole("button", {
+      name: /cancel/i,
+    });
+    act(() => cancelB.focus());
+    // Flush: the stale callback must be a no-op for B's marker.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(document.activeElement).toBe(cancelB);
+
+    // Row B drops: the marker survived, so focus restores to the header.
+    hookRows = [
+      makeRow({
+        family: "wiki",
+        key: "wiki-20",
+        title: "Wiki compile",
+        cancellable: true,
+        jobId: 20,
+        vaultId: 3,
+      }),
+    ];
+    rerender(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => {
+      expect(document.activeElement).toBe(header);
+    });
+  });
+
+  // Stage B test-engineer (R8 keep-polarity): the blurred node is
+  // DISCONNECTED before the macrotask fires (the removal signature) — the
+  // callback must KEEP the marker so the removal restores focus to the
+  // header. Observable in jsdom because the node is detached explicitly
+  // between dispatch and fire (real browsers fire this focusout on removal).
+  it("keeps the marker when the blurred node is disconnected before the macrotask fires", async () => {
+    const user = userEvent.setup();
+    hookRows = [
+      makeRow({
+        family: "wiki",
+        key: "wiki-30",
+        title: "Wiki compile",
+        cancellable: true,
+        jobId: 30,
+        vaultId: 3,
+      }),
+    ];
+    const { rerender } = render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
+
+    const cancel = within(rowByFamily("wiki")).getByRole("button", {
+      name: /cancel/i,
+    });
+    await user.click(cancel);
+    await waitFor(() => expect(cancel).toBeEnabled());
+    act(() => cancel.focus());
+    expect(document.activeElement).toBe(cancel);
+
+    // Null blur schedules the callback...
+    cancel.dispatchEvent(
+      new FocusEvent("focusout", { relatedTarget: null, bubbles: true }),
+    );
+    // ...and the node is disconnected BEFORE it fires (removal signature).
+    cancel.remove();
+    // Flush the macrotask: the disconnected node must KEEP the marker
+    // (mutant polarity: an unconditional clear would disable the restore).
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    // The removal itself (rows change) triggers the restore effect.
+    hookRows = [];
+    rerender(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
+    const header = screen.getByRole("button", { name: /activity/i });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(header);
+    });
+  });
+
+  // Stage B reviewer round (R8 ownership): focusing a row control and then
+  // DELIBERATELY moving to another tray control (the Hide button — a
+  // connected in-tray node) must transfer focus ownership; a later poll
+  // removal of the row restores NOTHING and focus stays on Hide.
+  it("never steals focus from a deliberate in-tray move when the row later drops", async () => {
+    hookRows = [
+      makeRow({
+        family: "wiki",
+        key: "wiki-40",
+        title: "Wiki compile",
+        cancellable: true,
+        jobId: 40,
+        vaultId: 3,
+      }),
+      makeRow({ family: "kms", key: "kms-41", title: "KMS recompile" }),
+    ];
+    const { rerender } = render(
+      <QueryClientProvider
+        client={
+          new QueryClient({
+            defaultOptions: { queries: { retry: false } },
+          })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
+
+    const cancel = within(rowByFamily("wiki")).getByRole("button", {
+      name: /cancel/i,
+    });
+    act(() => cancel.focus());
+    expect(document.activeElement).toBe(cancel);
+
+    // Deliberate move WITHIN the tray: concrete relatedTarget inside the
+    // Activity section (row -> Hide). The marker stays in-tray by design,
+    // but the focused control is now Hide — not the row.
+    const hide = screen.getByRole("button", { name: /hide/i });
+    act(() => hide.focus());
+    expect(document.activeElement).toBe(hide);
+
+    // Poll tick removes the focused row; focus must STAY on Hide.
+    hookRows = [
+      makeRow({ family: "kms", key: "kms-41", title: "KMS recompile" }),
+    ];
+    rerender(
+      <QueryClientProvider
+        client={
+          new QueryClient({
+            defaultOptions: { queries: { retry: false } },
+          })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(document.activeElement).toBe(hide);
   });
 
   it("never imports the client upload store (server-sourced constraint tripwire)", () => {

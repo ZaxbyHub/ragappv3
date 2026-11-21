@@ -38,7 +38,7 @@ import {
 import {
   createKMSEntry,
   listKMSEntries,
-  listKMSJobs,
+  getKMSJob,
   recompileVaultKMS,
   type KMSEntry,
 } from "@/lib/api";
@@ -116,20 +116,38 @@ export default function KMSPage() {
     return () => clearTimeout(t);
   }, [activeVaultId, search, statusFilter, fetchEntries]);
 
-  // Recompile job polling (issue #783): the POST /kms/recompile handle is
-  // kept and polled through listKMSJobs until a terminal status, then the
-  // entries refetch and the toast reports the real outcome. The listKMSJobs
-  // call lives ONLY inside the poll-time fetcher (lazy-closure constraint)
-  // so suites mocking @/lib/api with partial factories never dereference it
-  // outside a poll.
+  // Recompile job polling (issue #783; #1157 migration): the POST
+  // /kms/recompile handle is kept and polled through the SINGLE-JOB route
+  // (getKMSJob) until a terminal status, then the entries refetch and the
+  // toast reports the real outcome. The list route is no longer the poll
+  // source: its omitted limit now returns the default page (#1157 AC3), so
+  // a watched job beyond that page would otherwise go invisible. The
+  // getKMSJob call lives ONLY inside the poll-time fetcher (lazy-closure
+  // constraint) so suites mocking @/lib/api with partial factories never
+  // dereference it outside a poll.
   const recompileJobIdRef = useRef<number | null>(null);
+  // HTTP status of an API-client error, in either normalized shape this
+  // repo's client produces (same convention as useJobStatus's private
+  // httpStatusOf; kept local so the hook module's surface stays frozen).
+  const jobStatusOf = (e: unknown): number | undefined =>
+    (e as { status?: number } | null)?.status ??
+    (e as { response?: { status?: number } } | null)?.response?.status;
+
   const recompilePoll = useJobStatus("kms", {
     fetchJob: async () => {
       const vaultId = activeVaultId;
       const jobId = recompileJobIdRef.current;
       if (vaultId == null || jobId == null) return null;
-      const { jobs } = await listKMSJobs(vaultId);
-      return jobs.find((j) => j.id === jobId) ?? null;
+      try {
+        return await getKMSJob(vaultId, jobId);
+      } catch (e) {
+        // A 404 means the job left the visible window entirely (deleted
+        // history); return null — the same list-miss semantics as before
+        // #1157 (a null keeps the poll running to its iteration cap, where
+        // the timeout toast reports the outcome).
+        if (jobStatusOf(e) === 404) return null;
+        throw e;
+      }
     },
     onTerminal: (job) => {
       if (job.status === "failed") {

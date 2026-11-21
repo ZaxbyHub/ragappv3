@@ -276,6 +276,15 @@ export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
 
     const checkHealth = async (): Promise<void> => {
       if (!isCurrentLifetime(context, lifetime)) return;
+      // Visibility gate (#1158 AC5): no health request is issued while the
+      // document is hidden. Gating here covers every dispatch path — the
+      // mount check, the poll interval, and the unknown-services recheck
+      // chain (they all funnel through this function). The interval keeps
+      // running, so the first visible tick after un-hiding catches up; for
+      // callers WITHOUT a poll interval the visibilitychange re-arm fires
+      // the check at the first visible moment. The settled label
+      // (last-known state) stays stable meanwhile.
+      if (typeof document !== "undefined" && document.hidden) return;
       const read: HealthRead = { context, lifetime, token: Symbol("health-read"), sequence: lifetime.nextReadSequence++ };
       if (!isCurrentLifetime(context, lifetime)) return;
       latestReadRef.current = read;
@@ -411,6 +420,23 @@ export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
         void checkHealth();
       }, pollInterval);
     }
+    // K-12 (closeout): a caller WITHOUT a poll interval (SettingsPage) has
+    // no tick to catch up on after a hidden-tab mount skips the mount check
+    // — re-arm on visibilitychange so the first visible moment always
+    // checks. Interval callers get the same catch-up; one extra
+    // visible-state request is within the health budget.
+    const onVisibilityChange = (): void => {
+      if (!isCurrentLifetime(context, lifetime)) return;
+      if (typeof document !== 'undefined' && !document.hidden) {
+        // An in-flight read settles and applies its result on its own —
+        // superseding it here could discard a DEEP first read (its deep
+        // marker was consumed before the await), leaving a no-interval
+        // caller without service data until the next deep interval.
+        if (activeReadRef.current !== null) return;
+        void checkHealth();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
 
     return () => {
       lifetime.active = false;
@@ -422,6 +448,7 @@ export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
         clearInterval(lifetime.interval);
         lifetime.interval = null;
       }
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       if (activeReadRef.current?.lifetime === lifetime) activeReadRef.current = null;
       if (lifetimeRef.current === lifetime) lifetimeRef.current = null;
       if (healthContextRef.current === context) healthContextRef.current = null;

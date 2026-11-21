@@ -19,6 +19,9 @@ vi.mock("@/lib/api", () => ({
   createKMSEntry: vi.fn(),
   recompileVaultKMS: vi.fn().mockResolvedValue({ job_id: 7, status: "pending" }),
   listKMSJobs: vi.fn().mockResolvedValue({ jobs: [] }),
+  // #1157: the page's targeted poll now reads the single-job route; the
+  // forward-compatible member mirrors the frozen m03 file's factory idiom.
+  getKMSJob: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock("@/stores/useVaultStore", () => ({
@@ -35,7 +38,13 @@ vi.mock("sonner", () => ({
 
 import KMSPage from "@/pages/KMSPage";
 import { listKMSEntries, listKMSJobs, recompileVaultKMS } from "@/lib/api";
+import * as apiModule from "@/lib/api";
 import { toast } from "sonner";
+
+// getKMSJob is accessed through the mocked module namespace (cast, not a
+// direct import, so the partial-factory shape of other suites is honored).
+type MockFn = ReturnType<typeof vi.fn>;
+const getKMSJobMock = (apiModule as unknown as Record<string, MockFn>).getKMSJob;
 
 const render: typeof rtlRender = (ui, options) =>
   rtlRender(ui, { wrapper: MemoryRouter, ...options });
@@ -67,6 +76,9 @@ describe("KMSPage m03 companions (issue-trace 783)", () => {
   it("a terminal recompile job refetches entries and toasts success", async () => {
     vi.useFakeTimers();
     vi.mocked(listKMSJobs).mockResolvedValue({ jobs: [COMPLETED_JOB] });
+    // #1157: the poll reads the single-job client; the watched job (id 7)
+    // resolves terminal through it.
+    getKMSJobMock.mockResolvedValue(COMPLETED_JOB);
 
     render(<KMSPage />);
     await act(async () => {
@@ -126,6 +138,7 @@ describe("KMSPage m03 companions (issue-trace 783)", () => {
     vi.mocked(listKMSJobs).mockResolvedValue({
       jobs: [{ ...COMPLETED_JOB, id: 12, status: "cancelled" }],
     });
+    getKMSJobMock.mockResolvedValue({ ...COMPLETED_JOB, id: 12, status: "cancelled" });
 
     render(<KMSPage />);
     await act(async () => {

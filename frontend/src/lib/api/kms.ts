@@ -146,6 +146,20 @@ export async function listKMSJobs(
   return response.data;
 }
 
+/** Single-job read over GET /kms/jobs/{job_id} (#1157): KMSPage's targeted
+ * poll watches one known job id, which must stay visible even when it sits
+ * beyond the newest page of the (now default-bounded) list route. */
+export async function getKMSJob(
+  vaultId: number,
+  jobId: number
+): Promise<KMSCompileJob> {
+  const response = await apiClient.get<KMSCompileJob>(
+    `/kms/jobs/${jobId}`,
+    { params: { vault_id: vaultId } }
+  );
+  return response.data;
+}
+
 /** Trigger a browser download of a document's original bytes (DD-C009). */
 export async function downloadDocument(
   fileId: string | number,

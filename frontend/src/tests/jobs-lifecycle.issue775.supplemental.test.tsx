@@ -200,12 +200,12 @@ describe("WikiJobsPanel issue #775 lifecycle", () => {
       .mockImplementationOnce(() => filtered.promise)
       .mockImplementationOnce(() => final.promise);
     render(<WikiJobsPanel vaultId={42} />);
-    await waitFor(() => expect(api.listWikiJobs).toHaveBeenCalledWith({ vault_id: 42, status: undefined }));
+    await waitFor(() => expect(api.listWikiJobs).toHaveBeenCalledWith({ vault_id: 42, status: undefined, limit: 500 }));
 
     const filter = screen.getByRole("combobox");
     await user.click(filter);
     await user.click(screen.getByRole("option", { name: "Failed" }));
-    await waitFor(() => expect(api.listWikiJobs).toHaveBeenCalledWith({ vault_id: 42, status: "failed" }));
+    await waitFor(() => expect(api.listWikiJobs).toHaveBeenCalledWith({ vault_id: 42, status: "failed", limit: 500 }));
     await user.click(screen.getByRole("combobox"));
     await user.click(screen.getByRole("option", { name: "All statuses" }));
     await waitFor(() => expect(api.listWikiJobs).toHaveBeenCalledTimes(3));

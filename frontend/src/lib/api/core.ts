@@ -1318,32 +1318,11 @@ export async function cancelDocumentIngest(
   return response.data;
 }
 
-/** One embedding-reindex job row from `GET /documents/reindex/jobs` (issue #784). */
-export interface ReindexJobSummary {
-  id: number;
-  vault_id?: number | null;
-  trigger_type?: string | null;
-  trigger_id?: string | null;
-  status: string;
-  error?: string | null;
-  result_json?: string | null;
-  input_json?: string | null;
-  retry_count?: number;
-  created_at?: string | null;
-  started_at?: string | null;
-  completed_at?: string | null;
-}
-
-/**
- * List recent embedding-reindex jobs (admin route; non-admin callers get 403
- * and callers treat that as "family hidden", per the Activity tray contract).
- */
-export async function listReindexJobs(): Promise<{ jobs: ReindexJobSummary[] }> {
-  const response = await apiClient.get<{ jobs: ReindexJobSummary[] }>(
-    "/documents/reindex/jobs"
-  );
-  return response.data;
-}
+// listReindexJobs (GET /documents/reindex/jobs) and its ReindexJobSummary
+// row type were removed in #1157: the Activity tray now reads reindex rows
+// through the vault-scoped GET /activity/jobs aggregate (server-side admin
+// scoping), which orphaned the client. The backend route remains; re-add a
+// client here on the next consumer (MaintenanceSettings or an admin surface).
 
 /** Response from `POST /documents/reindex` (all-vault when `vault_id` is null). */
 export interface ReindexTriggerResponse {

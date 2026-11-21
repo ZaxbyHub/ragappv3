@@ -324,6 +324,10 @@ async def recompile_vault_kms(
 async def list_kms_jobs(
     vault_id: int = Query(...),
     status: Optional[str] = Query(None),
+    # Default row bound (#1157 AC3, parity with /wiki/jobs): an omitted
+    # limit returns the default page (50); an explicit limit still fetches
+    # deeper. KMSStore.list_jobs gained the LIMIT in both lease branches.
+    limit: int = Query(50, ge=1, le=500),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     evaluate: Callable = Depends(get_evaluate_policy),
@@ -331,7 +335,7 @@ async def list_kms_jobs(
 ):
     await _require_vault_read(evaluate, user, vault_id)
     store = KMSStore(db)
-    jobs = store.list_jobs(vault_id, status=status)
+    jobs = store.list_jobs(vault_id, status=status, limit=limit)
     return {"jobs": [asdict(j) for j in jobs]}
 
 
