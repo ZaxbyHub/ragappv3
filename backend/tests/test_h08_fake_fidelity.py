@@ -55,11 +55,16 @@ REPO = Path(__file__).resolve().parents[2]
 BACKEND = REPO / "backend"
 TESTS = BACKEND / "tests"
 
-# Suites driven under mutation for AC7/AC8 (issue #745 ACs name exactly these).
+# Suites driven under mutation for AC7/AC8 (issue #745 ACs name exactly
+# these; test_p02b joined with #1179 — it pins the check_chat/_probe_client
+# deadline (asyncio.wait_for) and the max_tokens=1 payload directly, so the
+# timeout mutant stays killed now that the contract is enforced by the
+# wait_for wrapper rather than the locally-built client's timeout).
 _LLM_HEALTH_SUITES = (
     "tests/test_issue494_llm_health.py",
     "tests/test_llm_health_dual.py",
     "tests/test_llm_reasoning_fallback.py",
+    "tests/test_p02b_probe_contract.py",
 )
 
 
@@ -488,11 +493,24 @@ def test_check_chat_timeout_mutant_is_killed(tmp_path):
     timeout must fail at least one LLM-health suite test — otherwise a
     candidate that ignores the timeout for chat ships green. RED at base: no
     suite in the three files calls ``check_chat``/``_probe_client``, so the
-    mutant survives."""
+    mutant survives. #1179 moved the enforced deadline to the
+    ``asyncio.wait_for`` wrapper (the locally-built client's timeout alone
+    no longer bounds an injected production client), so the mutant now
+    inflates BOTH the wait_for deadline and the constructed-client timeout."""
     n_failed = _run_llm_health_suites_under_mutation(
         tmp_path,
-        anchor="client = LLMClient(timeout=self.timeout)",
-        replacement="client = LLMClient(timeout=self.timeout * 60)",
+        anchor=(
+            "            await asyncio.wait_for(\n"
+            "                client.chat_completion(messages, max_tokens=1),\n"
+            "                timeout=self.timeout,\n"
+            "            )"
+        ),
+        replacement=(
+            "            await asyncio.wait_for(\n"
+            "                client.chat_completion(messages, max_tokens=1),\n"
+            "                timeout=self.timeout * 60,\n"
+            "            )"
+        ),
     )
     assert n_failed is not None, (
         "H08-AC7 HARNESS BROKEN: the copied LLM-health suites fail (or error) "
@@ -500,7 +518,7 @@ def test_check_chat_timeout_mutant_is_killed(tmp_path):
         "mutant — fix the harness/copy environment before trusting the kill"
     )
     assert n_failed >= 1, (
-        "H08-AC7 MUTANT SURVIVES: inflating check_chat's LLMClient timeout "
+        "H08-AC7 MUTANT SURVIVES: inflating check_chat's probe deadline "
         "60x left every LLM-health suite green — no test exercises the "
         "check_chat/_probe_client timeout contract; add a slow-socket test "
         "mirroring the check_embeddings AC3 harness"

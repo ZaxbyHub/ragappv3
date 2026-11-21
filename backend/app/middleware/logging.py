@@ -136,13 +136,14 @@ class LoggingMiddleware(BaseHTTPMiddleware):
                 # the contextvar reset in the outer finally, same as the
                 # success path (the RequestIdFilter reads the contextvar).
                 duration = time.monotonic() - start
+                sanitized_query = _sanitize_query(request.url.query)
                 logger.info(
                     "http_request",
                     extra={
                         "request_id": request_id,
                         "method": request.method,
                         "path": request.url.path,
-                        "query": _sanitize_query(request.url.query),
+                        "query": sanitized_query,
                         "status_code": 500,
                         "client_ip": request.client.host if request.client else None,
                         "duration_ms": round(duration * 1000, 2),
