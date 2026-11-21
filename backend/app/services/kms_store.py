@@ -489,9 +489,10 @@ class KMSStore:
         self,
         vault_id: int,
         status: Optional[str] = None,
-        # Default row bound (#1157 AC3): mirrors WikiStore.list_jobs — the
-        # route layer passes its validated value; direct callers keep the
-        # same default page instead of the vault's full history.
+        # Default row bound (#1157 AC3): matches the ROUTE default (50).
+        # Unlike WikiStore.list_jobs (whose None means unbounded), the kms
+        # store always applies LIMIT — direct callers must pass a concrete
+        # int (a Route Query default or None cannot bind to `LIMIT ?`).
         limit: int = 50,
     ) -> list[KMSCompileJob]:
         if _lease_enabled():

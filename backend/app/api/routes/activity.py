@@ -6,6 +6,11 @@ assemble from per-family, per-vault fan-out polling (one 8s tick cost
 ``2..6 + 2*V + 1 + D + (0|1)`` requests; the tray's polling-budget contract
 needs a single request per tick).
 
+Each family window holds at most ``limit`` rows: the LIVE arm
+(pending/running) is answered first and the terminal arm fills the
+REMAINDER of the window, so live jobs can never be evicted by terminal
+history and the per-family bound is exact (r1-critic F-002).
+
 Family sources mirror each family's own readers (lease switches, feature
 gates, and the legacy ``interrupted`` → ``failed`` reindex normalization):
 
@@ -29,12 +34,21 @@ windows this response would carry (canonical JSON, response order).
 ``changed=false`` therefore means "the snapshot you can see is
 byte-identical" — precise for inserts, status transitions, draft stage
 moves, ingest phase/progress moves, title/error edits, and removals, with
-bounded queries whose cost cannot grow as terminal rows accumulate.
+every query LIMIT-bounded. Cost note (r1-critic F-003): each family window
+is index-assisted on the ``jobs`` queue+status prefix, but the member
+vault filter rides ``json_extract(payload_json, '$.vault_id')``, which no
+index covers, so the terminal arm's ordering scan grows linearly with the
+family queue's accumulated history. The one-request-per-tick design trades
+that growth for eliminating the old per-vault fan-out; a terminal-history
+retention janitor on the ``jobs`` table is the systemic fix (out of scope
+here).
 Documented limitations: mutations entirely outside the visible window of an
 old snapshot (e.g. a beyond-``limit``-deep historical row's deletion) do
 not move the token, and a lease-branch flip can change row representations
 (and thus the token) without a semantic change. No per-user salt:
-identical visible data intentionally yields identical tokens across roles.
+identical visible data intentionally yields identical tokens across roles
+(r2 probe: the digest is recomputable from the caller's own response body,
+so it discloses nothing the body does not).
 
 The route follows the repo's read-route conventions: no CSRF guard (GET
 only) and no rate limit (the tray polls it; ``GET /documents/reindex/jobs``
@@ -45,6 +59,7 @@ static text — the vault set is bound as one JSON array consumed through
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -308,12 +323,17 @@ WHERE status IN ('completed', 'failed', 'cancelled', 'interrupted')
 ORDER BY id DESC
 LIMIT ?
 """
+# Processing rows rank ahead of pending (r2-critic F-007): a bulk upload's
+# oldest rows are the ones already showing progress, and pure created_at
+# ordering would let 50 newer pending rows push every processing row out of
+# the combined window.
 _INGEST_ALL = """
 SELECT id, vault_id, file_name, status, phase, phase_message,
        progress_percent, processed_units, total_units, unit_label, created_at
 FROM files
 WHERE status IN ('pending', 'processing')
-ORDER BY created_at DESC, id DESC
+ORDER BY CASE WHEN status = 'processing' THEN 0 ELSE 1 END,
+         created_at DESC, id DESC
 LIMIT ?
 """
 _INGEST_VAULT = """
@@ -322,7 +342,8 @@ SELECT id, vault_id, file_name, status, phase, phase_message,
 FROM files
 WHERE status IN ('pending', 'processing')
   AND vault_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
-ORDER BY created_at DESC, id DESC
+ORDER BY CASE WHEN status = 'processing' THEN 0 ELSE 1 END,
+         created_at DESC, id DESC
 LIMIT ?
 """
 _DRAFT_OWN_LIVE_ALL = """
@@ -366,30 +387,15 @@ def _canonical_token(windows: dict[str, list[dict[str, Any]]]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-@router.get("/jobs", response_model=ActivityJobsResponse)
-async def list_activity_jobs(
-    change_token: Optional[str] = Query(
-        None, description="Token from a prior response; an equal token yields an empty delta."
-    ),
-    limit: int = Query(50, ge=1, le=500),
-    db: sqlite3.Connection = Depends(get_db),
-    user: dict = Depends(get_current_active_user),
-) -> ActivityJobsResponse:
-    role = user.get("role", "")
-    is_admin = role in ("admin", "superadmin")
-    if is_admin:
-        vault_json: Optional[str] = None  # admins read all vaults
-    else:
-        accessible = await get_user_accessible_vault_ids(user, db)
-        if not accessible:
-            # No readable vaults: a well-formed empty snapshot (an empty
-            # window is still a window, so the token stays meaningful).
-            token = _canonical_token({})
-            return ActivityJobsResponse(
-                jobs=[], change_token=token, changed=change_token != token
-            )
-        vault_json = json.dumps([int(v) for v in accessible])
-
+def _collect_snapshot(
+    db: sqlite3.Connection,
+    vault_json: Optional[str],
+    is_admin: bool,
+    caller_id: int,
+    limit: int,
+) -> tuple[list[ActivityJobResponse], dict[str, list[dict[str, Any]]]]:
+    """Collect every family window synchronously. ALWAYS executed through
+    asyncio.to_thread (r1-critic F-003): the loop never waits on SQLite."""
     compile_lease = bool(getattr(settings, "wiki_kms_job_lease_enabled", False))
     reindex_lease = bool(getattr(settings, "reindex_job_lease_enabled", False))
     if compile_lease or reindex_lease:
@@ -419,13 +425,23 @@ async def list_activity_jobs(
         live_params: tuple,
         terminal_params: tuple,
     ) -> list[sqlite3.Row]:
-        # Live-first window (4.5 review F2): live rows can never be evicted
-        # by newer terminal history; terminal history fills the remainder.
+        # Live-first window (4.5 review F2, remainder semantics per r1-critic
+        # F-002): live rows are answered first and the terminal arm fills the
+        # REMAINDER of the family window, so live rows can never be evicted by
+        # terminal history and the per-family bound is exactly `limit`.
         live = run(live_sql, live_params)
+        remaining = limit - len(live)
+        if remaining <= 0:
+            return list(live)
+        # The live and terminal queries are separate autocommit snapshots: a
+        # row that settles between them appears in BOTH results, so the id
+        # filter below removes the duplicate (and keeps the change token
+        # stable). Set hoisted once — r1-review CS-005 disposition.
+        live_ids = {row["id"] for row in live}
         terminal = [
             r
-            for r in run(terminal_sql, terminal_params)
-            if r["id"] not in {row["id"] for row in live}
+            for r in run(terminal_sql, terminal_params[:-1] + (remaining,))
+            if r["id"] not in live_ids
         ]
         return live + terminal
 
@@ -528,8 +544,8 @@ async def list_activity_jobs(
     draft = fetch_live_terminal(
         _DRAFT_OWN_LIVE_VAULT if vault_json else _DRAFT_OWN_LIVE_ALL,
         _DRAFT_OWN_TERMINAL_VAULT if vault_json else _DRAFT_OWN_TERMINAL_ALL,
-        (int(user["id"]), vault_json, limit) if vault_json else (int(user["id"]), limit),
-        (int(user["id"]), vault_json, limit) if vault_json else (int(user["id"]), limit),
+        (caller_id, vault_json, limit) if vault_json else (caller_id, limit),
+        (caller_id, vault_json, limit) if vault_json else (caller_id, limit),
     )
     collect(
         "draft-room",
@@ -577,6 +593,48 @@ async def list_activity_jobs(
         )
     else:
         windows["reindex"] = []
+    return rows, windows
+
+
+@router.get("/jobs", response_model=ActivityJobsResponse)
+async def list_activity_jobs(
+    change_token: Optional[str] = Query(
+        None, description="Token from a prior response; an equal token yields an empty delta."
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    db: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_active_user),
+) -> ActivityJobsResponse:
+    role = user.get("role", "")
+    is_admin = role in ("admin", "superadmin")
+    if is_admin:
+        vault_json: Optional[str] = None  # admins read all vaults
+    else:
+        accessible = await get_user_accessible_vault_ids(user, db)
+        if not accessible:
+            # No readable vaults: a well-formed empty snapshot (an empty
+            # window is still a window, so the token stays meaningful).
+            token = _canonical_token({})
+            return ActivityJobsResponse(
+                jobs=[], change_token=token, changed=change_token != token
+            )
+        vault_json = json.dumps([int(v) for v in accessible])
+
+    # r1-critic F-003: every statement below runs synchronously against
+    # SQLite, so the whole collection is executed in one worker thread via
+    # asyncio.to_thread — the event loop (chat SSE, other requests) is never
+    # blocked by a poll (the repo convention: documents.py's reindex list).
+    def _collect() -> tuple[list[ActivityJobResponse], dict[str, list[dict[str, Any]]]]:
+        return _collect_snapshot(
+            db=db,
+            vault_json=vault_json,
+            is_admin=is_admin,
+            caller_id=int(user["id"]),
+            limit=limit,
+        )
+
+    rows, windows = await asyncio.to_thread(_collect)
+
 
     token = _canonical_token(windows)
     changed = change_token != token

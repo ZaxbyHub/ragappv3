@@ -135,7 +135,9 @@ function WikiJobsPanelState({
     setJobsPhase((current) => currentRead() ? "loading" : current);
     setJobsContext((current) => currentRead() ? capturedQuery : current);
     try {
-      const res = await listWikiJobs({ vault_id: vaultId, status: statusFilter || undefined });
+      // #1157: the jobs route defaults omitted limits to 50; pass the route
+      // maximum so the panel keeps near-parity with its previous unbounded view.
+      const res = await listWikiJobs({ vault_id: vaultId, status: statusFilter || undefined, limit: 500 });
       if (!Array.isArray(res?.jobs)) throw new Error("Jobs response was malformed");
       if (!currentRead()) return;
       setJobs((current) => currentRead() ? res.jobs : current);

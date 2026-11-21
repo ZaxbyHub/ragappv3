@@ -101,6 +101,12 @@ export function ActivityTray() {
   const sectionRef = useRef<HTMLElement | null>(null);
   const focusedKeyRef = useRef<string | null>(null);
   const focusInTrayRef = useRef(false);
+  // R8 (Stage B + r2 follow-up): the null-blur disambiguation callbacks must
+  // not outlive a NEWER in-tray focus — a stale callback would clear the
+  // marker for a row focused after the blur and disable its later
+  // restoration. Multiple callbacks can pend (row blur → header blur → …);
+  // ANY newer in-tray focus cancels ALL of them.
+  const pendingBlurIdsRef = useRef<Set<number>>(new Set());
   const prevRowKeysRef = useRef<Set<string>>(new Set());
 
   // Context-optional client read (#911): the real app always mounts the
@@ -228,8 +234,8 @@ export function ActivityTray() {
   // focused row (a successful cancel removes it; the terminal cap ages it
   // out) — restore focus to the tray header instead of dropping it to
   // <body>. The decision runs in a passive effect on the NEW row set, using
-  // focus facts captured BEFORE the removal (a render-phase DOM call is a
-  // side effect in render and StrictMode-unsafe):
+  // focus facts captured BEFORE the removal, and all refs are read and
+  // written inside the effect (no render-phase writes — StrictMode-safe):
   //   - onFocusCapture on a row control records the focused row key and
   //     marks focus-in-tray;
   //   - a focusout whose relatedTarget is a CONCRETE node outside the tray
@@ -239,15 +245,31 @@ export function ActivityTray() {
   //   - when the recorded row disappears from the new set and focus had not
   //     deliberately left, focus lands on the header; focus deliberately
   //     moved outside is never stolen back.
-  const prevKeys = prevRowKeysRef.current;
-  const currentKeys = new Set(rows.map((r) => r.key));
   useEffect(() => {
+    // r1-critic F-4 (StrictMode): prev/current are computed and the ref is
+    // written INSIDE the effect — no render-phase ref write, so a
+    // StrictMode double render cannot make prev == current and silently
+    // disable the guard.
+    const prevKeys = prevRowKeysRef.current;
+    const currentKeys = new Set(rows.map((r) => r.key));
     const focusedKey = focusedKeyRef.current;
+    // R8 (r2 critic): restore only when focus has nowhere better to be —
+    // nowhere (null), body (the node-removal case), a DETACHED node (jsdom
+    // can leave activeElement pointing at the removed row button; a real
+    // browser moves it to body), or still inside the tray. Never yank focus
+    // out of a connected element (e.g. the composer).
+    const active = document.activeElement;
+    const focusCleared =
+      active === null ||
+      active === document.body ||
+      !(active instanceof Node && active.isConnected) ||
+      (active instanceof Node && sectionRef.current?.contains(active));
     if (
       focusedKey &&
       !currentKeys.has(focusedKey) &&
       prevKeys.has(focusedKey) &&
-      focusInTrayRef.current
+      focusInTrayRef.current &&
+      focusCleared
     ) {
       focusedKeyRef.current = null;
       focusInTrayRef.current = false;
@@ -255,9 +277,8 @@ export function ActivityTray() {
         ?.querySelector<HTMLButtonElement>("button[aria-expanded]")
         ?.focus();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    prevRowKeysRef.current = currentKeys;
   }, [rows]);
-  prevRowKeysRef.current = currentKeys;
 
   return (
     // Stacked ABOVE the upload indicator on both breakpoints: the indicator
@@ -282,16 +303,31 @@ export function ActivityTray() {
       onBlurCapture={(e) => {
         // Deliberate external focus ONLY: a focusout whose relatedTarget is
         // a concrete node outside the tray means the user moved focus away
-        // on purpose — never steal it back. A null relatedTarget is the
-        // node-removal signature (the focused row is being unmounted); the
-        // in-tray marker must survive it so the guard's effect still
-        // restores focus to the header.
+        // on purpose — never steal it back.
         const to = e.relatedTarget;
         if (
           to instanceof Node &&
           !(to as HTMLElement).closest?.('[aria-label="Activity"]')
         ) {
           focusInTrayRef.current = false;
+          return;
+        }
+        if (to == null) {
+          // R8 (r2, execution-proven): a null relatedTarget is shared by two
+          // different events — the focused node being REMOVED (keep the
+          // marker so the guard restores to the header) and a DELIBERATE
+          // blur to <body>, e.g. clicking a non-focusable page region
+          // (clear it — never steal focus back). Indistinguishable at
+          // dispatch time; disambiguate after a macrotask, when a removed
+          // node is disconnected but a live one is still in the document.
+          const blurred = e.target;
+          const id = window.setTimeout(() => {
+            pendingBlurIdsRef.current.delete(id);
+            if (blurred instanceof Node && blurred.isConnected) {
+              focusInTrayRef.current = false;
+            }
+          }, 0);
+          pendingBlurIdsRef.current.add(id);
         }
       }}
     >
@@ -350,6 +386,10 @@ export function ActivityTray() {
                   onFocusCapture={() => {
                     focusedKeyRef.current = row.key;
                     focusInTrayRef.current = true;
+                    for (const id of pendingBlurIdsRef.current) {
+                      window.clearTimeout(id);
+                    }
+                    pendingBlurIdsRef.current.clear();
                   }}
                   className="flex flex-col gap-1 border-b py-2 last:border-b-0"
                 >

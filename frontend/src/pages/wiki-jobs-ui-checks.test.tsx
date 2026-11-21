@@ -529,7 +529,7 @@ describe("WikiJobsPanel read outcomes, filters, and preserved display", () => {
     render(<WikiJobsPanel vaultId={1} />);
 
     expect(screen.queryByText("No jobs found")).not.toBeInTheDocument();
-    expect(listWikiJobsMock).toHaveBeenCalledWith({ vault_id: 1, status: undefined });
+    expect(listWikiJobsMock).toHaveBeenCalledWith({ vault_id: 1, status: undefined, limit: 500 });
     await act(async () => {
       initial.resolve({ jobs: [] });
       await Promise.resolve();
@@ -537,7 +537,7 @@ describe("WikiJobsPanel read outcomes, filters, and preserved display", () => {
     expect(screen.getByText("No jobs found")).toBeInTheDocument();
   });
 
-  it("preserves the full-history omission, status filter, and refresh-signal query", async () => {
+  it("passes the route-max limit (500) on the status filter and refresh-signal query", async () => {
     const allJobs = Array.from({ length: 11 }, (_, index) =>
       makeJob(index + 1, "completed"),
     );
@@ -548,19 +548,19 @@ describe("WikiJobsPanel read outcomes, filters, and preserved display", () => {
     const view = render(<WikiJobsPanel vaultId={7} refreshSignal={0} />);
     await flush();
 
-    expect(listWikiJobsMock).toHaveBeenCalledWith({ vault_id: 7, status: undefined });
+    expect(listWikiJobsMock).toHaveBeenCalledWith({ vault_id: 7, status: undefined, limit: 500 });
     expect(screen.getByText("#1")).toBeInTheDocument();
     expect(screen.getByText("#11")).toBeInTheDocument();
 
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "failed" } });
     await flush();
-    expect(listWikiJobsMock).toHaveBeenLastCalledWith({ vault_id: 7, status: "failed" });
+    expect(listWikiJobsMock).toHaveBeenLastCalledWith({ vault_id: 7, status: "failed", limit: 500 });
     expect(screen.getByText("#40")).toBeInTheDocument();
     expect(screen.queryByText("#1")).not.toBeInTheDocument();
 
     view.rerender(<WikiJobsPanel vaultId={7} refreshSignal={1} />);
     await flush();
-    expect(listWikiJobsMock).toHaveBeenLastCalledWith({ vault_id: 7, status: "failed" });
+    expect(listWikiJobsMock).toHaveBeenLastCalledWith({ vault_id: 7, status: "failed", limit: 500 });
   });
 
   it("distinguishes a failed initial read, retries, and renders the current rows", async () => {
@@ -619,7 +619,7 @@ describe("WikiJobsPanel read outcomes, filters, and preserved display", () => {
 
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "failed" } });
     await flush();
-    expect(listWikiJobsMock).toHaveBeenLastCalledWith({ vault_id: 2, status: "failed" });
+    expect(listWikiJobsMock).toHaveBeenLastCalledWith({ vault_id: 2, status: "failed", limit: 500 });
     expect(screen.queryByText("#24")).not.toBeInTheDocument();
     await act(async () => {
       filterRead.resolve({ jobs: [makeJob(25, "failed", 2)] });

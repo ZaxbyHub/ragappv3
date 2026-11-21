@@ -142,7 +142,9 @@ export default function KMSPage() {
         return await getKMSJob(vaultId, jobId);
       } catch (e) {
         // A 404 means the job left the visible window entirely (deleted
-        // history); treat it as terminal-absent like the old list miss.
+        // history); return null — the same list-miss semantics as before
+        // #1157 (a null keeps the poll running to its iteration cap, where
+        // the timeout toast reports the outcome).
         if (jobStatusOf(e) === 404) return null;
         throw e;
       }

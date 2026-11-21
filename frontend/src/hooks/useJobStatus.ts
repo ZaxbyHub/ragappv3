@@ -170,9 +170,10 @@ export function useJobStatus(family: JobFamily, opts: UseJobStatusOptions) {
 // reusing the family's existing server list client (never the client upload
 // store). Mirrors the single-job hook's discipline above: setTimeout chain,
 // never setInterval; API clients are imported (dynamic) and dereferenced
-// ONLY at poll time; every family failure degrades to zero rows for one
-// tick instead of throwing (a 403 for feature/admin-gated families is an
-// ordinary "not visible to this user", not an error).
+// ONLY at poll time; a failed aggregate request retains the previous
+// snapshot for one tick instead of throwing (an authorization failure for
+// a family the caller cannot see is an ordinary "not visible to this
+// user", not an error).
 // ---------------------------------------------------------------------------
 
 /** One normalized job row the Activity tray renders, whatever the family. */
@@ -327,8 +328,8 @@ async function fetchAllActivityRows(): Promise<ActivityJobRow[]> {
   // #1039 admin-only reindex scoping and the draft-room owner boundary), so
   // the old per-family/per-vault fan-out and its client-side 403 backoff
   // layers are gone. Family failures are not per-family any more: a failed
-  // aggregate call degrades to zero rows for one tick (same allSettled
-  // semantics as before, one lane).
+  // aggregate call RETAINS the previous snapshot for that tick (last-known
+  // state beats a blank tray); the next successful tick replaces it.
   const response = await getActivityJobs();
   const mapped = response.jobs.map(mapActivityJob);
   // Retention stays PER FAMILY (the <=3-terminal-rows budget each family's
@@ -423,8 +424,9 @@ export function useActivityJobs(options: UseActivityJobsOptions = {}) {
       }
       void runFetch()
         .catch(() => {
-          // fetchAllActivityRows never rejects (allSettled); this guard only
-          // covers the setState bookkeeping above.
+          // fetchAllActivityRows rejects only when the aggregate request
+          // itself fails; swallow it so the chain stays alive and the last
+          // good snapshot remains on screen (r1-critic F-5 disposition).
         })
         .finally(() => {
           if (!mountedRef.current || generationRef.current !== generation) return;

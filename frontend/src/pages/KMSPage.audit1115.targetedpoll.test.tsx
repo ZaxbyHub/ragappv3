@@ -86,7 +86,10 @@ describe("KMSPage targeted poll beyond the default page (#1157)", () => {
       });
     }
 
-    // The poll asked the single-job route for the watched handle...
+    // The poll asked the single-job route for the watched handle, with the
+    // exact (vaultId, jobId) identity — a swapped or stale id would still
+    // resolve here only if the mock ignored arguments, so pin the arguments.
+    expect(getKMSJob).toHaveBeenCalledWith(1, 7);
     expect(getKMSJob).toHaveBeenCalled();
     // ...reached the terminal outcome (toast + entries refetch) even though
     // the list page the old poll relied on never contained the job.

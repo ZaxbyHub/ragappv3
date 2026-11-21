@@ -192,7 +192,7 @@ describe("useActivityJobs single-endpoint poll budget (audit 1115)", () => {
   it("hidden: polling stops entirely and resumes when visible again", async () => {
     publishAuthPrincipal({ id: 602, role: "member" });
 
-    renderHook(() => useActivityJobs({ intervalMs: 8000 }));
+    renderHook(() => useActivityJobs());
     await flushFirstTick();
     const callsBeforeHidden = mockGetActivityJobs.mock.calls.length;
 
@@ -215,7 +215,7 @@ describe("useActivityJobs single-endpoint poll budget (audit 1115)", () => {
       activityResponse([liveWikiJob()], "t1", true),
     );
 
-    const { result } = renderHook(() => useActivityJobs({ intervalMs: 8000 }));
+    const { result } = renderHook(() => useActivityJobs());
     await flushFirstTick();
 
     // Row mapping: the live wiki job arrives as a non-terminal wiki row.

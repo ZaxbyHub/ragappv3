@@ -342,3 +342,137 @@ class TestFractionalProgress:
 @pytest.mark.parametrize("unused", [pytest.param(None, id="singleton")])
 def test_companion_file_collected(unused):
     """Marker so a vacuous collection is observable."""
+
+
+class TestKmsLimitEnvelope:
+    """DI-04 (r2 critic): the kms route's ge=1/le=500 envelope is new
+    behavior and needs the same 422 pins the wiki route carries."""
+
+    def _seed_one(self, route_env):
+        route_env.seed_queue_job("kms", VAULT_A, status="running")
+
+    def test_kms_limit_zero_rejected_422(self, route_env):
+        self._seed_one(route_env)
+        resp = route_env.client.get(
+            "/api/kms/jobs",
+            params={"vault_id": VAULT_A, "limit": 0},
+            headers=route_env.member_headers(),
+        )
+        assert resp.status_code == 422
+
+    def test_kms_limit_above_500_rejected_422(self, route_env):
+        self._seed_one(route_env)
+        resp = route_env.client.get(
+            "/api/kms/jobs",
+            params={"vault_id": VAULT_A, "limit": 501},
+            headers=route_env.member_headers(),
+        )
+        assert resp.status_code == 422
+
+    def test_kms_default_page_is_50(self, route_env):
+        # Lease-on is the default: seed the UNIFIED queue (the lease-off
+        # legacy-table branch is covered by TestLeaseOffBoundedLists).
+        for _ in range(60):
+            route_env.seed_queue_job("kms", VAULT_A, status="completed")
+        resp = route_env.client.get(
+            "/api/kms/jobs",
+            params={"vault_id": VAULT_A},
+            headers=route_env.member_headers(),
+        )
+        assert resp.status_code == 200
+        assert len(resp.json()["jobs"]) == 50
+
+
+class TestTerminalRemainder:
+    """F-002 (r1 critic): the terminal arm fills the REMAINDER of the family
+    window, so a family returns at most `limit` rows total."""
+
+    def test_live_plus_terminal_capped_at_exact_limit(self, route_env):
+        live_id = route_env.seed_queue_job("wiki", VAULT_A, status="running")
+        for _ in range(55):
+            route_env.seed_queue_job("wiki", VAULT_A, status="completed")
+        rows = _family(route_env.client, route_env.member_headers(), "wiki")
+        assert len(rows) == 50
+        assert live_id in [j["id"] for j in rows]
+        assert sum(1 for j in rows if j["status"] == "completed") == 49
+
+    def test_full_live_backlog_leaves_no_terminal_room(self, route_env):
+        for _ in range(60):
+            route_env.seed_queue_job("wiki", VAULT_A, status="running")
+        for _ in range(5):
+            route_env.seed_queue_job("wiki", VAULT_A, status="completed")
+        rows = _family(route_env.client, route_env.member_headers(), "wiki")
+        assert len(rows) == 50
+        assert all(j["status"] == "running" for j in rows)
+
+
+class TestIngestProcessingPriority:
+    """F-007 (r2 critic): processing rows rank ahead of pending inside the
+    combined ingest window — a bulk upload's oldest (progress-bearing) rows
+    cannot be evicted by newer pending rows."""
+
+    def test_processing_row_survives_full_pending_window(self, route_env):
+        def _seed(conn):
+            conn.execute(
+                "INSERT INTO files (vault_id, file_path, file_name, file_size, "
+                "status, phase) VALUES (?, 'p0.txt', 'p0.txt', 10, "
+                "'processing', 'embedding')",
+                (VAULT_A,),
+            )
+            for i in range(55):
+                conn.execute(
+                    "INSERT INTO files (vault_id, file_path, file_name, file_size, "
+                    "status) VALUES (?, ?, ?, 10, 'pending')",
+                    (VAULT_A, f"p{i + 1}.txt", f"p{i + 1}.txt"),
+                )
+            conn.commit()
+
+        route_env._with_conn(_seed)
+        ingest = _family(route_env.client, route_env.member_headers(), "ingest")
+        assert len(ingest) == 50
+        statuses = [j["status"] for j in ingest]
+        assert statuses[0] == "processing", "processing row must rank first"
+        assert "processing" in statuses
+
+
+class TestThreadOffloadWiring:
+    """Stage B test-engineer F-003: the to_thread offload was unobserved —
+    a sync revert passed the whole activity surface. Pin the wiring: the
+    route must dispatch _collect_snapshot through asyncio.to_thread."""
+
+    def test_route_offloads_collection_to_worker_thread(self, route_env, monkeypatch):
+        import threading
+
+        import app.api.routes.activity as activity_module
+
+        # The route wraps _collect_snapshot in a route-local closure and
+        # dispatches THE CLOSURE through asyncio.to_thread, so pinning the
+        # to_thread argument list cannot see _collect_snapshot itself. The
+        # faithful observable is thread identity: the module-level function
+        # resolves through module globals at call time, so wrapping it here
+        # intercepts the worker-thread execution — and a sync revert (the
+        # route calling _collect_snapshot inline) would record the MAIN
+        # thread id and fail this pin.
+        main_thread = threading.get_ident()
+        collected_threads: list[int] = []
+        real_collect = activity_module._collect_snapshot
+
+        def recording_collect(*args, **kwargs):
+            collected_threads.append(threading.get_ident())
+            return real_collect(*args, **kwargs)
+
+        monkeypatch.setattr(
+            activity_module, "_collect_snapshot", recording_collect
+        )
+        route_env.seed_queue_job("wiki", VAULT_A, status="running")
+        resp = route_env.client.get(
+            "/api/activity/jobs", headers=route_env.member_headers()
+        )
+        assert resp.status_code == 200
+        assert collected_threads, (
+            "the activity route never invoked _collect_snapshot"
+        )
+        assert collected_threads != [main_thread], (
+            "the activity route ran the SQLite snapshot collection on the "
+            "event-loop thread (sync revert of the to_thread offload)"
+        )
