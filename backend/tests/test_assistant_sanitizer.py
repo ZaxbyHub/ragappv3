@@ -111,5 +111,47 @@ class TestCleanupRows(unittest.TestCase):
         self.assertEqual(second, [])
 
 
+class AnswerWrapperFenceAwarenessTest(unittest.TestCase):
+    """Review F-07: <answer> wrapper tags are stripped outside code fences but
+    a literal <answer> inside a fenced block is preserved (runtime AND the
+    startup re-sanitize migration, which would otherwise rewrite history)."""
+
+    def test_real_wrapper_tags_outside_fence_are_stripped(self):
+        self.assertEqual(
+            sanitize_assistant_content("<answer>the capital is Paris</answer>"),
+            "the capital is Paris",
+        )
+
+    def test_literal_answer_inside_backtick_fence_survives(self):
+        text = (
+            "Here is an example:\n"
+            "```xml\n"
+            "<answer>\n"
+            "  <value>42</value>\n"
+            "</answer>\n"
+            "```\n"
+            "That was the example."
+        )
+        self.assertEqual(sanitize_assistant_content(text), text)
+
+    def test_literal_answer_inside_tilde_fence_survives(self):
+        text = "~~~\n<answer>keep me</answer>\n~~~"
+        self.assertEqual(sanitize_assistant_content(text), text)
+
+    def test_wrapper_outside_fence_still_stripped_when_fence_present(self):
+        text = (
+            "<answer>real answer</answer>\n"
+            "```\n<answer>not a wrapper</answer>\n```\n"
+        )
+        cleaned = sanitize_assistant_content(text)
+        self.assertIn("real answer", cleaned)
+        self.assertIn("<answer>not a wrapper</answer>", cleaned)
+
+    def test_fence_aware_strip_is_idempotent(self):
+        text = "```\n<answer>x</answer>\n```\n<answer>y</answer>"
+        once = sanitize_assistant_content(text)
+        self.assertEqual(once, sanitize_assistant_content(once))
+
+
 if __name__ == "__main__":
     unittest.main()

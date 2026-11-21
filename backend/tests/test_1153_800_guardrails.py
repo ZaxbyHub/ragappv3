@@ -722,5 +722,108 @@ class StreamAuthClampDirectTest(unittest.TestCase):
         self.assertEqual(captured.get("vault_id"), V2)
 
 
+class StreamAuthHttpClampTest(unittest.TestCase):
+    """F-01 HTTP closure: the clamp survives the REAL FastAPI dependency wiring.
+
+    The direct-call tests prove get_stream_auth -> chat_stream propagation; this
+    drives the actual /api/chat/stream route through TestClient so a broken
+    dependency wiring (the failure mode the direct call cannot see) is caught.
+    A member with a session in V1 requesting V3 must be AUTHORIZED (clamp to the
+    stored scope) and start the SSE stream; the same member with no session and
+    vault_id=V3 must be 403 — proving the stored scope, not the requested one,
+    governs access.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self.db_path = str(Path(self._tmpdir) / "app.db")
+        init_db(self.db_path)
+        run_migrations(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self.addCleanup(self.conn.close)
+        _seed_user(self.conn, 1, "admin", "admin")
+        _seed_user(self.conn, 2, "member", "member")
+        for vid in (V1, V2, V3):
+            self.conn.execute(
+                "INSERT INTO vaults (id, name) VALUES (?, ?)", (vid, f"V{vid}")
+            )
+        self.conn.execute(
+            "INSERT INTO vault_members (vault_id, user_id, permission) "
+            "VALUES (?, 2, 'write')",
+            (V1,),
+        )
+        self.conn.execute(
+            "INSERT INTO chat_sessions (id, vault_id, title) VALUES (?, ?, 's7')",
+            (SESSION_7, V1),
+        )
+        self.conn.commit()
+        self.pool = SQLiteConnectionPool(self.db_path, max_size=3)
+        self.addCleanup(self.pool.close_all)
+        app.state.db_pool = self.pool
+        self.addCleanup(setattr, app.state, "db_pool", None)
+        app.state.rag_engine = object()
+        self.addCleanup(setattr, app.state, "rag_engine", None)
+
+        import app.api.routes.chat as chat_mod
+
+        self._captured = {}
+        from fastapi.responses import StreamingResponse
+
+        def _capture(*_a, **kwargs):
+            self._captured["vault_id"] = kwargs.get("vault_id")
+            return StreamingResponse(iter(["data: ok\n\n"]), media_type="text/event-stream")
+
+        self._orig_stream = chat_mod.stream_chat_response
+        chat_mod.stream_chat_response = _capture
+        self._orig_mode_check = chat_mod.require_mode_configured
+        chat_mod.require_mode_configured = lambda _mode: None
+
+        async def _resolve(conn, request, authorization, access_token):
+            return MEMBER_USER
+
+        self._orig_resolve = chat_mod._resolve_active_user
+        chat_mod._resolve_active_user = _resolve
+
+        self.client = TestClient(app, raise_server_exceptions=False)
+        app.dependency_overrides[get_db] = lambda: self.conn
+        self.addCleanup(app.dependency_overrides.pop, get_db, None)
+        from app.api.deps import require_model_ready
+
+        app.dependency_overrides[require_model_ready] = lambda: object()
+        self.addCleanup(app.dependency_overrides.pop, require_model_ready, None)
+        app.dependency_overrides[csrf_protect] = lambda: "t"
+        self.addCleanup(app.dependency_overrides.pop, csrf_protect, None)
+
+    def tearDown(self):
+        import app.api.routes.chat as chat_mod
+
+        chat_mod.stream_chat_response = self._orig_stream
+        chat_mod.require_mode_configured = self._orig_mode_check
+        chat_mod._resolve_active_user = self._orig_resolve
+
+    def _post(self, vault_id, session_id=None):
+        payload = {"messages": [{"role": "user", "content": "hi"}], "mode": "instant"}
+        if vault_id is not None:
+            payload["vault_id"] = vault_id
+        if session_id is not None:
+            payload["session_id"] = session_id
+        return self.client.post("/api/chat/stream", json=payload)
+
+    def test_http_member_clamped_to_stored_scope_starts_stream(self):
+        # Member, session in V1, requests V3 (no access). Clamp authorizes
+        # against V1 -> the route starts the stream, retrieval scoped to V1.
+        resp = self._post(V3, SESSION_7)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(self._captured.get("vault_id"), V1)
+
+    def test_http_member_no_session_denied_vault_403(self):
+        # Control: same member, no session, requests V3 directly -> 403 (no
+        # clamp, member has no V3 access). Proves the first leg's success is the
+        # stored-scope clamp, not an open hole.
+        resp = self._post(V3)
+        self.assertEqual(resp.status_code, 403, resp.text)
+
+
 if __name__ == "__main__":
     unittest.main()

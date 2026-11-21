@@ -48,6 +48,43 @@ _THINKING_PROCESS_PREFIX_RE = re.compile(
 _ANSWER_WRAPPER_OPEN_RE = re.compile(r"<answer\b[^>]*>", re.IGNORECASE)
 _ANSWER_WRAPPER_CLOSE_RE = re.compile(r"</answer\s*>", re.IGNORECASE)
 
+# A fenced code block: an opening fence of >=3 backticks or >=3 tildes (with an
+# optional info string), up to a matching closing fence of the SAME marker
+# character and at least as long. Used to keep literal markup inside code
+# examples untouched when stripping ``<answer>`` wrapper tags.
+_FENCE_RE = re.compile(
+    r"(^[ \t]*(`{3,}|~{3,})[^\n]*\n"  # opening fence line
+    r"(?:.*\n)*?"  # block body (non-greedy)
+    r"^[ \t]*\2[ \t]*(?:\n|\Z))",  # closing fence (same marker), EOF-tolerant
+    re.MULTILINE,
+)
+
+
+def _strip_answer_wrappers_outside_code_fences(text: str) -> str:
+    """Strip ``<answer>``/``</answer>`` wrapper tags only in non-fenced text.
+
+    A literal ``<answer>`` inside a fenced code block (an XML/HTML example, a
+    documentation snippet) is real content and must survive — both at runtime
+    and in the startup re-sanitize migration, which would otherwise
+    permanently rewrite historical messages. Only the wrapper tags outside
+    fences are removed (issue #1153 AC1).
+    """
+    parts: List[str] = []
+    last = 0
+    for match in _FENCE_RE.finditer(text):
+        parts.append(text[last:match.start()])  # non-fenced text before the fence
+        parts.append(match.group(0))  # the fenced block, left untouched
+        last = match.end()
+    parts.append(text[last:])  # trailing non-fenced text
+    stripped: List[str] = []
+    for index, part in enumerate(parts):
+        if index % 2 == 0:  # even index == non-fenced segment
+            part = _ANSWER_WRAPPER_CLOSE_RE.sub(
+                "", _ANSWER_WRAPPER_OPEN_RE.sub("", part)
+            )
+        stripped.append(part)
+    return "".join(stripped)
+
 
 def sanitize_assistant_content(content: str) -> str:
     """Return ``content`` with all known thinking-content patterns stripped.
@@ -85,9 +122,9 @@ def sanitize_assistant_content(content: str) -> str:
     out = _THINKING_PROCESS_PREFIX_RE.sub("", out)
     # 6. Answer wrapper TAGS — strip the delimiters, keep the inner answer
     #    (issue #1153 AC1: the tags reached persisted/returned content on a
-    #    deployed build). Idempotent: a second pass finds no tags.
-    out = _ANSWER_WRAPPER_OPEN_RE.sub("", out)
-    out = _ANSWER_WRAPPER_CLOSE_RE.sub("", out)
+    #    deployed build). Fenced-code-aware so a literal ``<answer>`` inside a
+    #    code example is not corrupted (review F-07); idempotent.
+    out = _strip_answer_wrappers_outside_code_fences(out)
 
     return out.strip()
 

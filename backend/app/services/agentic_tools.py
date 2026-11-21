@@ -208,6 +208,23 @@ class RetrievalTool(AgenticTool):
                 indexed_file_ids=None,
             )
 
+            # AC8 (issue #800): snapshot the answer-time files.file_hash onto
+            # each source, same write-once enrichment the standard path runs in
+            # rag_engine._serialize_source_candidates. The agentic path builds
+            # sources here directly, so it must enrich them too — otherwise
+            # agentic report/case provenance carries no hash.
+            from app.services.document_retrieval import attach_file_hashes
+            from app.services.rag_engine import _get_pool
+
+            try:
+                pool = _get_pool()
+                with pool.connection() as conn:
+                    attach_file_hashes(relevant_chunks, conn)
+            except Exception as exc:  # noqa: BLE001 — enrichment must never break the turn
+                logging.getLogger(__name__).debug(
+                    "agentic file-hash enrichment skipped: %s", exc
+                )
+
             sources = []
             for idx, chunk in enumerate(relevant_chunks):
                 src = engine.document_retrieval.to_source_metadata(
