@@ -394,10 +394,6 @@ class TestCreateUserEndpoint(unittest.TestCase):
         app = FastAPI()
         app.include_router(users_router)
 
-        # Patch get_pool to return test pool
-        from app.api.routes import users
-        users.get_pool = lambda path: self.test_pool
-
         # Override deps
         from app.api import deps
 

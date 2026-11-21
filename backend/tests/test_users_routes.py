@@ -83,9 +83,7 @@ class TestUserRoutes:
             finally:
                 test_pool.release_connection(conn)
 
-        # Patch get_pool in users module to return our test pool
         from app.api.routes import users
-        users.get_pool = lambda path: test_pool
 
         app.dependency_overrides[deps.get_db] = override_get_db
 
@@ -117,8 +115,6 @@ class TestUserRoutes:
         _pool_cache.clear()
         self.conn.close()
 
-        # Restore original get_pool
-        from app.api.routes import users
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret

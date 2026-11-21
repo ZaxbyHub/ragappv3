@@ -162,12 +162,9 @@ class TestUserOrganizationsScopedAccess:
             finally:
                 test_pool.release_connection(conn)
 
-        # Patch get_pool in users module to return our test pool
-        from app.api.routes import users
-        users.get_pool = lambda path: test_pool
-
         # Also patch deps.get_pool for evaluate_policy
         from app.api import deps
+        from app.api.routes import users
 
         original_deps_pool = deps.get_pool
         deps.get_pool = lambda path: test_pool
@@ -192,7 +189,6 @@ class TestUserOrganizationsScopedAccess:
         # Restore settings
         _app_settings.users_enabled = self._prev_users_enabled
 
-        # Restore original get_pool
         deps.get_pool = self.original_deps_pool
 
         # Clean up temp directory

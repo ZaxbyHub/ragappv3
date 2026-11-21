@@ -64,6 +64,11 @@ the application stack (uvicorn's duplicate access log is now disabled).
   access-logged — the middleware registration order changed so the logging
   middleware wraps the maintenance and rate-limit layers; this blind spot
   remains for invalid-Host 400s and unhandled 500s only.)*
+  *(Superseded again in part by #1179: unhandled 500s now emit an
+  `http_request` record — the logging middleware's exception arm logs
+  status_code 500 before re-raising; the blind spot remains for
+  invalid-Host 400s and CORS preflight only, and 500 responses still carry
+  no `X-Request-ID` header.)*
 
 - The recurrence census (trace `08a`) routes a wider same-class family to
   a follow-up issue: provider bodies composed into raised

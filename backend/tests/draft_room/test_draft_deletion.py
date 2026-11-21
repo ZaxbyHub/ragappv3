@@ -827,25 +827,26 @@ class TestUserDeleteWiresDraftRoomPurge(DraftRouteWiringTestBase):
         transaction to fail AFTER the purge has already tombstoned files. The
         user row, its drafts, and their input files must all survive intact.
 
-        ``delete_user`` fetches its connection via ``get_pool`` directly
-        (not the ``get_db`` dependency the vault route uses), so the failure
-        is injected by patching ``app.api.routes.users.get_pool`` to hand
-        back a ``_FailingCommitPool`` wrapping the real pool for this one
-        request, instead of overriding ``get_db``.
+        ``delete_user`` takes its connection from the request-scoped
+        ``get_db`` dependency (#798 AC4), which this harness overrides with
+        ``override_get_db`` serving from ``self._connection_pool`` — so the
+        failure is injected by swapping that pool for a
+        ``_FailingCommitPool`` wrapper for the duration of the one request
+        (``override_get_db`` resolves the attribute at call time, and its
+        ``finally`` releases through the same wrapper).
         """
         draft_a, input_a = self._make_draft_with_input(owner_id=200, vault_id=501)
         content = self.storage.resolve(input_a.storage_relpath).read_bytes()
 
-        from app.models.database import get_pool as real_get_pool
-
-        real_pool = real_get_pool(str(settings.sqlite_path))
-        failing_pool = _FailingCommitPool(real_pool)
-
-        with patch("app.api.routes.users.get_pool", return_value=failing_pool):
+        real_pool = self._connection_pool
+        self._connection_pool = _FailingCommitPool(real_pool)
+        try:
             resp = self.client.delete(
                 "/api/users/200",
                 headers=self._headers(100, "root-admin", "superadmin"),
             )
+        finally:
+            self._connection_pool = real_pool
 
         self.assertEqual(resp.status_code, 500, resp.text)
 

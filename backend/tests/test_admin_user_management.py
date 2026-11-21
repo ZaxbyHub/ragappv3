@@ -87,7 +87,6 @@ class TestUpdateUser:
             finally:
                 test_pool.release_connection(conn)
 
-        # Patch get_pool in users module to return our test pool
         from app.api.routes import users
 
         app.dependency_overrides[deps.get_db] = override_get_db
@@ -112,7 +111,6 @@ class TestUpdateUser:
         _pool_cache.clear()
         self.conn.close()
 
-        # Restore original get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -334,7 +332,6 @@ class TestAdminResetPassword:
             finally:
                 test_pool.release_connection(conn)
 
-        # Patch get_pool in users module to return our test pool
         from app.api.routes import users
 
         app.dependency_overrides[deps.get_db] = override_get_db
@@ -359,7 +356,6 @@ class TestAdminResetPassword:
         _pool_cache.clear()
         self.conn.close()
 
-        # Restore original get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -557,7 +553,6 @@ class TestUpdateUserActiveStatus:
             finally:
                 test_pool.release_connection(conn)
 
-        # Patch get_pool in users module to return our test pool
         from app.api.routes import users
 
         app.dependency_overrides[deps.get_db] = override_get_db
@@ -582,7 +577,6 @@ class TestUpdateUserActiveStatus:
         _pool_cache.clear()
         self.conn.close()
 
-        # Restore original get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -810,7 +804,6 @@ class TestActiveStatusWithMultipleAdmins:
             finally:
                 test_pool.release_connection(conn)
 
-        # Patch get_pool in users module to return our test pool
         from app.api.routes import users
 
         app.dependency_overrides[deps.get_db] = override_get_db
@@ -835,7 +828,6 @@ class TestActiveStatusWithMultipleAdmins:
         _pool_cache.clear()
         self.conn.close()
 
-        # Restore original get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
