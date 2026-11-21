@@ -89,7 +89,7 @@ describe("useSendMessage issue #553 server-side durable turn wiring", () => {
 
   it("passes the session id and the client turn id on the stream request", async () => {
     await act(async () => {
-      useChatStore.setState({ activeChatId: "42", input: "question" });
+      useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "question" });
     });
     installStream();
 

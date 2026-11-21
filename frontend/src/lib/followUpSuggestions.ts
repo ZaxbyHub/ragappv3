@@ -1,8 +1,10 @@
 // frontend/src/lib/followUpSuggestions.ts
-// Issue #573 (AC1): derive 2-3 short suggested next questions for a completed
-// assistant turn from the context that turn ALREADY retrieved (its sources)
-// plus the user's own question — deterministic, no LLM call, and crucially no
-// new retrieval call (the issue's constraint).
+// Issue #573 (AC1) / #1153 AC6: derive 2-3 short suggested next questions for
+// a completed assistant turn from the context that turn ALREADY produced
+// (its answer text and its sources) — deterministic, no LLM call, and
+// crucially no new retrieval call (the issue's constraint). The topic comes
+// from the ASSISTANT ANSWER (issue #1153 AC6): the answer names what the
+// turn actually established, while the user question names what was asked.
 
 /** Interrogatives/fillers stripped from the front of the user query so the
  * topic embeds grammatically ("…risks around the coolant interval"). */
@@ -39,9 +41,11 @@ function capAtWordBoundary(text: string, max: number): string {
   return out || text;
 }
 
-/** Trim to a short topic phrase suitable for embedding in a question. */
-function topicFrom(userContent: string): string {
-  const cleaned = userContent
+/** Trim to a short topic phrase suitable for embedding in a question.
+ * Issue #1153 AC6: the input is the ASSISTANT ANSWER text — the topic must
+ * name what the turn established, not what the user asked. */
+function topicFrom(assistantAnswer: string): string {
+  const cleaned = assistantAnswer
     .replace(/\s+/g, " ")
     .replace(/[?.!]+\s*$/, "")
     .trim()
@@ -81,14 +85,16 @@ function truncate(text: string, max: number): string {
 }
 
 /**
- * Derive follow-up suggestions from the turn's already-retrieved context.
- * Returns 0-3 strings; empty when there is nothing to work from.
+ * Derive follow-up suggestions from the turn's already-produced context.
+ * Issue #1153 AC6: the FIRST argument is the assistant ANSWER text (the
+ * topic source); source titles ground the comparison suggestions. Returns
+ * 0-3 strings; empty when there is nothing to work from.
  */
 export function deriveFollowUps(
-  userContent: string,
+  assistantContent: string,
   sourceTitles: string[]
 ): string[] {
-  const topic = topicFrom(userContent ?? "");
+  const topic = topicFrom(assistantContent ?? "");
   const titles = (sourceTitles ?? [])
     .map((t) => (typeof t === "string" ? t.trim() : ""))
     .filter((t) => t.length > 0)

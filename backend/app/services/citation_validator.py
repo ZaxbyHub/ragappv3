@@ -389,12 +389,72 @@ def _jaccard(tokens_a: Set[str], tokens_b: Set[str]) -> float:
 # -------------------------------------------------------------------------- #
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 
+#: A standalone ordered/unordered list marker fragment: digits, a single
+#: letter, or a roman numeral followed by ``.`` or ``)`` (issue #1153 AC2 —
+#: such fragments are sentence-splitters' artifacts, never claims).
+_LIST_MARKER_RE = re.compile(r"^(?:\d{1,3}|[a-z]|[ivxlcdm]{1,5})[.)]$", re.IGNORECASE)
+#: The same marker dangling at the END of a fragment (a lead-in line such as
+#: "Consider these findings:\n1." keeps its sentence text but the marker tail
+#: belongs to the FOLLOWING list sentence).
+_TRAILING_MARKER_RE = re.compile(r"\n((?:\d{1,3}|[a-z]|[ivxlcdm]{1,5})[.)])\s*$", re.IGNORECASE)
+
+
+def _merge_list_markers(fragments: List[str]) -> List[str]:
+    """Fold sentence-splitter list-marker artifacts into their list sentences.
+
+    ``_SENTENCE_RE`` splits after ``.``+whitespace, so an ordered list item
+    ("1. Zebras migrate.") yields a standalone ``"1."`` fragment, and a
+    lead-in line ending in ":\n1." keeps the marker dangling on the header
+    fragment. Both are artifacts of splitting, not claims: a standalone
+    marker is prepended to the following fragment, and a dangling marker
+    tail is detached from its header and likewise prepended. Sentence text
+    itself is never dropped or reordered (issue #1153 AC2).
+    """
+    out: List[str] = []
+    pending_prefix = ""
+    for fragment in fragments:
+        piece = fragment
+        # Detach a marker tail dangling on the current fragment first — the
+        # detached marker belongs to the NEXT fragment, not this one.
+        tail_match = _TRAILING_MARKER_RE.search(piece)
+        if tail_match:
+            pending_prefix = (
+                tail_match.group(1) + " " + pending_prefix
+            ).strip()
+            piece = piece[: tail_match.start()].rstrip()
+            if not piece:
+                continue
+            # The current piece keeps its sentence text WITHOUT the marker.
+            out.append(piece)
+            continue
+        if _LIST_MARKER_RE.match(piece):
+            # Standalone marker: prepend to the next real fragment.
+            pending_prefix = (piece + " " + pending_prefix).strip()
+            continue
+        if pending_prefix:
+            out.append(pending_prefix + " " + piece)
+            pending_prefix = ""
+        else:
+            out.append(piece)
+    if pending_prefix and out:
+        # A trailing marker with nothing after it: keep it attached to the
+        # last sentence rather than dropping content.
+        out[-1] = (out[-1] + " " + pending_prefix).strip()
+    elif pending_prefix:
+        out.append(pending_prefix)
+    return out
+
 
 def _split_sentences(text: str) -> List[str]:
-    """Split text into sentence strings, stripping leading whitespace."""
+    """Split text into sentence strings, stripping leading whitespace.
+
+    List-marker artifacts are folded back into their list sentences so every
+    returned sentence is a whole claim (issue #1153 AC2).
+    """
     if not text:
         return []
-    return [s.strip() for s in _SENTENCE_RE.split(text) if s.strip()]
+    raw = [s.strip() for s in _SENTENCE_RE.split(text) if s.strip()]
+    return _merge_list_markers(raw)
 
 
 # -------------------------------------------------------------------------- #

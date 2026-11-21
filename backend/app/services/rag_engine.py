@@ -44,6 +44,7 @@ from app.services.document_retrieval import (
     DocumentRetrievalService,
     RAGSource,
     artifact_fields_from_metadata,
+    attach_file_hashes,
     source_dedup_key,
 )
 from app.services.embeddings import EmbeddingError, EmbeddingService
@@ -3930,7 +3931,36 @@ class RAGEngine:
     ) -> List[Dict[str, Any]]:
         """Serialize chunks exactly as done.sources does: to_source_metadata
         with 1-based source labels. evidence_type is NOT set here; it is a
-        done-time distinction assigned only to final sources."""
+        done-time distinction assigned only for final sources.
+
+        Issue #800 AC8 (F13d/F13e): the answer-time ``files.file_hash``
+        snapshot is attached HERE — the final-source serialization seam both
+        the candidates payload and the done sources flow through, after
+        filtering/window expansion by construction. ``attach_file_hashes``
+        is write-once per chunk, so the second serialization (done sources)
+        can never refresh a snapshot the first (candidates) took before a
+        files-table replacement.
+
+        The enrichment is ONE batched SELECT (an IN clause over the final
+        chunk list's distinct file ids), executed synchronously. An earlier
+        revision dispatched it via ``run_in_executor(...).result()`` when a
+        loop was running — that returns an asyncio Future whose ``.result()``
+        raises ``InvalidStateError`` inside a running loop, silently stamping
+        every chunk with the permanent None missing-marker (final-critic
+        round 1); a synchronous bounded query is correct in every context
+        this sync method is invoked from.
+        """
+        try:
+            pool = _get_pool()
+            with pool.connection() as conn:
+                attach_file_hashes(relevant_chunks, conn)
+        except Exception as exc:  # noqa: BLE001 — defensive
+            # Enrichment must never break serialization: unenriched chunks
+            # keep the explicit missing-marker (None) instead.
+            logger.debug("file-hash enrichment skipped: %s", exc)
+            for chunk in relevant_chunks:
+                if "_file_hash" not in chunk.metadata:
+                    chunk.metadata["_file_hash"] = None
         return [
             self.document_retrieval.to_source_metadata(chunk, source_index=idx + 1)
             for idx, chunk in enumerate(relevant_chunks)

@@ -34,6 +34,7 @@ const mockChatState = vi.hoisted(() => ({
   inputError: null as string | null,
   expandedSources: new Set<string>(),
   activeChatId: null as string | null,
+  activeSessionVaultId: null as number | null,
   abortFn: null,
   pendingTurnPersist: null as Promise<void> | null,
   setInput: vi.fn(),
@@ -205,6 +206,7 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
     mockChatState.streamingMessageId = null;
     mockChatState.inputError = null;
     mockChatState.activeChatId = null;
+    mockChatState.activeSessionVaultId = null;
     // PRR-003: no in-flight durable turn save unless a test installs one.
     mockChatState.pendingTurnPersist = null;
     mockChatState.setInput = vi.fn();
@@ -237,6 +239,7 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
     // content (kmsRefs/mode survive the mapper, UI-039).
     mockChatState.loadChat = vi.fn((chatId: string, messages: any[]) => {
       mockChatState.activeChatId = chatId;
+      mockChatState.activeSessionVaultId = 1;
       mockChatState.messageIds = messages.map((m) => m.id);
       mockChatState.messagesById = Object.fromEntries(messages.map((m) => [m.id, m]));
     });
@@ -255,6 +258,7 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
 
   it("retry truncates the persisted history at the LAST user message before trimming the store, then sends directly", async () => {
     mockChatState.activeChatId = "77";
+      mockChatState.activeSessionVaultId = 1;
     // Durable seq on every row: the truncate anchor is the max seq among the
     // KEPT rows (m1/m2 → seq 2), not a positional count (PRR-020).
     setMockMessages([
@@ -306,6 +310,7 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
     // but the kept rows (m1/m2) have NO durable seq — the server anchor must be
     // 0 (keep nothing durable), never the stale positional 2.
     mockChatState.activeChatId = "77";
+      mockChatState.activeSessionVaultId = 1;
     setMockMessages([
       { id: "m1", role: "user", content: "first question" },
       { id: "m2", role: "assistant", content: "first answer" },
@@ -337,6 +342,7 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
 
   it("retry waits for the in-flight durable turn save before truncating (PRR-003)", async () => {
     mockChatState.activeChatId = "77";
+      mockChatState.activeSessionVaultId = 1;
     setMockMessages([
       { id: "m1", role: "user", content: "first question", seq: 1 },
       { id: "m2", role: "assistant", content: "first answer", seq: 2 },
@@ -367,6 +373,7 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
 
   it("edit truncates the persisted history at the edited message's own index before trimming the store", async () => {
     mockChatState.activeChatId = "77";
+      mockChatState.activeSessionVaultId = 1;
     const mockSetInput = vi.fn();
     mockChatState.setInput = mockSetInput;
     setMockMessages([
@@ -402,6 +409,7 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
 
   it("keeps the local transcript intact and toasts when truncateChatSession rejects", async () => {
     mockChatState.activeChatId = "77";
+      mockChatState.activeSessionVaultId = 1;
     const mockSetInput = vi.fn();
     mockChatState.setInput = mockSetInput;
     setMockMessages([
@@ -428,6 +436,7 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
 
   it("fork maps the response through mapSessionMessage so kmsRefs and mode reach the store (UI-039)", async () => {
     mockChatState.activeChatId = "77";
+      mockChatState.activeSessionVaultId = 1;
     setMockMessages([
       { id: "m1", role: "user", content: "Question", seq: 1 },
       { id: "m2", role: "assistant", content: "Answer", seq: 2 },
@@ -472,7 +481,8 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
       expect.arrayContaining([
         expect.objectContaining({ id: "101", role: "user" }),
         expect.objectContaining({ id: "102" }),
-      ])
+      ]),
+      1
     );
 
     // The store adopted the MAPPED messages — snake_case api fields must not
@@ -498,6 +508,7 @@ describe("TranscriptPane persisted terminal status banner (issue #507)", () => {
     mockChatState.streamingMessageId = null;
     mockChatState.inputError = null;
     mockChatState.activeChatId = null;
+    mockChatState.activeSessionVaultId = null;
     mockChatState.pendingTurnPersist = null;
     mockChatState.removeMessagesFrom = vi.fn();
     mockChatState.loadChat = vi.fn();

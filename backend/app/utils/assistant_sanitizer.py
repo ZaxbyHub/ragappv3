@@ -9,6 +9,8 @@ persisted in chat history. It handles four distinct patterns:
 3. Standard ``<think>...</think>`` thinking blocks (gpt-oss-120b and others).
 4. ``Thinking Process:`` followed by a ``</think>`` close even without an
    opening tag (defensive — fragmented streams may emit just the close).
+5. ``<answer>`` / ``</answer>`` wrapper TAGS (content preserved — the inner
+   text is the answer; issue #1153 AC1).
 
 All functions are idempotent: calling them twice on already-sanitized text
 returns the same result.
@@ -38,6 +40,13 @@ _THINKING_PROCESS_BLOCK_RE = re.compile(
 _THINKING_PROCESS_PREFIX_RE = re.compile(
     r"^Thinking Process:[^\n]*\n", re.IGNORECASE
 )
+# Answer wrapper TAGS (issue #1153 AC1): some models wrap the final answer in
+# ``<answer>...</answer>`` elements. Unlike thinking blocks (removed with their
+# content), only the TAGS are stripped — the inner text IS the answer. Matches
+# openers with attributes and any casing; the pair need not be balanced on this
+# pass (a lone closer is equally stripped), and the pass is idempotent.
+_ANSWER_WRAPPER_OPEN_RE = re.compile(r"<answer\b[^>]*>", re.IGNORECASE)
+_ANSWER_WRAPPER_CLOSE_RE = re.compile(r"</answer\s*>", re.IGNORECASE)
 
 
 def sanitize_assistant_content(content: str) -> str:
@@ -74,6 +83,11 @@ def sanitize_assistant_content(content: str) -> str:
     out = _UNTERMINATED_THINK_TAIL_RE.sub("", out)
     # 5. Leading "Thinking Process:" line without a close — defensive last pass
     out = _THINKING_PROCESS_PREFIX_RE.sub("", out)
+    # 6. Answer wrapper TAGS — strip the delimiters, keep the inner answer
+    #    (issue #1153 AC1: the tags reached persisted/returned content on a
+    #    deployed build). Idempotent: a second pass finds no tags.
+    out = _ANSWER_WRAPPER_OPEN_RE.sub("", out)
+    out = _ANSWER_WRAPPER_CLOSE_RE.sub("", out)
 
     return out.strip()
 

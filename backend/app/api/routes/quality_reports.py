@@ -53,15 +53,19 @@ def _config_ref() -> str:
 
     Cached per process: the underlying git/env lookup is a subprocess we do
     not want per request. Never empty (falls back through env vars to a
-    literal 'unknown' marker).
+    literal 'unknown' marker). Only SUCCESSFUL lookups are cached (issue
+    #800 AC4): a transient ``None`` returns the 'unknown' marker without
+    poisoning the cache, so the next call retries the lookup.
     """
     if "value" in _release_id_cache:
         return _release_id_cache["value"]
     from app.services.eval_adapter import _get_release_id
 
-    value = _get_release_id() or "unknown"
-    _release_id_cache["value"] = value
-    return value
+    value = _get_release_id()
+    if value:
+        _release_id_cache["value"] = value
+        return value
+    return "unknown"
 
 
 def _source_file_hashes(raw_sources: Optional[str]) -> List[str]:
@@ -209,32 +213,63 @@ async def submit_quality_report(
             status_code=404, detail="Message not found in this session"
         )
 
-    config_ref = _config_ref()
+    config_ref = await asyncio.to_thread(_config_ref)
     # msg_row columns (positional): 0=id, 1=turn_id, 2=seq, 3=sources
     file_hashes_json = json.dumps(_source_file_hashes(msg_row[3]))
-    cursor = await asyncio.to_thread(
+    # Idempotent submit (issue #800 AC2): the retry identity is
+    # (message_id, category) — a retried POST of the same report returns the
+    # existing row; independent reports (different message or category) are
+    # never suppressed (the September reconstruction constraint). The
+    # pre-SELECT plus unique index close the concurrent window: a racing
+    # winner that committed between the SELECT and the INSERT surfaces as
+    # IntegrityError, and the recovery rolls back and re-selects the winner.
+    existing_result = await asyncio.to_thread(
         conn.execute,
-        "INSERT INTO quality_reports (session_id, message_id, category, note, "
-        "turn_id, seq, config_ref, source_file_hashes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            body.session_id,
-            body.message_id,
-            body.category,
-            body.note,
-            msg_row[1],
-            msg_row[2],
-            config_ref,
-            file_hashes_json,
-        ),
+        "SELECT * FROM quality_reports "
+        "WHERE message_id = ? AND category = ? ORDER BY id ASC LIMIT 1",
+        (body.message_id, body.category),
     )
-    await asyncio.to_thread(conn.commit)
-
-    row_result = await asyncio.to_thread(
-        conn.execute,
-        "SELECT * FROM quality_reports WHERE id = ?",
-        (cursor.lastrowid,),
-    )
-    row = await asyncio.to_thread(row_result.fetchone)
+    existing_row = await asyncio.to_thread(existing_result.fetchone)
+    if existing_row is not None:
+        return _report_row_to_dict(existing_row)
+    try:
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            "INSERT INTO quality_reports (session_id, message_id, category, note, "
+            "turn_id, seq, config_ref, source_file_hashes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                body.session_id,
+                body.message_id,
+                body.category,
+                body.note,
+                msg_row[1],
+                msg_row[2],
+                config_ref,
+                file_hashes_json,
+            ),
+        )
+        await asyncio.to_thread(conn.commit)
+    except sqlite3.IntegrityError:
+        # A concurrent submission of the same identity won the race (unique
+        # index). Roll the failed statement back and return the winner.
+        await asyncio.to_thread(conn.rollback)
+        winner_result = await asyncio.to_thread(
+            conn.execute,
+            "SELECT * FROM quality_reports "
+            "WHERE message_id = ? AND category = ? ORDER BY id ASC LIMIT 1",
+            (body.message_id, body.category),
+        )
+        winner_row = await asyncio.to_thread(winner_result.fetchone)
+        if winner_row is None:
+            raise
+        row = winner_row
+    else:
+        row_result = await asyncio.to_thread(
+            conn.execute,
+            "SELECT * FROM quality_reports WHERE id = ?",
+            (cursor.lastrowid,),
+        )
+        row = await asyncio.to_thread(row_result.fetchone)
     logger.info(
         "Quality report %s submitted (category=%s, session=%s, message=%s)",
         row[0], body.category, body.session_id, body.message_id,
@@ -277,7 +312,7 @@ async def convert_report_to_eval_case(
 
     report_result = await asyncio.to_thread(
         conn.execute,
-        "SELECT id, session_id, message_id, turn_id, config_ref, "
+        "SELECT id, session_id, message_id, turn_id, seq, config_ref, "
         "source_file_hashes FROM quality_reports WHERE id = ?",
         (report_id,),
     )
@@ -285,15 +320,74 @@ async def convert_report_to_eval_case(
     if report is None:
         raise HTTPException(status_code=404, detail="Quality report not found")
 
-    # The case's query is the turn's user message (matched by turn_id).
-    query_result = await asyncio.to_thread(
+    # Idempotent convert (issue #800 AC3): one case per report — a retried
+    # convert returns the existing case; the unique index plus IntegrityError
+    # recovery close the concurrent window the same way submit does.
+    existing_case_result = await asyncio.to_thread(
         conn.execute,
-        "SELECT content FROM chat_messages "
-        "WHERE session_id = ? AND turn_id = ? AND role = 'user' "
-        "ORDER BY seq ASC, id ASC LIMIT 1",
-        (report[1], report[3]),
+        "SELECT id, report_id, query, expected_outcome, provenance "
+        "FROM quality_eval_cases WHERE report_id = ? ORDER BY id ASC LIMIT 1",
+        (report_id,),
     )
-    query_row = await asyncio.to_thread(query_result.fetchone)
+    existing_case = await asyncio.to_thread(existing_case_result.fetchone)
+    if existing_case is not None:
+        return {
+            "id": existing_case[0],
+            "report_id": existing_case[1],
+            "query": existing_case[2],
+            "expected_outcome": existing_case[3],
+            "provenance": json.loads(existing_case[4] or "{}"),
+        }
+
+    # The case's query is the turn's user message. Primary match: the
+    # stored turn_id. Fallback for legacy/migrated sessions whose rows carry
+    # NULL turns (issue #800 AC1): strict seq adjacency — the user row at
+    # the greatest seq strictly below the assistant row's seq with NO other
+    # message row between them. Any other NULL-turn shape (no preceding user
+    # row, a gap, an intervening row, or NULL ordering on either side) is
+    # unresolvable ambiguity and is refused without inserting a case.
+    query_row = None
+    user_message_id: Optional[int] = None
+    user_seq: Optional[int] = None
+    if report[3] is not None:
+        query_result = await asyncio.to_thread(
+            conn.execute,
+            "SELECT content, id, seq FROM chat_messages "
+            "WHERE session_id = ? AND turn_id = ? AND role = 'user' "
+            "ORDER BY seq ASC, id ASC LIMIT 1",
+            (report[1], report[3]),
+        )
+        query_row = await asyncio.to_thread(query_result.fetchone)
+        if query_row is not None:
+            user_message_id = query_row[1]
+            user_seq = query_row[2]
+    else:
+        report_seq_result = await asyncio.to_thread(
+            conn.execute,
+            "SELECT seq FROM chat_messages WHERE id = ?",
+            (report[2],),
+        )
+        report_seq_row = await asyncio.to_thread(report_seq_result.fetchone)
+        if report_seq_row is not None and report_seq_row[0] is not None:
+            adjacency_result = await asyncio.to_thread(
+                conn.execute,
+                "SELECT content, id, seq FROM chat_messages "
+                "WHERE session_id = ? AND role = 'user' AND seq < ? "
+                "ORDER BY seq DESC, id DESC LIMIT 1",
+                (report[1], report_seq_row[0]),
+            )
+            candidate = await asyncio.to_thread(adjacency_result.fetchone)
+            if candidate is not None:
+                # Refuse unless the candidate is NUMERICALLY adjacent: the
+                # user row must sit at assistant_seq - 1. This is stricter
+                # than counting intervening rows — a deleted middle row
+                # leaves a numeric gap that is exactly the ambiguity the
+                # plan refuses (05-fix-plan.md F12b: "Any other shape (gap,
+                # intervening row...) -> 404 refusal, no insert").
+                if candidate[2] == report_seq_row[0] - 1:
+                    query_row = candidate
+                    user_message_id = candidate[1]
+                    user_seq = candidate[2]
     if query_row is None:
         raise HTTPException(
             status_code=404,
@@ -301,24 +395,47 @@ async def convert_report_to_eval_case(
         )
 
     provenance = {
-        "config_ref": report[4],
-        "source_file_hashes": json.loads(report[5] or "[]"),
+        "config_ref": report[5],
+        "source_file_hashes": json.loads(report[6] or "[]"),
         "session_id": report[1],
         "message_id": report[2],
         "turn_id": report[3],
+        "user_message_id": user_message_id,
+        "user_seq": user_seq,
     }
-    cursor = await asyncio.to_thread(
-        conn.execute,
-        "INSERT INTO quality_eval_cases (report_id, query, expected_outcome, "
-        "provenance) VALUES (?, ?, ?, ?)",
-        (
-            report_id,
-            query_row[0],
-            body.expected_outcome,
-            json.dumps(provenance, sort_keys=True),
-        ),
-    )
-    await asyncio.to_thread(conn.commit)
+    try:
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            "INSERT INTO quality_eval_cases (report_id, query, expected_outcome, "
+            "provenance) VALUES (?, ?, ?, ?)",
+            (
+                report_id,
+                query_row[0],
+                body.expected_outcome,
+                json.dumps(provenance, sort_keys=True),
+            ),
+        )
+        await asyncio.to_thread(conn.commit)
+    except sqlite3.IntegrityError:
+        # A concurrent convert of the same report won the race (unique
+        # index). Roll back and return the winner's case.
+        await asyncio.to_thread(conn.rollback)
+        winner_case_result = await asyncio.to_thread(
+            conn.execute,
+            "SELECT id, report_id, query, expected_outcome, provenance "
+            "FROM quality_eval_cases WHERE report_id = ? ORDER BY id ASC LIMIT 1",
+            (report_id,),
+        )
+        winner_case = await asyncio.to_thread(winner_case_result.fetchone)
+        if winner_case is None:
+            raise
+        return {
+            "id": winner_case[0],
+            "report_id": winner_case[1],
+            "query": winner_case[2],
+            "expected_outcome": winner_case[3],
+            "provenance": json.loads(winner_case[4] or "{}"),
+        }
 
     case_result = await asyncio.to_thread(
         conn.execute,

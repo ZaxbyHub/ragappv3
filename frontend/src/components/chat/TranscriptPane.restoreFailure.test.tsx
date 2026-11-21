@@ -218,7 +218,7 @@ describe("TranscriptPane restore failure (issue #684 review F-006)", () => {
       seedRow(3, "user", "question-2", 3),
       seedRow(4, "assistant", "answer-2", 4),
     ];
-    useChatStore.getState().loadChat("42", server.rows.map(mapSessionMessage));
+    useChatStore.getState().loadChat("42", server.rows.map(mapSessionMessage), 7);
 
     // Replacement stream rejected at the admission gate before any content —
     // the real parser consumes the frame so the restore gate fires.

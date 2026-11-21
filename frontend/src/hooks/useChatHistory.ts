@@ -63,7 +63,8 @@ export function useChatHistory(activeVaultId: number | null): UseChatHistoryRetu
       // every issue-#507 field (kmsRefs/mode/turnId/status/assessment), so any
       // future consumer of this hook would silently lose them on replay.
       const loadedMessages: Message[] = (detail.messages ?? []).map(mapSessionMessage);
-      useChatStore.getState().loadChat(session.id.toString(), loadedMessages);
+      // Issue #1153 AC5: bind the session's stored vault scope atomically.
+      useChatStore.getState().loadChat(session.id.toString(), loadedMessages, detail.vault_id);
     } catch (err) {
       console.error("Failed to load chat session:", err);
     }

@@ -380,6 +380,63 @@ export function useSendMessage(
 
       if (currentState.activeChatId) {
         sessionId = parseInt(currentState.activeChatId);
+        // Issue #1153 AC5 (F5c): the STORED vault scope of the active
+        // session is authoritative for follow-ups — a mid-conversation
+        // global vault switch must never re-scope an existing session.
+        // The scope was bound atomically at load/create/fork time; an
+        // unbound existing session (legacy path that lost the binding)
+        // blocks loudly instead of silently sending the global scope.
+        const storedScope = useChatStore.getState().activeSessionVaultId;
+        if (typeof storedScope === "number") {
+          sendVaultId = storedScope;
+        } else {
+          // Unbound existing session (legacy in-flight session from before
+          // this deploy): REFETCH the stored scope and BLOCK loudly when it
+          // cannot be resolved — an existing session never sends an
+          // unresolved or globally-scoped vault (issue #1153 AC5, F5c; the
+          // backend clamp is defense in depth, not a substitute).
+          try {
+            const api = await import("@/lib/api");
+            if (typeof api.getChatSession !== "function") {
+              throw new Error("session detail unavailable");
+            }
+            const detail = await api.getChatSession(sessionId);
+            // Per-send ownership (review 4.5 round 3): BOTH the send
+            // generation and the active session must still be ours before
+            // ANY store mutation — a stop-and-resend in the same session
+            // bumps the generation, so the stale lookup rebinds nothing.
+            if (
+              sendGenRef.current === gen &&
+              useChatStore.getState().activeChatId === sessionId.toString()
+            ) {
+              useChatStore
+                .getState()
+                .bindSession?.(sessionId.toString(), detail.vault_id ?? null);
+            }
+            if (typeof detail.vault_id !== "number") {
+              throw new Error("session has no stored vault");
+            }
+            sendVaultId = detail.vault_id;
+          } catch {
+            // Ownership guard on the FAILURE path too, with the SAME
+            // per-send generation check: a stale lookup (superseded by a
+            // session switch OR by a newer send in this session) must not
+            // clear the replacement's streaming state, abort handle, or
+            // send guard (review 4.5 rounds 2-3).
+            if (
+              sendGenRef.current === gen &&
+              useChatStore.getState().activeChatId === sessionId.toString()
+            ) {
+              setInputError(
+                "Couldn't determine this session's vault — reload the conversation and try again."
+              );
+              setIsStreaming(false);
+              setAbortFn(null);
+              sendingRef.current = false;
+            }
+            return false;
+          }
+        }
       } else {
         if (!sendVaultId) {
           setInputError(
@@ -393,7 +450,12 @@ export function useSendMessage(
         try {
           const newSession = await createChatSession({ vault_id: sendVaultId });
           sessionId = newSession.id;
-          useChatStore.setState({ activeChatId: newSession.id.toString() });
+          // Issue #1153 AC5: bind the created session's stored scope
+          // atomically with its id (the session lives in sendVaultId).
+          // Optional chain per the repo's mock-tolerance convention.
+          useChatStore
+            .getState()
+            .bindSession?.(newSession.id.toString(), sendVaultId);
           createdSession = true;
         } catch (err) {
           console.error("Failed to create chat session:", err);
