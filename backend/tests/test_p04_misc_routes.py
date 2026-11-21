@@ -422,6 +422,48 @@ class ConfigRefTransientFailureRecoveryTest(unittest.TestCase):
         second = qr._config_ref()
         self.assertEqual(second, "abc123")
 
+    def test_transient_git_failure_is_not_cached(self):
+        """A real subprocess failure returns None and is never cached (AC4).
+
+        Proves the production chain end-to-end: ``subprocess.run`` fails →
+        ``_get_release_id`` returns ``None`` → ``_config_ref`` does NOT cache a
+        marker, so a later successful lookup is used instead of a poisoned value.
+        """
+        import os
+        import subprocess
+
+        import app.services.eval_adapter as eval_adapter
+        from app.api.routes import quality_reports as qr
+
+        qr._release_id_cache.clear()
+        self.addCleanup(qr._release_id_cache.clear)
+        for key in ("APP_RELEASE_ID", "APP_VERSION"):
+            self.addCleanup(os.environ.pop, key, None)
+            os.environ.pop(key, None)
+
+        real_run = subprocess.run
+        calls = {"n": 0}
+
+        def fake_run(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise subprocess.SubprocessError("git transiently unavailable")
+            # Second call: git recovers and reports a real short hash.
+            class _R:
+                returncode = 0
+                stdout = "def4567"
+            return _R()
+
+        self.addCleanup(setattr, subprocess, "run", real_run)
+        subprocess.run = fake_run
+
+        first = qr._config_ref()  # git fails → 'unknown', NOT cached
+        self.assertEqual(first, "unknown")
+        self.assertNotIn("value", qr._release_id_cache)
+        second = qr._config_ref()  # retries, git recovered → real hash, now cached
+        self.assertEqual(second, "def4567")
+        self.assertEqual(qr._release_id_cache["value"], "def4567")
+
 
 class SubmitRouteConfigRefOffloadTest(unittest.TestCase):
     def test_submit_quality_report_has_no_inline_config_ref(self):

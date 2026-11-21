@@ -46,6 +46,7 @@ except ImportError:
 from app.models.database import init_db, run_migrations
 from app.services.citation_validator import (
     _find_unverifiable_claims,
+    _merge_list_markers,
     repair_against_sources_and_memories,
 )
 from app.utils.assistant_sanitizer import sanitize_chat_messages_content
@@ -323,6 +324,33 @@ class UnverifiableClaimsSentenceSegmentationTest(unittest.TestCase):
                 [("1.", item_1), ("2.", item_2)],
                 header=header,
             )
+
+
+class ListMarkerFoldOrderTest(unittest.TestCase):
+    """F-06: consecutive list markers fold in document order, not reversed."""
+
+    def test_consecutive_standalone_markers_preserve_order(self):
+        # "1." "2." "Do X." must fold to "1. 2. Do X." — the pre-fix accumulation
+        # prepended each marker, producing the reversed "2. 1. Do X.".
+        self.assertEqual(
+            _merge_list_markers(["1.", "2.", "Do X."]),
+            ["1. 2. Do X."],
+        )
+
+    def test_colon_header_then_numbered_items_preserve_order(self):
+        # A header fragment followed by in-order markers "1." "2." must keep
+        # that order when folded onto the trailing item.
+        self.assertEqual(
+            _merge_list_markers(["Steps:", "1.", "2.", "Do X."]),
+            ["Steps:", "1. 2. Do X."],
+        )
+
+    def test_single_marker_still_prepends(self):
+        # Regression guard: a lone marker before real text still attaches.
+        self.assertEqual(
+            _merge_list_markers(["1.", "Zebras migrate."]),
+            ["1. Zebras migrate."],
+        )
 
 
 if __name__ == "__main__":

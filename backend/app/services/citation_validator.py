@@ -418,8 +418,10 @@ def _merge_list_markers(fragments: List[str]) -> List[str]:
         # detached marker belongs to the NEXT fragment, not this one.
         tail_match = _TRAILING_MARKER_RE.search(piece)
         if tail_match:
+            # Append the detached tail AFTER any marker already pending so a
+            # run of list markers keeps its order ("1. 2." not "2. 1.").
             pending_prefix = (
-                tail_match.group(1) + " " + pending_prefix
+                pending_prefix + " " + tail_match.group(1)
             ).strip()
             piece = piece[: tail_match.start()].rstrip()
             if not piece:
@@ -428,8 +430,9 @@ def _merge_list_markers(fragments: List[str]) -> List[str]:
             out.append(piece)
             continue
         if _LIST_MARKER_RE.match(piece):
-            # Standalone marker: prepend to the next real fragment.
-            pending_prefix = (piece + " " + pending_prefix).strip()
+            # Standalone marker: append to the pending run (preserving order)
+            # so consecutive markers fold as "1. 2. 3." rather than reversed.
+            pending_prefix = (pending_prefix + " " + piece).strip()
             continue
         if pending_prefix:
             out.append(pending_prefix + " " + piece)

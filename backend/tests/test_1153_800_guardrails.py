@@ -14,6 +14,7 @@ implementation time (disclosed in 05-fix-plan.md v3 item 9):
    downgraded by a late reconciled write (F7c, atomic WHERE guard).
 """
 
+import asyncio
 import json
 import sqlite3
 import tempfile
@@ -21,6 +22,7 @@ import unittest
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from app.api.deps import (
     get_current_active_user,
@@ -28,8 +30,13 @@ from app.api.deps import (
     get_evaluate_policy,
     get_rag_engine,
 )
+from app.api.routes.chat import ChatStreamRequest
 from app.main import app
-from app.models.database import init_db, run_migrations
+from app.models.database import (
+    SQLiteConnectionPool,
+    init_db,
+    run_migrations,
+)
 from app.security import csrf_protect
 
 ADMIN_USER = {"id": 1, "role": "admin", "username": "admin"}
@@ -203,6 +210,82 @@ class QualityIdempotencyMigrationTest(unittest.TestCase):
         self.assertIn("idx_quality_reports_message_category", indexes)
         self.assertIn("idx_quality_eval_cases_report_unique", indexes)
 
+    def test_converged_db_skips_convergence_scans(self):
+        """RP-004: a second run on an already-converged DB early-returns without
+        re-journaling the convergence (the indexes-existing fast path)."""
+        db_path = self._db()
+        init_db(db_path)
+        run_migrations(db_path)
+        conn = sqlite3.connect(db_path)
+        first = conn.execute(
+            "SELECT COUNT(*) FROM migration_journal"
+            " WHERE migration_name ="
+            " 'migrate_add_quality_idempotency_indexes'"
+        ).fetchone()[0]
+        conn.close()
+        run_migrations(db_path)  # converged → fast path
+        conn = sqlite3.connect(db_path)
+        second = conn.execute(
+            "SELECT COUNT(*) FROM migration_journal"
+            " WHERE migration_name ="
+            " 'migrate_add_quality_idempotency_indexes'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(first, second, "converged restart must not re-run convergence")
+
+    def test_differing_notes_are_merged_not_discarded(self):
+        """F-03: a discarded duplicate report's note is merged into the
+        canonical row, not silently deleted."""
+        db_path = self._db()
+        init_db(db_path)
+        run_migrations(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute("DROP INDEX IF EXISTS idx_quality_reports_message_category")
+        conn.execute("DROP INDEX IF EXISTS idx_quality_eval_cases_report_unique")
+        conn.execute("INSERT INTO vaults (id, name) VALUES (501, 'mv')")
+        conn.execute("INSERT INTO chat_sessions (id, vault_id) VALUES (1, 501)")
+        conn.execute(
+            "INSERT INTO chat_messages (id, session_id, role, content, turn_id, seq)"
+            " VALUES (100, 1, 'assistant', 'a', 't1', 2)"
+        )
+        conn.execute(
+            "INSERT INTO quality_reports (id, session_id, message_id, category,"
+            " turn_id, seq, config_ref, note) VALUES (10, 1, 100, 'cat', 't1', 2,"
+            " 'r', 'first reviewer note')"
+        )
+        conn.execute(
+            "INSERT INTO quality_reports (id, session_id, message_id, category,"
+            " turn_id, seq, config_ref, note) VALUES (11, 1, 100, 'cat', 't1', 2,"
+            " 'r', 'second reviewer note')"
+        )
+        conn.commit()
+        conn.close()
+        run_migrations(db_path)
+        conn = sqlite3.connect(db_path)
+        note = conn.execute(
+            "SELECT note FROM quality_reports WHERE id = 10"
+        ).fetchone()[0]
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM quality_reports WHERE message_id = 100 AND category = 'cat'"
+        ).fetchone()[0]
+        conn.close()
+        # Both distinct notes survive on the canonical (lowest-id) report.
+        self.assertIn("first reviewer note", note)
+        self.assertIn("second reviewer note", note)
+        # The duplicate report row is gone; one canonical row remains.
+        self.assertEqual(remaining, 1)
+        # F-03 observability: the convergence is journaled, not silent.
+        journal = sqlite3.connect(db_path)
+        row = journal.execute(
+            "SELECT phase, outcome FROM migration_journal"
+            " WHERE migration_name ="
+            " 'migrate_add_quality_idempotency_indexes'"
+        ).fetchone()
+        journal.close()
+        self.assertIsNotNone(row, "migration outcome must be journaled")
+        self.assertEqual(row[0], "succeeded")
+        self.assertEqual(row[1], "ok")
+
     def test_uniqueness_enforced_post_migration(self):
         db_path = self._db()
         init_db(db_path)
@@ -362,6 +445,108 @@ class BatchCompletionFenceTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row[0], "new mirror")
         self.assertEqual(row[1], "failed")
+
+
+class StreamAuthClampDirectTest(unittest.TestCase):
+    """F-01 (#1153 AC5 backend clamp): get_stream_auth reaches the vault clamp.
+
+    The HTTP-level StreamAuthOrderingTest legs assert only "not 403", but every
+    leg returned 500 at ``app.state.rag_engine`` BEFORE ``get_stream_auth`` ran,
+    so the stored-vault clamp was unproven on the backend. This drives
+    ``get_stream_auth`` as a coroutine against a real pooled connection with the
+    user-resolution seam patched, so the clamp and the policy check actually
+    execute and their outcome is asserted.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self.db_path = str(Path(self._tmpdir) / "app.db")
+        init_db(self.db_path)
+        run_migrations(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self.addCleanup(self.conn.close)
+        _seed_user(self.conn, 1, "admin", "admin")
+        _seed_user(self.conn, 2, "member", "member")
+        for vid in (V1, V2, V3):
+            self.conn.execute(
+                "INSERT INTO vaults (id, name) VALUES (?, ?)", (vid, f"V{vid}")
+            )
+        self.conn.execute(
+            "INSERT INTO vault_members (vault_id, user_id, permission) "
+            "VALUES (?, 2, 'write')",
+            (V1,),
+        )
+        self.conn.execute(
+            "INSERT INTO vault_members (vault_id, user_id, permission) "
+            "VALUES (?, 2, 'read')",
+            (V2,),
+        )
+        # Session 7 stored in vault 1 (member-writable).
+        self.conn.execute(
+            "INSERT INTO chat_sessions (id, vault_id, title) VALUES (?, ?, 's7')",
+            (SESSION_7, V1),
+        )
+        self.conn.commit()
+        self.pool = SQLiteConnectionPool(self.db_path, max_size=3)
+        self.addCleanup(self.pool.close_all)
+        app.state.db_pool = self.pool
+        self.addCleanup(setattr, app.state, "db_pool", None)
+
+    def _run_auth(self, body):
+        from app.api.routes.chat import get_stream_auth
+
+        async def _go():
+            scope = {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/chat/stream",
+                "headers": [],
+                "query_string": b"",
+            }
+            request = Request(scope)
+            request.scope["app"] = app
+            return await get_stream_auth(request, body)
+
+        return asyncio.run(_go())
+
+    def _patch_user(self, user):
+        import app.api.routes.chat as chat_mod
+
+        async def _resolve(conn, request, authorization, access_token):
+            return user
+
+        original = chat_mod._resolve_active_user
+        chat_mod._resolve_active_user = _resolve
+        self.addCleanup(setattr, chat_mod, "_resolve_active_user", original)
+
+    def test_requested_inaccessible_vault_clamped_to_stored_scope(self):
+        # Member's session lives in V1 (write); the request names V3 (no access).
+        # The stored scope must win: clamp to V1, authorize against V1, succeed.
+        self._patch_user(MEMBER_USER)
+        body = ChatStreamRequest(
+            messages=[{"role": "user", "content": "hi"}],
+            vault_id=V3,
+            session_id=SESSION_7,
+        )
+        user = self._run_auth(body)
+        self.assertEqual(user["id"], MEMBER_USER["id"])
+        # The clamp fired: the requested V3 was rewritten to the stored V1.
+        self.assertEqual(body.vault_id, V1)
+
+    def test_no_session_inaccessible_vault_is_rejected(self):
+        # Control: with no session there is no clamp, so a member requesting an
+        # inaccessible vault is 403. This is the behavior the positive leg only
+        # escapes via the clamp — proving the clamp is load-bearing, not a hole.
+        from fastapi import HTTPException
+
+        self._patch_user(MEMBER_USER)
+        body = ChatStreamRequest(
+            messages=[{"role": "user", "content": "hi"}], vault_id=V3
+        )
+        with self.assertRaises(HTTPException) as ctx:
+            self._run_auth(body)
+        self.assertEqual(ctx.exception.status_code, 403)
 
 
 if __name__ == "__main__":

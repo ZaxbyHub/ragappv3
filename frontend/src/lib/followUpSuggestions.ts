@@ -44,13 +44,52 @@ function capAtWordBoundary(text: string, max: number): string {
 /** Trim to a short topic phrase suitable for embedding in a question.
  * Issue #1153 AC6: the input is the ASSISTANT ANSWER text — the topic must
  * name what the turn established, not what the user asked. */
-function topicFrom(assistantAnswer: string): string {
-  const cleaned = assistantAnswer
+/** Answer-chrome that must not leak into a follow-up topic (review F-05):
+ *  citation labels the prompt builder emits (`[S1]`, `[M2]`, `[A1]`), inline
+ *  markdown (`**bold**`, `*italic*`, `` `code` ``), and boilerplate openers
+ *  ("Based on the documents,", "Here is"). Stripped before the topic phrase
+ *  is chosen so a chip reads "coolant interval" not "Based on the documents,
+ *  the coolant". */
+const ANSWER_OPENERS = [
+  "based on the documents",
+  "based on the sources",
+  "based on the provided",
+  "based on this",
+  "according to the documents",
+  "according to the sources",
+  "according to",
+  "here is",
+  "here are",
+  "here's",
+];
+
+function stripAnswerChrome(text: string): string {
+  return text
+    // Citation labels: [S1] [M2] [A1] (and multi-digit).
+    .replace(/\[[SMA]\d+\]/gi, "")
+    // Inline markdown emphasis / code delimiters.
+    .replace(/(\*\*|\*|`)/g, "")
     .replace(/\s+/g, " ")
-    .replace(/[?.!]+\s*$/, "")
-    .trim()
-    .replace(/^(please|could you|can you|would you)\s+/i, "")
     .trim();
+}
+
+function stripLeadingOpener(text: string): string {
+  for (const opener of ANSWER_OPENERS) {
+    const re = new RegExp(`^${opener}\\s*,?\\s*`, "i");
+    const next = text.replace(re, "");
+    if (next !== text) return next.trim();
+  }
+  return text;
+}
+
+function topicFrom(assistantAnswer: string): string {
+  const cleaned = stripLeadingOpener(
+    stripAnswerChrome(assistantAnswer)
+      .replace(/[?.!]+\s*$/, "")
+      .trim()
+      .replace(/^(please|could you|can you|would you)\s+/i, "")
+      .trim()
+  );
   if (!cleaned) return "";
   let words = cleaned.split(" ");
   // Strip ONE leading imperative verb — even when it is the only word, so a

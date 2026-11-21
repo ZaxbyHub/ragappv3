@@ -121,6 +121,53 @@ describe("deriveFollowUps topic source (issue #1153 AC6)", () => {
     });
   });
 
+  describe("answer-chrome stripping (review F-05): markdown, citations, openers", () => {
+    it("does not leak a citation label into the topic", () => {
+      const chips = deriveFollowUps(
+        "The coolant interval is 60,000 km [S1] for turbo engines.",
+        [],
+      );
+      expect(chips.join(" ")).not.toMatch(/\[S1\]/);
+      expect(chips.some((c) => /coolant interval/i.test(c))).toBe(true);
+    });
+
+    it("does not leak markdown emphasis into the topic", () => {
+      const chips = deriveFollowUps(
+        "**Summary:** the coolant interval is 60,000 km for turbo engines.",
+        [],
+      );
+      expect(chips.join(" ")).not.toMatch(/\*\*/);
+      expect(chips.some((c) => /coolant interval/i.test(c))).toBe(true);
+    });
+
+    it("drops a 'Based on the documents' opener so the topic is the noun phrase", () => {
+      const chips = deriveFollowUps(
+        "Based on the documents, the coolant interval is 60,000 km for turbo engines.",
+        [],
+      );
+      const topicChip = chips.find((c) => /coolant interval/i.test(c));
+      expect(topicChip).toBeDefined();
+      expect(topicChip).not.toMatch(/based on the documents/i);
+    });
+
+    it("drops a 'Here is' opener", () => {
+      const chips = deriveFollowUps(
+        "Here is the summary: the coolant interval is 60,000 km.",
+        [],
+      );
+      expect(chips.join(" ")).not.toMatch(/here is/i);
+      expect(chips.some((c) => /coolant interval/i.test(c))).toBe(true);
+    });
+
+    it("still derives a clean topic from a plain declarative answer", () => {
+      const chips = deriveFollowUps(
+        "The coolant interval is 60,000 km for turbo engines.",
+        [],
+      );
+      expect(chips.some((c) => /coolant interval/i.test(c))).toBe(true);
+    });
+  });
+
   describe("production call site: the pane derives the topic from the assistant answer", () => {
     beforeEach(() => {
       vi.clearAllMocks();

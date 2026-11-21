@@ -3288,15 +3288,78 @@ def migrate_add_quality_idempotency_indexes(sqlite_path: str) -> None:
     One row per retry identity ``quality_reports(message_id, category)`` and
     one case per ``quality_eval_cases.report_id``. Legacy duplicates are
     converged BEFORE index creation, inside one transaction, preserving
-    referential integrity: eval cases owned by duplicate reports are
-    re-parented to the canonical (lowest-id) report first, then cases are
+    referential integrity: differing reviewer notes are merged into the
+    canonical report first, eval cases owned by duplicate reports are
+    re-parented to the canonical (lowest-id) report, then cases are
     deduplicated per report (lowest id survives), then the duplicate reports
     are deleted, then the indexes are created. Rerun-safe: every step is a
     no-op on a converged database.
+
+    Data-loss handling (review F-03): convergence keeps the lowest-id row per
+    identity and discards the rest, which is irreversible. To make that loss
+    observable rather than silent:
+
+    * differing ``note`` text on discarded reports is merged into the
+      canonical report's note (all distinct non-empty notes, ``' || '``
+      separated) so no reviewer commentary is lost;
+    * eval cases cannot be merged — the ``report_id`` unique index allows one
+      case per report — so genuinely distinct legacy cases are counted and
+      logged, not silently dropped;
+    * the counts of discarded reports, merged notes, and discarded cases are
+      logged and journaled via ``record_migration_outcome`` inside the same
+      transaction, matching the sibling destructive-dedup migrations.
     """
     conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
+        # Converged-DB fast path (review RP-004): the migration is transactional
+        # (BEGIN IMMEDIATE .. commit), so the two unique indexes existing is a
+        # durable proof the data is already converged. Skip the convergence
+        # scans entirely on every restart of an already-migrated database —
+        # without this, a large legacy DB pays the correlated-subquery scans on
+        # every boot. A half-applied run cannot leave the indexes behind (they
+        # are created inside the same transaction, before commit), so this
+        # early return is safe.
+        existing = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        if "idx_quality_reports_message_category" in existing and (
+            "idx_quality_eval_cases_report_unique" in existing
+        ):
+            return
         conn.execute("BEGIN IMMEDIATE")
+        # 0. Merge differing reviewer notes from duplicate reports into the
+        #    canonical (lowest-id) report of each (message_id, category)
+        #    identity, so a discarded report's note is preserved on the row
+        #    that survives. Only canonical rows with more than one distinct
+        #    non-empty note are touched (rerun-safe no-op once converged).
+        conn.execute(
+            """
+            UPDATE quality_reports
+            SET note = (
+                SELECT group_concat(note_val, ' || ')
+                FROM (
+                    SELECT DISTINCT qr2.note AS note_val
+                    FROM quality_reports qr2
+                    WHERE qr2.message_id = quality_reports.message_id
+                      AND qr2.category = quality_reports.category
+                      AND TRIM(qr2.note) != ''
+                )
+            )
+            WHERE id IN (
+                SELECT MIN(id) FROM quality_reports GROUP BY message_id, category
+            )
+            AND (
+                SELECT COUNT(DISTINCT qr2.note)
+                FROM quality_reports qr2
+                WHERE qr2.message_id = quality_reports.message_id
+                  AND qr2.category = quality_reports.category
+                  AND TRIM(qr2.note) != ''
+            ) > 1
+            """
+        )
         # 1. Re-parent eval cases from duplicate reports to the canonical
         #    (lowest-id) report of each (message_id, category) identity.
         #    The SET subquery correlates through the TARGET table's own
@@ -3323,6 +3386,13 @@ def migrate_add_quality_idempotency_indexes(sqlite_path: str) -> None:
             )
             """
         )
+        # Count eval cases discarded by the per-report dedup BELOW (review F-03).
+        cases_discarded = conn.execute(
+            "SELECT COUNT(*) FROM quality_eval_cases"
+            " WHERE id NOT IN ("
+            "   SELECT MIN(cec.id) FROM quality_eval_cases cec GROUP BY cec.report_id"
+            ")"
+        ).fetchone()[0]
         # 2. Deduplicate eval cases per report (lowest id survives).
         conn.execute(
             """
@@ -3333,6 +3403,13 @@ def migrate_add_quality_idempotency_indexes(sqlite_path: str) -> None:
             )
             """
         )
+        # Count reports discarded by the dedup BELOW (review F-03).
+        reports_discarded = conn.execute(
+            "SELECT COUNT(*) FROM quality_reports"
+            " WHERE id NOT IN ("
+            "   SELECT MIN(id) FROM quality_reports GROUP BY message_id, category"
+            ")"
+        ).fetchone()[0]
         # 3. Delete duplicate reports (canonical lowest-id rows survive).
         conn.execute(
             """
@@ -3342,6 +3419,24 @@ def migrate_add_quality_idempotency_indexes(sqlite_path: str) -> None:
                 GROUP BY qr.message_id, qr.category
             )
             """
+        )
+        logger.info(
+            "migrate_add_quality_idempotency_indexes: converged quality-report "
+            "idempotency duplicates — reports deleted=%d, eval cases deleted=%d "
+            "(irreversible; differing notes were merged into the surviving "
+            "canonical report)",
+            reports_discarded,
+            cases_discarded,
+        )
+        record_migration_outcome(
+            conn,
+            migration_name="migrate_add_quality_idempotency_indexes",
+            phase="succeeded",
+            outcome="ok",
+            detail=(
+                f"deduplicated quality reports: deleted={reports_discarded}, "
+                f"eval cases deleted={cases_discarded}"
+            ),
         )
         # 4. Create the unique indexes on the converged data. Per-statement
         #    execute (NOT executescript — it issues an implicit COMMIT that

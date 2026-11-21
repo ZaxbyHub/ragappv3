@@ -17,6 +17,7 @@ const apiMocks = vi.hoisted(() => ({
   addChatMessage: vi.fn(),
   addChatMessagesBatch: vi.fn(),
   chatStream: vi.fn(),
+  getChatSession: vi.fn(),
   getLlmModeHealth: vi.fn(),
   getSettings: vi.fn(async () => ({ chat_message_max_chars: 20000 })),
 }));
@@ -27,6 +28,7 @@ vi.mock("@/lib/api", () => ({
   addChatMessage: (...args: unknown[]) => apiMocks.addChatMessage(...args),
   addChatMessagesBatch: (...args: unknown[]) => apiMocks.addChatMessagesBatch(...args),
   chatStream: (...args: unknown[]) => apiMocks.chatStream(...args),
+  getChatSession: (...args: unknown[]) => apiMocks.getChatSession(...args),
   getLlmModeHealth: (...args: unknown[]) => apiMocks.getLlmModeHealth(...args),
 }));
 
@@ -153,6 +155,39 @@ describe("useSendMessage", () => {
       expect.objectContaining({ role: "user", content: "What changed?" }),
       expect.objectContaining({ role: "assistant" }),
     ]);
+  });
+
+  it("blocks loudly when an existing session's stored scope is unbound and the refetch fails (AC5 F5c)", async () => {
+    // G-AC5 / MS-TST-001: an existing session (activeChatId set) whose scope was
+    // never bound (activeSessionVaultId null) must refetch the stored vault and
+    // BLOCK the send when that refetch fails — never silently send with the
+    // global/unresolved scope. This is the AC5 defense-in-depth leg the C5 suite
+    // did not drive (it only covered pre-bound reopen/create/fork).
+    const refreshHistory = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      activeChatId: "42",
+      activeSessionVaultId: null,
+      input: "follow up",
+    });
+    apiMocks.getChatSession.mockRejectedValue(new Error("network down"));
+
+    const { result } = renderHook(() => useSendMessage(42, refreshHistory));
+
+    let outcome: unknown;
+    await act(async () => {
+      outcome = await result.current.handleSend();
+    });
+
+    // handleSend maps the inner block to "blocked" (never "sent").
+    expect(outcome).toBe("blocked");
+    // The send never reaches the transport.
+    expect(apiMocks.chatStream).not.toHaveBeenCalled();
+    // And the user is told why, with the reload guidance.
+    await waitFor(() => {
+      expect(useChatStore.getState().inputError).toContain(
+        "Couldn't determine this session's vault",
+      );
+    });
   });
 
   it("stores the server-issued seq, not a locally computed position (issue #683)", async () => {

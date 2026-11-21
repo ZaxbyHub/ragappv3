@@ -2321,7 +2321,7 @@ class RAGEngine:
             yield {
                 "type": "evidence_candidates",
                 "version": 1,
-                "candidates": self._serialize_source_candidates(relevant_chunks),
+                "candidates": await self._serialize_source_candidates(relevant_chunks),
             }
 
             # Build messages using prompt builder service.
@@ -2489,7 +2489,7 @@ class RAGEngine:
 
         # Yield done message with sources. Pass cited_labels so that
         # memories_used contains only memories the assistant actually cited.
-        done_msg = self._build_done_message(
+        done_msg = await self._build_done_message(
             relevant_chunks,
             memories,
             score_type,
@@ -3926,7 +3926,7 @@ class RAGEngine:
             out.append(candidate)
         return out
 
-    def _serialize_source_candidates(
+    async def _serialize_source_candidates(
         self, relevant_chunks: List[RAGSource]
     ) -> List[Dict[str, Any]]:
         """Serialize chunks exactly as done.sources does: to_source_metadata
@@ -3942,31 +3942,44 @@ class RAGEngine:
         files-table replacement.
 
         The enrichment is ONE batched SELECT (an IN clause over the final
-        chunk list's distinct file ids), executed synchronously. An earlier
-        revision dispatched it via ``run_in_executor(...).result()`` when a
-        loop was running — that returns an asyncio Future whose ``.result()``
-        raises ``InvalidStateError`` inside a running loop, silently stamping
-        every chunk with the permanent None missing-marker (final-critic
-        round 1); a synchronous bounded query is correct in every context
-        this sync method is invoked from.
+        chunk list's distinct file ids). It runs in ``asyncio.to_thread`` so it
+        never blocks the worker's event loop (issue #1153/#800 review F-04): an
+        earlier revision called the synchronous pool checkout directly from the
+        async stream generator, and under pool exhaustion ``pool.get`` waits up
+        to ~15s on the loop, stalling every concurrent request; a ``to_thread``
+        dispatch (not ``run_in_executor(...).result()``) is what keeps the loop
+        free without the InvalidStateError that the direct-future form raised
+        inside a running loop (final-critic round 1).
+
+        When every chunk already carries the write-once ``_file_hash`` key
+        (the done path re-serializes the same chunk objects the candidate path
+        stamped), the SELECT is skipped entirely — the second checkout is pure
+        waste.
         """
-        try:
-            pool = _get_pool()
-            with pool.connection() as conn:
-                attach_file_hashes(relevant_chunks, conn)
-        except Exception as exc:  # noqa: BLE001 — defensive
-            # Enrichment must never break serialization: unenriched chunks
-            # keep the explicit missing-marker (None) instead.
-            logger.debug("file-hash enrichment skipped: %s", exc)
-            for chunk in relevant_chunks:
-                if "_file_hash" not in chunk.metadata:
-                    chunk.metadata["_file_hash"] = None
+        if any("_file_hash" not in chunk.metadata for chunk in relevant_chunks):
+            try:
+                pool = _get_pool()
+
+                def _enrich() -> None:
+                    # Entered inside the worker thread so the pooled connection
+                    # is checked out and released off the event loop (F-04).
+                    with pool.connection() as conn:
+                        attach_file_hashes(relevant_chunks, conn)
+
+                await asyncio.to_thread(_enrich)
+            except Exception as exc:  # noqa: BLE001 — defensive
+                # Enrichment must never break serialization: unenriched chunks
+                # keep the explicit missing-marker (None) instead.
+                logger.debug("file-hash enrichment skipped: %s", exc)
+                for chunk in relevant_chunks:
+                    if "_file_hash" not in chunk.metadata:
+                        chunk.metadata["_file_hash"] = None
         return [
             self.document_retrieval.to_source_metadata(chunk, source_index=idx + 1)
             for idx, chunk in enumerate(relevant_chunks)
         ]
 
-    def _build_done_message(
+    async def _build_done_message(
         self,
         relevant_chunks: List[RAGSource],
         memories: List[Any],
@@ -4021,7 +4034,7 @@ class RAGEngine:
         # Split into primary and supporting (same split as prompt builder)
         primary_count = calculate_primary_count(len(relevant_chunks))
 
-        sources = self._serialize_source_candidates(relevant_chunks)
+        sources = await self._serialize_source_candidates(relevant_chunks)
         for idx, source_meta in enumerate(sources):
             source_meta["evidence_type"] = (
                 "primary" if idx < primary_count else "supporting"

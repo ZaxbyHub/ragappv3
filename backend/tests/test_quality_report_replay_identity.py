@@ -560,20 +560,18 @@ class QualityReportReplayIdentityTest(unittest.TestCase):
             second = service.to_source_metadata(chunk, source_index=1)
             self.assertEqual(second.get("file_hash"), original_hash)
 
-        # Final-critic round-1 finding + 4.5 delta-review round-2 finding:
-        # the enrichment must actually RUN inside a running event loop AND
-        # the leg must KILL the original defect. The earlier executor
-        # dispatch (run_in_executor(...).result() inside a live loop) always
-        # raised InvalidStateError, silently stamping the permanent None
-        # missing-marker in production; with an INSTANT fake pool the
-        # executor worker could win the write-once race and false-pass, so
-        # the fake pool's connection acquisition blocks briefly: under the
-        # defective executor dispatch the main thread's except-branch
-        # None-stamp lands first (emitted None -> RED), while the fixed
-        # synchronous call is unaffected apart from the deliberate delay.
-        # This leg drives the REAL RAGEngine._serialize_source_candidates
-        # under a running loop and asserts the emitted source carries the
-        # files-table hash (behavioral, not structural, kill-verified).
+        # Review F-04: the enrichment must run OFF the worker's event loop.
+        # The dispatch is ``asyncio.to_thread`` (never the earlier
+        # ``run_in_executor(...).result()`` form, which raised InvalidStateError
+        # inside a live loop and silently stamped the permanent None
+        # missing-marker). The fake pool's connection acquisition blocks
+        # briefly in the worker thread so a regression back to a blocking
+        # synchronous checkout on the loop is observable; under the correct
+        # to_thread dispatch the awaiting main task still observes the real
+        # files-table hash. This leg drives the REAL (now async)
+        # RAGEngine._serialize_source_candidates under a running loop and
+        # asserts the emitted source carries the files-table hash
+        # (behavioral, kill-verified).
         with self.subTest(leg="running-loop-behavioral"):
             import asyncio as _asyncio
             import contextlib
@@ -628,7 +626,7 @@ class QualityReportReplayIdentityTest(unittest.TestCase):
                     connection=_pool_yielding_test_conn
                 )
                 try:
-                    return RAGEngine._serialize_source_candidates(
+                    return await RAGEngine._serialize_source_candidates(
                         engine, [loop_chunk]
                     )
                 finally:
@@ -636,6 +634,55 @@ class QualityReportReplayIdentityTest(unittest.TestCase):
 
             emitted = _asyncio.run(_serialize_under_loop())
             self.assertEqual(emitted[0].get("file_hash"), loop_hash)
+
+    def test_serialize_skips_pool_when_all_chunks_stamped(self):
+        """F-04 optimization: the done-path re-serialization does no DB work.
+
+        When every chunk already carries the write-once ``_file_hash`` key
+        (the candidate serialization stamped it), ``_serialize_source_candidates``
+        must NOT check out a pooled connection — the second checkout is pure
+        waste. Proven by pointing ``_get_pool`` at a sentinel that records the
+        call and raises, then asserting the stamped path returns sources with
+        no pool access.
+        """
+        import asyncio as _asyncio
+        import types
+
+        from app.services.document_retrieval import (
+            DocumentRetrievalService,
+            RAGSource,
+        )
+        from app.services.rag_engine import RAGEngine
+
+        pool_touched = {"n": 0}
+
+        def _boom_pool():
+            pool_touched["n"] += 1
+            raise AssertionError("pool checked out on the stamped-chunks path")
+
+        chunk = RAGSource(
+            text="Already-stamped body.",
+            file_id="999",
+            score=0.4,
+            metadata={"source_file": "pinned.txt", "_file_hash": "abc123"},
+        )
+        engine = types.SimpleNamespace(
+            document_retrieval=DocumentRetrievalService()
+        )
+
+        import app.services.rag_engine as rag_engine_mod
+
+        real_get_pool = rag_engine_mod._get_pool
+        rag_engine_mod._get_pool = _boom_pool
+        try:
+            emitted = _asyncio.run(
+                RAGEngine._serialize_source_candidates(engine, [chunk])
+            )
+        finally:
+            rag_engine_mod._get_pool = real_get_pool
+
+        self.assertEqual(pool_touched["n"], 0)
+        self.assertEqual(emitted[0].get("file_hash"), "abc123")
 
 
 if __name__ == "__main__":

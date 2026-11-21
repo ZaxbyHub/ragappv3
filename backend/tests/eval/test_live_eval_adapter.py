@@ -447,19 +447,35 @@ class TestReleaseId:
         assert isinstance(release_id, str)
         assert len(release_id) > 0
 
-    def test_release_id_fallback_unknown_when_git_unavailable(self):
-        """When git fails, falls back to 'unknown' (settings has no app_version attr)."""
+    def test_release_id_none_when_git_unavailable_and_no_env(self, monkeypatch):
+        """When git fails AND no env override, returns None (not a cached marker).
+
+        Issue #800 AC4: a synthetic 'unknown' that gets cached for the process
+        life is the defect. ``None`` signals the caller to retry.
+        """
         import subprocess
 
-        import app.services.eval_adapter as adapter_module
+        monkeypatch.delenv("APP_RELEASE_ID", raising=False)
+        monkeypatch.delenv("APP_VERSION", raising=False)
 
-        # Patch subprocess.run to simulate git not being available
-        with patch.object(
-            subprocess, "run", side_effect=FileNotFoundError("git not found")
-        ):
-            release_id = _get_release_id()
-            # Since settings has no app_version, fallback is "unknown"
-            assert release_id == "unknown"
+        def _boom(*a, **k):
+            raise FileNotFoundError("git not found")
+
+        monkeypatch.setattr(subprocess, "run", _boom)
+        assert _get_release_id() is None
+
+    def test_release_id_env_override_when_git_unavailable(self, monkeypatch):
+        """A stable env override is returned (and is safe to cache) when git fails."""
+        import subprocess
+
+        monkeypatch.delenv("APP_RELEASE_ID", raising=False)
+        monkeypatch.delenv("APP_VERSION", raising=False)
+        monkeypatch.setenv("APP_RELEASE_ID", "ci-build-42")
+        monkeypatch.setattr(
+            subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(
+                FileNotFoundError("git not found"))
+        )
+        assert _get_release_id() == "ci-build-42"
 
 
 class TestDuplicateIdRejection(unittest.TestCase):

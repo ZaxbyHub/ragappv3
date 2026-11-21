@@ -52,10 +52,12 @@ def _config_ref() -> str:
     """Non-empty config/release snapshot reference for report provenance.
 
     Cached per process: the underlying git/env lookup is a subprocess we do
-    not want per request. Never empty (falls back through env vars to a
-    literal 'unknown' marker). Only SUCCESSFUL lookups are cached (issue
-    #800 AC4): a transient ``None`` returns the 'unknown' marker without
-    poisoning the cache, so the next call retries the lookup.
+    not want per request. Only SUCCESSFUL lookups are cached (issue #800 AC4):
+    ``_get_release_id`` returns ``None`` when no real id is available (git
+    failed AND no env override), so the ``if value:`` guard below skips the
+    cache and the next call retries — a transient git failure is never cached
+    for the life of the process. This wrapper still returns a non-empty marker
+    ('unknown') for the current call so provenance is never blank.
     """
     if "value" in _release_id_cache:
         return _release_id_cache["value"]
