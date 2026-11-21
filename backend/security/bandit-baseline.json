@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 102975,
+      "loc": 102987,
       "nosec": 0,
       "skipped_tests": 73
     },
@@ -660,7 +660,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 412,
+      "loc": 415,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1908,7 +1908,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 116,
+      "loc": 125,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3486,7 +3486,7 @@
       "test_name": "hashlib"
     },
     {
-      "code": "11 import logging\n12 import xml.sax.saxutils\n13 from abc import ABC, abstractmethod\n",
+      "code": "12 import logging\n13 import xml.sax.saxutils\n14 from abc import ABC, abstractmethod\n",
       "col_offset": 0,
       "end_col_offset": 23,
       "filename": "backend/app/services/agentic_tools.py",
@@ -3497,9 +3497,9 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Using xml.sax.saxutils to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.sax.saxutils with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
-      "line_number": 12,
+      "line_number": 13,
       "line_range": [
-        12
+        13
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_imports.html#b406-import-xml-sax",
       "test_id": "B406",

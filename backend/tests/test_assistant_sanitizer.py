@@ -152,6 +152,25 @@ class AnswerWrapperFenceAwarenessTest(unittest.TestCase):
         once = sanitize_assistant_content(text)
         self.assertEqual(once, sanitize_assistant_content(once))
 
+    def test_longer_closing_fence_keeps_literal_answer(self):
+        # CommonMark: a closing fence may be longer than the opening one.
+        text = "```\n<answer>keep</answer>\n````"
+        self.assertEqual(sanitize_assistant_content(text), text)
+
+    def test_unclosed_fence_runs_to_eof_keeps_literal_answer(self):
+        text = "```\n<answer>keep</answer>"
+        self.assertEqual(sanitize_assistant_content(text), text)
+
+    def test_wrapper_outside_unclosed_fence_is_still_stripped(self):
+        # A real wrapper BEFORE an unterminated fence has its tags removed (inner
+        # text kept, per AC1); the fence then consumes the rest to EOF
+        # (CommonMark), protecting the later literal markup.
+        text = "<answer>strip me</answer>\n```\n<answer>keep me</answer>"
+        cleaned = sanitize_assistant_content(text)
+        self.assertIn("strip me", cleaned)
+        self.assertNotIn("<answer>strip me", cleaned)
+        self.assertIn("<answer>keep me</answer>", cleaned)
+
 
 if __name__ == "__main__":
     unittest.main()

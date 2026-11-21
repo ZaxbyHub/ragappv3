@@ -8,6 +8,7 @@ foundation only — it is wired into ``RAGEngine.query`` behind
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import xml.sax.saxutils
 from abc import ABC, abstractmethod
@@ -212,18 +213,23 @@ class RetrievalTool(AgenticTool):
             # each source, same write-once enrichment the standard path runs in
             # rag_engine._serialize_source_candidates. The agentic path builds
             # sources here directly, so it must enrich them too — otherwise
-            # agentic report/case provenance carries no hash.
+            # agentic report/case provenance carries no hash. Dispatched off the
+            # event loop (review F-04): the pooled checkout + SELECT is sync, so
+            # it must not run inline in this async method.
             from app.services.document_retrieval import attach_file_hashes
             from app.services.rag_engine import _get_pool
 
-            try:
-                pool = _get_pool()
-                with pool.connection() as conn:
-                    attach_file_hashes(relevant_chunks, conn)
-            except Exception as exc:  # noqa: BLE001 — enrichment must never break the turn
-                logging.getLogger(__name__).debug(
-                    "agentic file-hash enrichment skipped: %s", exc
-                )
+            def _enrich() -> None:
+                try:
+                    pool = _get_pool()
+                    with pool.connection() as conn:
+                        attach_file_hashes(relevant_chunks, conn)
+                except Exception as exc:  # noqa: BLE001 — enrichment must never break the turn
+                    logging.getLogger(__name__).debug(
+                        "agentic file-hash enrichment skipped: %s", exc
+                    )
+
+            await asyncio.to_thread(_enrich)
 
             sources = []
             for idx, chunk in enumerate(relevant_chunks):

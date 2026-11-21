@@ -48,16 +48,7 @@ _THINKING_PROCESS_PREFIX_RE = re.compile(
 _ANSWER_WRAPPER_OPEN_RE = re.compile(r"<answer\b[^>]*>", re.IGNORECASE)
 _ANSWER_WRAPPER_CLOSE_RE = re.compile(r"</answer\s*>", re.IGNORECASE)
 
-# A fenced code block: an opening fence of >=3 backticks or >=3 tildes (with an
-# optional info string), up to a matching closing fence of the SAME marker
-# character and at least as long. Used to keep literal markup inside code
-# examples untouched when stripping ``<answer>`` wrapper tags.
-_FENCE_RE = re.compile(
-    r"(^[ \t]*(`{3,}|~{3,})[^\n]*\n"  # opening fence line
-    r"(?:.*\n)*?"  # block body (non-greedy)
-    r"^[ \t]*\2[ \t]*(?:\n|\Z))",  # closing fence (same marker), EOF-tolerant
-    re.MULTILINE,
-)
+_OPEN_FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
 
 
 def _strip_answer_wrappers_outside_code_fences(text: str) -> str:
@@ -68,22 +59,41 @@ def _strip_answer_wrappers_outside_code_fences(text: str) -> str:
     and in the startup re-sanitize migration, which would otherwise
     permanently rewrite historical messages. Only the wrapper tags outside
     fences are removed (issue #1153 AC1).
+
+    Fence tracking is line-based (not a single regex) so it honours CommonMark:
+    a closing fence may be LONGER than the opening one, and an unterminated
+    fence runs to the end of the text — both must keep their literal markup.
     """
-    parts: List[str] = []
-    last = 0
-    for match in _FENCE_RE.finditer(text):
-        parts.append(text[last:match.start()])  # non-fenced text before the fence
-        parts.append(match.group(0))  # the fenced block, left untouched
-        last = match.end()
-    parts.append(text[last:])  # trailing non-fenced text
-    stripped: List[str] = []
-    for index, part in enumerate(parts):
-        if index % 2 == 0:  # even index == non-fenced segment
-            part = _ANSWER_WRAPPER_CLOSE_RE.sub(
-                "", _ANSWER_WRAPPER_OPEN_RE.sub("", part)
-            )
-        stripped.append(part)
-    return "".join(stripped)
+
+    def _strip_tags(line: str) -> str:
+        return _ANSWER_WRAPPER_CLOSE_RE.sub(
+            "", _ANSWER_WRAPPER_OPEN_RE.sub("", line)
+        )
+
+    out: List[str] = []
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if not in_fence:
+            open_match = _OPEN_FENCE_RE.match(stripped)
+            if open_match:
+                in_fence = True
+                fence_char = open_match.group(1)[0]
+                fence_len = len(open_match.group(1))
+                out.append(line)
+                continue
+            out.append(_strip_tags(line))
+            continue
+        # Inside a fence: a closing fence is the same marker, at least as long,
+        # with only trailing whitespace. Otherwise the line is protected.
+        if re.match(
+            rf"^{re.escape(fence_char)}{{{fence_len},}}[ \t]*$", stripped
+        ):
+            in_fence = False
+        out.append(line)
+    return "\n".join(out)
 
 
 def sanitize_assistant_content(content: str) -> str:
