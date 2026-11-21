@@ -427,7 +427,14 @@ export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
     // visible-state request is within the health budget.
     const onVisibilityChange = (): void => {
       if (!isCurrentLifetime(context, lifetime)) return;
-      if (typeof document !== 'undefined' && !document.hidden) void checkHealth();
+      if (typeof document !== 'undefined' && !document.hidden) {
+        // An in-flight read settles and applies its result on its own —
+        // superseding it here could discard a DEEP first read (its deep
+        // marker was consumed before the await), leaving a no-interval
+        // caller without service data until the next deep interval.
+        if (activeReadRef.current !== null) return;
+        void checkHealth();
+      }
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
 

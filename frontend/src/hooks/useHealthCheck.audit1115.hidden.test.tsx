@@ -112,6 +112,35 @@ describe("useHealthCheck hidden-document gating (audit 1115)", () => {
     expect(mockGet.mock.calls.length).toBe(1);
   });
 
+  // Stage B (K-12 re-review): the re-arm must not supersede an IN-FLIGHT
+  // deep read — the deep marker (lastDeepAt/isFirstCheck) was consumed
+  // before the await, so a superseding read would be shallow and the deep
+  // response would be discarded on arrival. While a read is in flight the
+  // re-arm is a no-op; the parked deep result applies when it settles.
+  it("visibility re-arm does not supersede an in-flight deep read", async () => {
+    let releaseDeep!: () => void;
+    const deepGate = new Promise<void>((resolve) => {
+      releaseDeep = resolve;
+    });
+    mockGet.mockImplementationOnce(() => deepGate.then(() => okResponse()));
+
+    const { result } = renderHook(() => useHealthCheck());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mockGet).toHaveBeenCalledTimes(1); // deep mount check in flight
+
+    // Hide, then become visible while the deep read is still parked: the
+    // re-arm window opens but an active read exists — no new dispatch.
+    setHidden(true);
+    setHidden(false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mockGet).toHaveBeenCalledTimes(1);
+
+    // The deep response settles and applies its service data.
+    releaseDeep();
+    await vi.waitFor(() => expect(result.current.backend).toBe(true));
+    expect(mockGet).toHaveBeenCalledTimes(1);
+  });
+
   it("visible baseline: mount check plus interval polling still work (pin)", async () => {
     const { result } = renderHook(() => useHealthCheck({ pollInterval: 30_000 }));
 
