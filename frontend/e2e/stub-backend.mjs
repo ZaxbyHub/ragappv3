@@ -120,6 +120,9 @@ const VAULT = {
   created_at: nowIso(),
   updated_at: nowIso(),
   file_count: 2,
+  // Issue #1153 AC4: the chat empty state gates on indexed documents
+  // (status="indexed" parity); the stub's two seeded files are indexed.
+  indexed_file_count: 2,
   memory_count: 0,
   session_count: 0,
   org_id: null,
@@ -827,6 +830,7 @@ const server = http.createServer(async (req, res) => {
         created_at: nowIso(),
         updated_at: nowIso(),
         file_count: 0,
+        indexed_file_count: 0,
       };
       vaults.push(vault);
       onboarding.vault_created = true;
