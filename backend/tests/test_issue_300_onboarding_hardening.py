@@ -41,6 +41,7 @@ os.environ["JWT_SECRET_KEY"] = (
 )
 os.environ["USERS_ENABLED"] = "true"
 
+from app.api import deps as deps_mod
 from app.api.routes.auth import router as auth_router
 from app.api.routes.organizations import router as organizations_router
 from app.api.routes.users import router as users_router
@@ -214,7 +215,7 @@ class TestCreateUserForcesPasswordRotation:
         """Admin-created user has must_change_password=1 in DB after creation."""
         from app.api.routes import users
 
-        orig_get_pool = users.get_pool
+        orig_get_pool = deps_mod.get_pool
         from app.models.database import get_pool
 
         # get_pool will naturally route via settings.sqlite_path to our test DB

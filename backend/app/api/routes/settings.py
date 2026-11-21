@@ -1548,6 +1548,13 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
                 if getattr(rag_engine, "llm_client", None) is None:
                     engine_kwargs["llm_client"] = thinking_client
                 rag_engine.rebind_clients(**engine_kwargs)
+            # #1179 AC2: the health checker must see the new client too, or
+            # /api/llm-health/modes keeps reporting the thinking mode
+            # unavailable until restart. getattr no-op covers checker-less
+            # test applications.
+            health_checker = getattr(app.state, "llm_health_checker", None)
+            if health_checker is not None:
+                health_checker.rebind_clients(thinking_client=thinking_client)
             logger.info(
                 "Thinking chat model configured; client activated live (no restart needed)"
             )
@@ -1610,6 +1617,11 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
             rag_engine = getattr(app.state, "rag_engine", None)
             if rag_engine is not None:
                 rag_engine.rebind_clients(instant_client=instant_client)
+            # #1179 AC2 (instant sibling): same wiring as the thinking
+            # branch above.
+            health_checker = getattr(app.state, "llm_health_checker", None)
+            if health_checker is not None:
+                health_checker.rebind_clients(instant_client=instant_client)
             logger.info(
                 "Instant chat model configured; client activated live (no restart needed)"
             )

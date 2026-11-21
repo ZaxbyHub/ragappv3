@@ -26,7 +26,7 @@ Harness follows the proven direct-call recipe from
 backend/tests/test_d05_vault_delete_integrity.py (real temp DB via init_db,
 real SQLiteConnectionPool, real DraftStore/DraftInputStorage bytes on disk,
 delete route called directly with a minimal ASGI Request) plus the
-users.get_pool patch from test_d04_user_mutation_invariants.py. The pool is
+deps_mod.get_pool patch from test_d04_user_mutation_invariants.py. The pool is
 a thin facade so the connection delete_user borrows can be wrapped: the
 wrapper lets every statement run and raises CancelledError only after the
 user DELETE executes inside the still-open BEGIN IMMEDIATE — the faithful
@@ -53,6 +53,7 @@ from unittest.mock import patch
 import pytest
 from starlette.requests import Request
 
+from app.api import deps as deps_mod
 from app.api.routes import users as users_mod
 from app.api.routes.users import delete_user
 from app.config import settings
@@ -236,18 +237,20 @@ class _Env:
         )
         self.facade = _PoolFacade(self.real_pool, borrow_conn)
 
-        self._saved_get_pool = users_mod.get_pool
-        users_mod.get_pool = lambda _path: self.facade
+        self._saved_get_pool = deps_mod.get_pool
+        deps_mod.get_pool = lambda _path: self.facade
         self._saved_data_dir = settings.data_dir
         settings.data_dir = tmp_path
 
     def call_delete_user(self) -> None:
+        conn = asyncio.run(self.facade.get_connection_async())
         asyncio.run(
             delete_user(
                 2,
                 Request(_delete_scope(2)),
-                dict(_ADMIN_USER),
-                "test-csrf",
+                user=dict(_ADMIN_USER),
+                _csrf_token="test-csrf",
+                db=conn,
             )
         )
 
@@ -256,7 +259,7 @@ class _Env:
         return sqlite3.connect(self.db_path)
 
     def close(self) -> None:
-        users_mod.get_pool = self._saved_get_pool
+        deps_mod.get_pool = self._saved_get_pool
         settings.data_dir = self._saved_data_dir
         self.real_pool.close_all()
         _pool_cache.clear()

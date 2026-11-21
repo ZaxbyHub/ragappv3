@@ -29,7 +29,6 @@ RED at base, GREEN after the fix:
 
 Harness mirrors the proven recipe in backend/tests/test_users_routes.py
 (env vars before app imports, pool override, csrf dependency override,
-users.get_pool patch, settings patch, user-agent ""). security_audit_log and
 user_sessions used to be created locally because TEST_SCHEMA lacked them;
 since the #744 fixture swap the shared helper builds the production schema
 (init_db + run_migrations), so the local CREATE IF NOT EXISTS DDL blocks below
@@ -113,7 +112,6 @@ def _mutation_env(
     """Build an isolated temp DB + FastAPI app with the requested routers.
 
     Mirrors test_users_routes.py isolation: _pool_cache.clear(), own tmpdir,
-    own pool, get_db override, csrf_protect override, users.get_pool patch,
     settings patch, and a client whose user-agent matches the fingerprint the
     test tokens are minted with ("").
     """
@@ -146,11 +144,9 @@ def _mutation_env(
     patched_get_pools = []
 
     if mount_users:
-        from app.api.routes import users as users_mod
         from app.api.routes.users import router as users_router
 
         app.include_router(users_router)
-        patched_get_pools.append((users_mod, users_mod.get_pool))
 
     if mount_auth:
         from app.api.routes.auth import router as auth_router
@@ -165,9 +161,6 @@ def _mutation_env(
     from app.models.database import SQLiteConnectionPool
 
     pool = SQLiteConnectionPool(db_path, max_size=5)
-    for mod, _orig in patched_get_pools:
-        mod.get_pool = lambda _path, _pool=pool: _pool
-
     from app.api import deps
     from app.security import csrf_protect
 
@@ -210,8 +203,6 @@ def _mutation_env(
         client.close()
         _pool_cache.clear()
         conn.close()
-        for mod, orig in patched_get_pools:
-            mod.get_pool = orig
         pool.close_all()
         settings.users_enabled = saved_users_enabled
         settings.jwt_secret_key = saved_jwt_secret

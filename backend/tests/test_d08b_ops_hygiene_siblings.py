@@ -69,8 +69,6 @@ class _SiblingBase(unittest.TestCase):
         from app.api.routes import users as users_module
 
         self._users_module = users_module
-        self._orig_get_pool = users_module.get_pool
-        users_module.get_pool = lambda path: self.pool
 
         self._saved = {
             k: getattr(settings, k)
@@ -95,7 +93,6 @@ class _SiblingBase(unittest.TestCase):
         app.dependency_overrides.pop(get_db, None)
         app.dependency_overrides.pop(get_current_active_user, None)
         app.dependency_overrides.pop(csrf_protect, None)
-        self._users_module.get_pool = self._orig_get_pool
         for k, v in self._saved.items():
             setattr(settings, k, v)
         # Restore (never unconditionally pop) the ambient env value so a

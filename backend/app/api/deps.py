@@ -93,6 +93,11 @@ class UserRole(IntEnum):
 _ACTIVE_USER_CACHE: dict[str, tuple[dict, float]] = {}
 _ACTIVE_USER_CACHE_LOCK = Lock()
 _ACTIVE_USER_CACHE_KEY_FORMAT = "active_user:{user_id}"
+# Bumped by every invalidation (#798 AC2): a reader whose DB fetch was in
+# flight when the invalidation landed sees a changed generation and must
+# not write its (now stale) snapshot back into the cache. Same pattern as
+# maintenance.py / toggle_manager.py.
+_ACTIVE_USER_CACHE_GENERATION = 0
 
 
 def _build_active_user_cache_key(user_id: int) -> str:
@@ -114,9 +119,11 @@ def invalidate_active_user_cache(user_id: int) -> None:
     subsequent requests see the updated row. Multiple IDs can be
     invalidated by calling this function in a loop.
     """
+    global _ACTIVE_USER_CACHE_GENERATION
     cache_key = _build_active_user_cache_key(user_id)
     with _ACTIVE_USER_CACHE_LOCK:
         _ACTIVE_USER_CACHE.pop(cache_key, None)
+        _ACTIVE_USER_CACHE_GENERATION += 1
 
 
 
@@ -356,33 +363,21 @@ def resolve_granted_by(user: dict) -> int | None:
 
 
 def _fetch_user_row_with_pwc(db: sqlite3.Connection, user_id: int) -> tuple | None:
-    """Fetch a user row, tolerating the absence of the password_changed_at column.
+    """Fetch a user row (7 columns, including ``password_changed_at``).
 
-    The ``password_changed_at`` column was added by migration
-    ``migrate_add_password_changed_at``. Test databases that define their own
-    ``users`` table without this column will raise ``OperationalError`` on the
-    7-column SELECT. This helper catches that case and falls back to a 6-column
-    SELECT with ``password_changed_at`` set to 0.0.
+    The ``password_changed_at`` column is added by migration
+    ``migrate_add_password_changed_at``, which startup runs before serving
+    (database.py -> lifespan.py). A schema missing the column fails LOUDLY
+    here (``OperationalError``) instead of silently substituting epoch 0.0,
+    which would disable FR-007 password-change token invalidation (#798
+    AC3). Test fixtures that hand-roll a ``users`` table must carry the
+    column (user_route_helpers.py's production-schema template does).
     """
-    try:
-        return db.execute(
-            "SELECT id, username, full_name, role, is_active, must_change_password, password_changed_at "
-            "FROM users WHERE id = ?",
-            (user_id,),
-        ).fetchone()
-    except sqlite3.OperationalError as exc:
-        if "no such column" not in str(exc).lower():
-            raise  # not the missing column — propagate
-        # Column likely doesn't exist in this test DB — fall back to 6-col SELECT
-        row = db.execute(
-            "SELECT id, username, full_name, role, is_active, must_change_password "
-            "FROM users WHERE id = ?",
-            (user_id,),
-        ).fetchone()
-        if row is not None:
-            # Append password_changed_at = 0.0 (epoch never bumped)
-            row = tuple(row) + (0.0,)  # pyright: ignore[reportAssignmentType]
-        return row
+    return db.execute(
+        "SELECT id, username, full_name, role, is_active, must_change_password, password_changed_at "
+        "FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
 
 
 async def _resolve_active_user(
@@ -509,9 +504,13 @@ async def _resolve_active_user(
     cache_key = _build_active_user_cache_key(user_id)
     ttl = _get_active_user_cache_ttl()
     cached_user = None
+    # Generation at cache-read time (#798 AC2): compared again at write-back
+    # so a snapshot whose key was invalidated mid-read is never re-cached.
+    read_generation = 0
 
     if ttl > 0:
         with _ACTIVE_USER_CACHE_LOCK:
+            read_generation = _ACTIVE_USER_CACHE_GENERATION
             cached_entry = _ACTIVE_USER_CACHE.get(cache_key)
             if cached_entry is not None:
                 _cached_user, expires_at = cached_entry
@@ -549,9 +548,16 @@ async def _resolve_active_user(
         if ttl > 0:
             with _ACTIVE_USER_CACHE_LOCK:
                 # Double-check: if the entry was invalidated between the DB read and
-                # this write-back, do not re-cache a stale snapshot. The narrow race
-                # is bounded by the TTL floor (5s) and single-writer SQLite.
-                if _ACTIVE_USER_CACHE.get(cache_key) is None:
+                # this write-back, do not re-cache a stale snapshot. Key absence
+                # alone cannot distinguish "invalidated mid-read" from "never
+                # cached" (#798 AC2), so the generation captured before the DB
+                # read must also be unchanged (maintenance/toggle_manager
+                # pattern); the narrow race stays bounded by the TTL floor (5s)
+                # and single-writer SQLite.
+                if (
+                    _ACTIVE_USER_CACHE.get(cache_key) is None
+                    and _ACTIVE_USER_CACHE_GENERATION == read_generation
+                ):
                     _ACTIVE_USER_CACHE[cache_key] = (user, time.monotonic() + ttl)
     else:
         user = cached_user

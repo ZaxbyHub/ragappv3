@@ -90,14 +90,10 @@ class TestUpdateUser:
         # Patch get_pool in users module to return our test pool
         from app.api.routes import users
 
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         # Store for cleanup
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
         self._orig_users_enabled = settings.users_enabled
@@ -117,7 +113,6 @@ class TestUpdateUser:
         self.conn.close()
 
         # Restore original get_pool
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -342,14 +337,10 @@ class TestAdminResetPassword:
         # Patch get_pool in users module to return our test pool
         from app.api.routes import users
 
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         # Store for cleanup
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
         self._orig_users_enabled = settings.users_enabled
@@ -369,7 +360,6 @@ class TestAdminResetPassword:
         self.conn.close()
 
         # Restore original get_pool
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -570,14 +560,10 @@ class TestUpdateUserActiveStatus:
         # Patch get_pool in users module to return our test pool
         from app.api.routes import users
 
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         # Store for cleanup
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
         self._orig_users_enabled = settings.users_enabled
@@ -597,7 +583,6 @@ class TestUpdateUserActiveStatus:
         self.conn.close()
 
         # Restore original get_pool
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -828,14 +813,10 @@ class TestActiveStatusWithMultipleAdmins:
         # Patch get_pool in users module to return our test pool
         from app.api.routes import users
 
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         # Store for cleanup
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
         self._orig_users_enabled = settings.users_enabled
@@ -855,7 +836,6 @@ class TestActiveStatusWithMultipleAdmins:
         self.conn.close()
 
         # Restore original get_pool
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret

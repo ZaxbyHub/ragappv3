@@ -38,7 +38,6 @@ Feedback-round additions (PR #1027):
   409.
 
 Harness mirrors the frozen files' d07 pattern (own temp DB, get_db override,
-csrf override, users.get_pool patch, settings save/restore) and supports both
 multi-user mode (mutable acting-user dict) and single-admin mode (real
 admin-token auth so the id-0 sentinel principal is minted).
 """
@@ -93,8 +92,6 @@ class _HardeningHarness:
         from app.api.routes import users as users_module
 
         self._users_module = users_module
-        self._orig_get_pool = users_module.get_pool
-        users_module.get_pool = lambda path: self.pool
 
         from app.config import settings
 
@@ -254,7 +251,6 @@ class _HardeningHarness:
         app.dependency_overrides.pop(get_db, None)
         app.dependency_overrides.pop(get_current_active_user, None)
         app.dependency_overrides.pop(csrf_protect, None)
-        self._users_module.get_pool = self._orig_get_pool
         for key, value in self._saved.items():
             setattr(self._settings, key, value)
         self.client.close()

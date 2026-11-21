@@ -396,8 +396,6 @@ class TestCreateUserEndpoint(unittest.TestCase):
 
         # Patch get_pool to return test pool
         from app.api.routes import users
-
-        self.original_get_pool = users.get_pool
         users.get_pool = lambda path: self.test_pool
 
         # Override deps
@@ -428,7 +426,6 @@ class TestCreateUserEndpoint(unittest.TestCase):
         from app.models.database import _pool_cache
 
         self.client.close()
-        users.get_pool = self.original_get_pool
         _pool_cache.clear()
         self.test_pool.close_all()
         self._deps_module.settings.users_enabled = self._original_users_enabled

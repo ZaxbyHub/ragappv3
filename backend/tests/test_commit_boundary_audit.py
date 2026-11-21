@@ -46,6 +46,7 @@ from pathlib import Path  # noqa: E402
 
 from starlette.requests import Request  # noqa: E402
 
+from app.api import deps as deps_mod
 from app.api.routes import users as users_mod  # noqa: E402
 from app.api.routes.users import UpdateRoleRequest, update_user_role  # noqa: E402
 from app.models.database import SQLiteConnectionPool, _pool_cache, init_db  # noqa: E402
@@ -92,8 +93,8 @@ class _AuditEnv:
         init_db(self.db_path)
         self.pool = SQLiteConnectionPool(self.db_path, max_size=2)
         self.facade = _SingleConnPoolFacade(self.pool)
-        self._saved_get_pool = users_mod.get_pool
-        users_mod.get_pool = lambda _p: self.facade
+        self._saved_get_pool = deps_mod.get_pool
+        deps_mod.get_pool = lambda _p: self.facade
 
         seed = self.pool.get_connection()
         try:
@@ -120,7 +121,7 @@ class _AuditEnv:
             check.close()
 
     def close(self) -> None:
-        users_mod.get_pool = self._saved_get_pool
+        deps_mod.get_pool = self._saved_get_pool
         if self.facade._conn is not None:
             try:
                 self.pool.release_connection(self.facade._conn)
@@ -187,6 +188,7 @@ def test_commit_boundary_cancellation_still_records_audit(tmp_path: Path) -> Non
                     TARGET_USER_ID,
                     _request_for(TARGET_USER_ID),
                     UpdateRoleRequest(role="admin"),
+                    db=await deps_mod.get_pool("").get_connection_async(),
                     user=dict(_SUPERADMIN),
                     _csrf_token="t",
                 )
