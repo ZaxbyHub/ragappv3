@@ -388,13 +388,18 @@ application stack, including maintenance-window 503s: the access-logging
 middleware sits outside the maintenance and rate-limit middleware, so a
 maintenance 503 still gets an application access line and an `X-Request-ID`
 header. That is equally true for native (non-container) runs, which carry
-the same flag. Still outside the middleware's reach — on every launch path,
-so these requests produce no access line anywhere: CORS preflight OPTIONS
-responses (the CORS layer, outermost of the always-registered core, answers
-them itself), invalid-Host 400s (answered by the host-header validator,
-which registers outside CORS when allowed_hosts is configured), and
-unhandled 500s (converted by the server's error middleware outside the
-application stack).
+the same flag. Unhandled 500s also get an application access line (with
+`status_code: 500`) since #1179: the access-logging middleware's exception
+arm emits exactly one `http_request` record before re-raising — though the
+500 response itself carries no `X-Request-ID` header, because the exception
+path produces no response object inside that middleware. Still outside the
+middleware's reach — on every launch path, so these requests produce no
+access line anywhere: CORS preflight OPTIONS responses (the CORS layer,
+outermost of the always-registered core, answers them itself) and
+invalid-Host 400s (answered by the host-header validator, which registers
+outside CORS when allowed_hosts is configured; health endpoints are exempt
+from host validation so probes without the probe hostname in
+ALLOWED_HOSTS keep working).
 
 Operators who want uvicorn's own access lines back (for example to
 correlate raw connection behavior) can re-enable them by launching without
@@ -1222,7 +1227,7 @@ For a subpath deployment such as `https://example.com/knowledgevault/`, configur
 | `VITE_API_URL` | Build arg (optional) | API URL override. Derived from `VITE_APP_BASENAME` when empty |
 | `BACKEND_CORS_ORIGINS` | Runtime env | Allowed CORS origins for your domain |
 | `FORWARDED_ALLOW_IPS` | Runtime env | Trusted proxy IPs for forwarded headers |
-| `ALLOWED_HOSTS` | Runtime env | Allowed Host header values for TrustedHostMiddleware |
+| `ALLOWED_HOSTS` | Runtime env | Allowed Host header values for TrustedHostMiddleware; health endpoints (`/health`, `/api/health`, `/api/healthz`) are exempt so probes without the probe hostname in `ALLOWED_HOSTS` keep working |
 
 **Minimal configuration** (`.env` or environment):
 

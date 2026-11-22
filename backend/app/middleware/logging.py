@@ -123,7 +123,33 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         # must never produce a negative duration_ms on the access line.
         start = time.monotonic()
         try:
-            response = await call_next(request)
+            try:
+                response = await call_next(request)
+            except Exception:
+                # Uncaught route exceptions used to skip the access record
+                # entirely (#798 AC8 / #1179 AC4): the log call sat only on
+                # the success path, so the only access line for a 500 was
+                # lost (the PR #981 documented blind spot). Emit exactly one
+                # record with status_code 500, then re-raise. asyncio
+                # CancelledError is a BaseException on 3.11 and deliberately
+                # NOT recorded as a 500 here. The record is emitted BEFORE
+                # the contextvar reset in the outer finally, same as the
+                # success path (the RequestIdFilter reads the contextvar).
+                duration = time.monotonic() - start
+                sanitized_query = _sanitize_query(request.url.query)
+                logger.info(
+                    "http_request",
+                    extra={
+                        "request_id": request_id,
+                        "method": request.method,
+                        "path": request.url.path,
+                        "query": sanitized_query,
+                        "status_code": 500,
+                        "client_ip": request.client.host if request.client else None,
+                        "duration_ms": round(duration * 1000, 2),
+                    },
+                )
+                raise
             # Emit the access record BEFORE the contextvar reset: the
             # lifespan-installed RequestIdFilter overwrites record.request_id
             # with the CURRENT contextvar value on every emitted record, so

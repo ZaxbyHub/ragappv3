@@ -100,9 +100,7 @@ class _SupportHarness:
         app.dependency_overrides[csrf_protect] = lambda: "t1028-csrf"
 
         from app.api.routes import organizations as orgs_module
-        from app.api.routes import users as users_module
-
-        self._mods = (users_module, orgs_module)
+        self._mods = (orgs_module,)
         self._orig_get_pools = [m.get_pool for m in self._mods]
         for m in self._mods:
             m.get_pool = lambda path: self.pool

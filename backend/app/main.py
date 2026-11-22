@@ -105,8 +105,12 @@ if (
 # through (maintenance 503, slowapi's application-level-limit 429), and
 # every response the middleware it wraps produces must carry X-Request-ID
 # and produce an http_request access-log line. (Responses answered OUTSIDE
-# LoggingMiddleware still do not: CORS preflight OPTIONS, invalid-Host 400s,
-# and unhandled 500s — see docs/admin-guide.md.) Always-registered core,
+# LoggingMiddleware still do not: CORS preflight OPTIONS and invalid-Host
+# 400s. Unhandled 500s DO get an http_request access-log line since #1179
+# AC4 — LoggingMiddleware's exception arm logs status_code 500 before
+# re-raising — but they carry no X-Request-ID response header, since the
+# exception path produces no response object here; see docs/admin-guide.md.)
+# Always-registered core,
 # outermost first: CORS → Logging → SlowAPI → Maintenance.
 # ── Portal-resilience layer (innermost of the core) ────────────────────
 # Added FIRST so these two sit closest to the app (last added = outermost,
@@ -154,16 +158,34 @@ if "*" in settings.backend_cors_origins:
 # Health check endpoints are exempted so Docker/K8s/lb probes (which send
 # Host: localhost) continue to work without needing the probe hostname in
 # ALLOWED_HOSTS.
-_HEALTH_EXEMPT_PATHS = {"/health", "/api/health"}
+_HEALTH_EXEMPT_PATHS = {"/health", "/api/health", "/api/healthz"}
 
 class _TrustedHostWithHealthExempt(TrustedHostMiddleware):
-    """TrustedHostMiddleware that exempts health-check paths."""
+    """TrustedHostMiddleware that exempts health-check paths.
 
-    async def dispatch(self, request, call_next):
-        path = (request.scope.get("path") or "").rstrip("/") or "/"
-        if path in _HEALTH_EXEMPT_PATHS:
-            return await call_next(request)
-        return await super().dispatch(request, call_next)
+    Pure-ASGI override (#798 AC7 / #1179 AC3): Starlette's
+    TrustedHostMiddleware implements only ``__call__`` (it never invokes a
+    ``dispatch`` hook), so the previous ``dispatch()`` override was dead
+    code — the exemption never executed. The ``scope["path"]`` check below
+    mirrors the supported deployment shape (the reverse proxy strips the
+    mount prefix, so the backend sees the bare routed path; root_path may
+    be non-empty).
+    """
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            # Exact-path match only (PR #1198 feedback F-02): a trailing-slash
+            # form (/health/, /api/healthz/) is NOT exempt and stays under host
+            # validation — under the previous rstrip normalization Starlette's
+            # redirect_slashes built a 307 Location from the unvalidated,
+            # attacker-chosen Host header on exactly those forms. Health probes
+            # hit the canonical paths (docker-compose probes /health with no
+            # slash), so no probe flow changes.
+            path = scope.get("path") or "/"
+            if path in _HEALTH_EXEMPT_PATHS:
+                await self.app(scope, receive, send)
+                return
+        await super().__call__(scope, receive, send)
 
 if settings.allowed_hosts:
     _hosts = list(settings.allowed_hosts)

@@ -46,7 +46,10 @@ family (#982) and the two reindex duplicate-accounting edges disclosed at PR
   admin guide states the blind-spot caveat (no access line for CORS
   preflight / invalid-Host 400 / unhandled 500) for native runs too, and
   documents the operator re-enable path (`--access-log`) with an explicit
-  raw-query disclosure warning. The nightly change stops the SERVER access log
+  raw-query disclosure warning.
+  *(Superseded in part by #1179: unhandled 500s now emit an `http_request`
+  record; the caveat's remaining cases are CORS preflight and invalid-Host
+  400s.)* The nightly change stops the SERVER access log
   (`schemathesis-uvicorn.log`) from persisting fuzz-generated query strings;
   schemathesis's own CLI failure reproductions in `schemathesis-run.log` still
   carry them (the uploaded artifact contains BOTH files).

@@ -83,12 +83,6 @@ class TestUserRoutes:
             finally:
                 test_pool.release_connection(conn)
 
-        # Patch get_pool in users module to return our test pool
-        from app.api.routes import users
-
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         # Mutating user endpoints now require csrf_protect. This standalone app
@@ -101,7 +95,6 @@ class TestUserRoutes:
 
         # Store for cleanup
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
         self._orig_users_enabled = settings.users_enabled
@@ -120,10 +113,6 @@ class TestUserRoutes:
         _pool_cache.clear()
         self.conn.close()
 
-        # Restore original get_pool
-        from app.api.routes import users
-
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -135,7 +124,6 @@ class TestUserRoutes:
             shutil.rmtree(self.tmpdir, ignore_errors=True)
         except Exception:
             pass
-
 
 class TestListUsers(TestUserRoutes):
     """Tests for GET /users/ endpoint."""
@@ -217,7 +205,6 @@ class TestListUsers(TestUserRoutes):
         data = response.json()
         assert data["total"] == 4
 
-
 class TestGetUser(TestUserRoutes):
     """Tests for GET /users/{user_id} endpoint."""
 
@@ -250,7 +237,6 @@ class TestGetUser(TestUserRoutes):
         """No token returns 401."""
         response = self.client.get(f"/users/{self.member_id}")
         assert response.status_code == 401
-
 
 class TestUpdateUserRole(TestUserRoutes):
     """Tests for PATCH /users/{user_id}/role endpoint."""
@@ -321,7 +307,6 @@ class TestUpdateUserRole(TestUserRoutes):
         )
 
         assert response.status_code == 404
-
 
 class TestUpdateUserActive(TestUserRoutes):
     """Tests for PATCH /users/{user_id}/active endpoint."""
@@ -406,7 +391,6 @@ class TestUpdateUserActive(TestUserRoutes):
 
         assert response.status_code == 404
 
-
 class TestDeleteUser(TestUserRoutes):
     """Tests for DELETE /users/{user_id} endpoint."""
 
@@ -467,7 +451,6 @@ class TestDeleteUser(TestUserRoutes):
 
         assert response.status_code == 404
 
-
 class TestUnauthenticatedAccess(TestUserRoutes):
     """Tests for unauthenticated access rejection."""
 
@@ -506,7 +489,6 @@ class TestUnauthenticatedAccess(TestUserRoutes):
         """DELETE /users/{id} without token returns 401."""
         response = self.client.delete(f"/users/{self.member_id}")
         assert response.status_code == 401
-
 
 class TestLastSuperadminEdgeCases(TestUserRoutes):
     """Edge case tests for last superadmin protection."""
@@ -579,7 +561,6 @@ class TestLastSuperadminEdgeCases(TestUserRoutes):
         )
         assert cursor.fetchone() is None
 
-
 class TestRoleHierarchy(TestUserRoutes):
     """Tests to verify role hierarchy enforcement."""
 
@@ -611,7 +592,6 @@ class TestRoleHierarchy(TestUserRoutes):
         )
 
         assert response.status_code == 403
-
 
 class TestUpdateUserActiveSelfDeactivation(TestUserRoutes):
     """Tests for self-deactivation guard in PATCH /users/{user_id}/active."""
@@ -678,7 +658,6 @@ class TestUpdateUserActiveSelfDeactivation(TestUserRoutes):
             "SELECT is_active FROM users WHERE id = ?", (self.member_id,)
         )
         assert cursor.fetchone()[0] == 0
-
 
 class TestUpdateUser(TestUserRoutes):
     """Tests for PATCH /users/{user_id} endpoint - username uniqueness."""
@@ -767,7 +746,6 @@ class TestUpdateUser(TestUserRoutes):
         assert response.status_code == 200
         data = response.json()
         assert data["full_name"] == "Updated Name"
-
 
 class TestCreateUser(TestUserRoutes):
     """Tests for POST /users/ endpoint."""
@@ -950,7 +928,6 @@ class TestCreateUser(TestUserRoutes):
 
         assert response.status_code == 403
 
-
 class TestAdminResetPassword(TestUserRoutes):
     """Tests for PATCH /users/{user_id}/password endpoint."""
 
@@ -1008,7 +985,6 @@ class TestAdminResetPassword(TestUserRoutes):
             "SELECT must_change_password FROM users WHERE id = ?", (self.member_id,)
         )
         assert cursor.fetchone()[0] == 1
-
 
 class TestGetUserOrganizations(TestUserRoutes):
     """Tests for GET /users/{user_id}/organizations endpoint."""
@@ -1129,7 +1105,6 @@ class TestGetUserOrganizations(TestUserRoutes):
         )
 
         assert response.status_code == 403
-
 
 class TestUpdateUserOrganizations(TestUserRoutes):
     """Tests for PUT /users/{user_id}/organizations endpoint.
@@ -1252,7 +1227,6 @@ class TestUpdateUserOrganizations(TestUserRoutes):
         assert "not a member of" in response.json()["detail"]
         assert self._user_org_ids(self.member_id) == {self.org1_id}
 
-
 class TestUserRoutesCsrfParity:
     """Every mutating /users route must declare csrf_protect (defense-in-depth).
 
@@ -1292,7 +1266,6 @@ class TestUserRoutesCsrfParity:
         assert not missing, (
             "Mutating user routes missing csrf_protect: " + ", ".join(missing)
         )
-
 
 class TestUpdateUserGroupsCallerOrgCheck(TestUserRoutes):
     """Regression for PF-002: PUT /users/{id}/groups must enforce caller-org
@@ -1477,7 +1450,6 @@ class TestUpdateUserGroupsCallerOrgCheck(TestUserRoutes):
         assert response.status_code == 400
         assert "User is not a member of organization" in response.json()["detail"]
 
-
 class TestSecurityAuditTrail(TestUserRoutes):
     """Issues #743 (S02-SK2-08) + #744 (T1-21-KR-09): every users.py
     safe_record_security_event family must land a real security_audit_log row,
@@ -1653,5 +1625,4 @@ class TestSecurityAuditTrail(TestUserRoutes):
         )
         assert response.status_code == 200, response.text
         assert self._audit_count("membership.groups_replaced", self.member_id, actor_user_id=self.superadmin_id) == 1
-
 

@@ -87,11 +87,6 @@ class TestRoleAssignmentRule:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
-        self.original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         # Mutating user endpoints require csrf_protect. This standalone app
@@ -120,7 +115,6 @@ class TestRoleAssignmentRule:
         self.client.close()
         _pool_cache.clear()
         self.conn.close()
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret

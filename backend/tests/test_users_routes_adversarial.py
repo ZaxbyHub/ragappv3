@@ -152,15 +152,9 @@ class TestSQLInjection:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
         self._orig_users_enabled = settings.users_enabled
@@ -177,9 +171,6 @@ class TestSQLInjection:
         self.client.close()
         _pool_cache.clear()
         self.conn.close()
-        from app.api.routes import users
-
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -289,15 +280,9 @@ class TestXSSPrevention:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
         self._orig_users_enabled = settings.users_enabled
@@ -314,9 +299,6 @@ class TestXSSPrevention:
         self.client.close()
         _pool_cache.clear()
         self.conn.close()
-        from app.api.routes import users
-
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -426,15 +408,9 @@ class TestMassAssignment:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
         self._orig_users_enabled = settings.users_enabled
@@ -451,9 +427,6 @@ class TestMassAssignment:
         self.client.close()
         _pool_cache.clear()
         self.conn.close()
-        from app.api.routes import users
-
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -538,15 +511,9 @@ class TestNegativeAndBoundaryUserIds:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
         self._orig_users_enabled = settings.users_enabled
@@ -563,9 +530,6 @@ class TestNegativeAndBoundaryUserIds:
         self.client.close()
         _pool_cache.clear()
         self.conn.close()
-        from app.api.routes import users
-
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -683,15 +647,9 @@ class TestOversizedParameters:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
         self._orig_users_enabled = settings.users_enabled
@@ -708,9 +666,6 @@ class TestOversizedParameters:
         self.client.close()
         _pool_cache.clear()
         self.conn.close()
-        from app.api.routes import users
-
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -821,15 +776,9 @@ class TestEmptyAndMalformedBodies:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
         self._orig_users_enabled = settings.users_enabled
@@ -846,9 +795,6 @@ class TestEmptyAndMalformedBodies:
         self.client.close()
         _pool_cache.clear()
         self.conn.close()
-        from app.api.routes import users
-
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -999,15 +945,9 @@ class TestJWTTokenManipulation:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
         self._orig_users_enabled = settings.users_enabled
@@ -1024,9 +964,6 @@ class TestJWTTokenManipulation:
         self.client.close()
         _pool_cache.clear()
         self.conn.close()
-        from app.api.routes import users
-
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -1151,15 +1088,9 @@ class TestLastSuperadminRaceCondition:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
         self._orig_users_enabled = settings.users_enabled
@@ -1176,9 +1107,6 @@ class TestLastSuperadminRaceCondition:
         self.client.close()
         _pool_cache.clear()
         self.conn.close()
-        from app.api.routes import users
-
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -1289,15 +1217,9 @@ class TestInvalidRoleValues:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
         self._orig_users_enabled = settings.users_enabled
@@ -1314,9 +1236,6 @@ class TestInvalidRoleValues:
         self.client.close()
         _pool_cache.clear()
         self.conn.close()
-        from app.api.routes import users
-
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -1416,15 +1335,9 @@ class TestInvalidIsActiveValues:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
         self._orig_users_enabled = settings.users_enabled
@@ -1441,9 +1354,6 @@ class TestInvalidIsActiveValues:
         self.client.close()
         _pool_cache.clear()
         self.conn.close()
-        from app.api.routes import users
-
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret

@@ -36,6 +36,7 @@ from pathlib import Path  # noqa: E402
 
 from starlette.requests import Request  # noqa: E402
 
+from app.api import deps as deps_mod
 from app.api.routes import users as users_mod  # noqa: E402
 from app.api.routes.users import (  # noqa: E402
     UpdateActiveRequest,
@@ -83,8 +84,8 @@ class _AuditEnv:
         self.pool = SQLiteConnectionPool(self.db_path, max_size=2)
         self.facade = _SingleConnPoolFacade(self.pool)
         self.facade._conn = self.pool.get_connection()
-        self._saved_get_pool = users_mod.get_pool
-        users_mod.get_pool = lambda _p: self.facade
+        self._saved_get_pool = deps_mod.get_pool
+        deps_mod.get_pool = lambda _p: self.facade
         seed = self.pool.get_connection()
         try:
             for uid, username, role in ((1, "root", "superadmin"), (2, "target", "member")):
@@ -109,7 +110,7 @@ class _AuditEnv:
             check.close()
 
     def close(self) -> None:
-        users_mod.get_pool = self._saved_get_pool
+        deps_mod.get_pool = self._saved_get_pool
         users_mod.invalidate_active_user_cache = self._saved_invalidate
         if self.facade._conn is not None:
             try:
@@ -210,6 +211,7 @@ def test_update_user_active_cancel_at_commit_still_audits(tmp_path: Path) -> Non
                 _request_for("PATCH", "/active"),
                 body=UpdateActiveRequest(is_active=False),
                 user=dict(_SUPERADMIN),
+                db=env.facade._conn,
                 _csrf_token="t",
             )
         )
@@ -263,8 +265,8 @@ def test_create_user_cancel_at_commit_still_audits(tmp_path: Path) -> None:
     init_db(db_path)
     pool = SQLiteConnectionPool(db_path, max_size=2)
     facade = _PoolFacade(pool)
-    saved_get_pool = users_mod.get_pool
-    users_mod.get_pool = lambda _p: facade
+    saved_get_pool = deps_mod.get_pool
+    deps_mod.get_pool = lambda _p: facade
     seed = pool.get_connection()
     try:
         seed.execute(
@@ -325,6 +327,7 @@ def test_create_user_cancel_at_commit_still_audits(tmp_path: Path) -> None:
                     CreateUserRequest(
                         username="newuser", password="Password123x", role="member"
                     ),
+                    db=await deps_mod.get_pool("").get_connection_async(),
                     user={
                         "id": 1,
                         "username": "root",
@@ -346,7 +349,7 @@ def test_create_user_cancel_at_commit_still_audits(tmp_path: Path) -> None:
     try:
         outcome = asyncio.run(drive())
     finally:
-        users_mod.get_pool = saved_get_pool
+        deps_mod.get_pool = saved_get_pool
         if facade._conn is not None:
             try:
                 pool.release_connection(facade._conn)

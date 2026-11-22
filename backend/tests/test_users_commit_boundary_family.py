@@ -64,6 +64,7 @@ from pathlib import Path  # noqa: E402
 
 from starlette.requests import Request  # noqa: E402
 
+from app.api import deps as deps_mod
 from app.api.routes import users as users_mod  # noqa: E402
 from app.api.routes.users import (  # noqa: E402
     AdminResetPasswordRequest,
@@ -158,8 +159,8 @@ class _UsersWorld:
         self.pool = SQLiteConnectionPool(self.db_path, max_size=2)
         self.real_conn = self.pool.get_connection()
         self.facade = _PoolFacade()
-        self._saved_get_pool = users_mod.get_pool
-        users_mod.get_pool = lambda _p: self.facade
+        self._saved_get_pool = deps_mod.get_pool
+        deps_mod.get_pool = lambda _p: self.facade
         seed = self.pool.get_connection()
         try:
             for uid, username, role in (
@@ -212,7 +213,7 @@ class _UsersWorld:
             check.close()
 
     def close(self) -> None:
-        users_mod.get_pool = self._saved_get_pool
+        deps_mod.get_pool = self._saved_get_pool
         users_mod.invalidate_active_user_cache = self._saved_invalidate
         try:
             if self.real_conn.in_transaction:
@@ -352,6 +353,7 @@ def test_update_user_organizations_cancel_at_commit_still_audits(
                 TARGET_USER_ID,
                 _request_for("PUT", f"/api/users/{TARGET_USER_ID}/organizations"),
                 UserOrgsUpdateRequest(org_ids=[1]),
+                db=conn,
                 user=dict(_SUPERADMIN),
                 _csrf_token="t",
             ),
@@ -388,6 +390,7 @@ def test_update_user_groups_cancel_at_commit_still_audits(tmp_path: Path) -> Non
                 TARGET_USER_ID,
                 _request_for("PUT", f"/api/users/{TARGET_USER_ID}/groups"),
                 UserGroupsUpdateRequest(group_ids=[1]),
+                db=conn,
                 user=dict(_SUPERADMIN),
                 _csrf_token="t",
             ),
