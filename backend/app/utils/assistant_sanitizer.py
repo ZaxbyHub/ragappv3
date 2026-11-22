@@ -55,7 +55,7 @@ def _strip_answer_tags(text: str) -> str:
     """Remove ``<answer>``/``</answer>`` wrapper tags from a run of text.
 
     Applied to the WHOLE run (not line-by-line) so a wrapper tag that spans
-    lines is still removed — the pre-fence-awareness behavior.
+    lines is still removed.
     """
     return _ANSWER_WRAPPER_CLOSE_RE.sub(
         "", _ANSWER_WRAPPER_OPEN_RE.sub("", text)
@@ -65,14 +65,19 @@ def _strip_answer_tags(text: str) -> str:
 def _find_code_fence_spans(text: str) -> List[Tuple[int, int]]:
     """Return the ``(start, end)`` char offsets of fenced code blocks.
 
-    Honours CommonMark so the protection is correct, not just present:
-    - an opening fence is 3+ backticks or tildes (up to 3 spaces indented); a
-      backtick fence's info string may not itself contain a backtick, so
+    Honours the CommonMark rules that matter for protecting literal markup:
+    - an opening fence is 3+ backticks or tildes, indented at most 3 spaces;
+      a backtick opener's info string may not itself contain a backtick, so
       `` ```a`b `` is NOT a fence and does not shield the rest of the text;
-    - a closing fence is the same marker character, at least as long, with only
-      trailing whitespace — so a longer closer (```` vs ```) terminates it;
+    - a closing fence is the same marker character, at least as long as the
+      opener, with only trailing spaces/tabs — so a longer closer (```` for a
+      ``` block) terminates it, and a line with any other content does not;
     - an unterminated fence runs to the end of the text.
-    CRLF line endings are handled (the ``\\r`` is whitespace for detection).
+
+    Line endings are tolerated (a trailing ``\\r`` from CRLF is ignored for
+    detection but preserved in the returned offsets). Indentation is matched
+    against spaces/tabs only — a non-breaking space or other character in the
+    closer keeps the fence open, so protected content is never released early.
     """
     spans: List[Tuple[int, int]] = []
     pos = 0
@@ -82,27 +87,28 @@ def _find_code_fence_spans(text: str) -> List[Tuple[int, int]]:
     fence_start = 0
     for line in text.split("\n"):
         line_start = pos
-        trimmed = line.strip()
+        core = line.rstrip("\r")  # CRLF: drop the CR, keep everything else
+        stripped = core.lstrip(" \t")  # up to 3 leading spaces/tabs are indent
+        indent = len(core) - len(stripped)
         if not in_fence:
-            open_match = _OPEN_FENCE_RE.match(trimmed)
-            if open_match:
-                marker = open_match.group(1)
-                marker_char = marker[0]
-                info = trimmed[len(marker):]
-                # A backtick info string may not contain a backtick.
-                if marker_char == "`" and "`" in info:
-                    pass  # not a valid opener
-                else:
-                    in_fence = True
-                    fence_char = marker_char
-                    fence_len = len(marker)
-                    fence_start = line_start
-        elif trimmed and all(c == fence_char for c in trimmed) and len(
-            trimmed
-        ) >= fence_len:
-            # Closing fence: include through the end of this line (the "\n"
-            # separator is added by the next iteration's accounting).
-            spans.append((fence_start, line_start + len(line)))
+            if indent <= 3:
+                open_match = _OPEN_FENCE_RE.match(stripped)
+                if open_match:
+                    marker = open_match.group(1)
+                    info = stripped[len(marker):]
+                    if marker[0] == "`" and "`" in info:
+                        pass  # invalid backtick opener — not a fence
+                    else:
+                        in_fence = True
+                        fence_char = marker[0]
+                        fence_len = len(marker)
+                        fence_start = line_start
+        elif indent <= 3 and stripped and re.fullmatch(
+            rf"{re.escape(fence_char)}{{{fence_len},}}[ \t]*", stripped
+        ):
+            # Closing fence: protect through the end of this line (the "\n"
+            # separator belongs to the following text, not the fence).
+            spans.append((fence_start, line_start + len(core)))
             in_fence = False
         pos = line_start + len(line) + 1
     if in_fence:
@@ -118,6 +124,10 @@ def _strip_answer_wrappers_outside_code_fences(text: str) -> str:
     and in the startup re-sanitize migration, which would otherwise
     permanently rewrite historical messages. Only the wrapper tags outside
     fences are removed (issue #1153 AC1).
+
+    Known limitation: fences nested inside block quotes / list items, and a
+    wrapper tag sitting on the same line as a fence marker, are not handled —
+    the rare cases where this matters are documented rather than special-cased.
     """
     spans = _find_code_fence_spans(text)
     if not spans:
