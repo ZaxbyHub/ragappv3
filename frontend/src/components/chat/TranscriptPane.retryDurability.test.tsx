@@ -260,7 +260,7 @@ describe("TranscriptPane retry durability (issue #684)", () => {
       seedRow(3, "user", "question-2", 3),
       seedRow(4, "assistant", "answer-2", 4),
     ];
-    useChatStore.getState().loadChat("42", server.rows.map(mapSessionMessage));
+    useChatStore.getState().loadChat("42", server.rows.map(mapSessionMessage), 7);
 
     // The replacement stream is rejected at the admission gate before any
     // content: the terminal SSE error frame carries ADMISSION_REJECTED. The

@@ -44,6 +44,7 @@ from app.services.document_retrieval import (
     DocumentRetrievalService,
     RAGSource,
     artifact_fields_from_metadata,
+    attach_file_hashes,
     source_dedup_key,
 )
 from app.services.embeddings import EmbeddingError, EmbeddingService
@@ -2320,7 +2321,9 @@ class RAGEngine:
             yield {
                 "type": "evidence_candidates",
                 "version": 1,
-                "candidates": self._serialize_source_candidates(relevant_chunks),
+                "candidates": await asyncio.to_thread(
+                    self._serialize_source_candidates, relevant_chunks
+                ),
             }
 
             # Build messages using prompt builder service.
@@ -2488,7 +2491,10 @@ class RAGEngine:
 
         # Yield done message with sources. Pass cited_labels so that
         # memories_used contains only memories the assistant actually cited.
-        done_msg = self._build_done_message(
+        # _build_done_message (and the file-hash SELECT it runs) is sync, so it
+        # is dispatched off the event loop — review F-04.
+        done_msg = await asyncio.to_thread(
+            self._build_done_message,
             relevant_chunks,
             memories,
             score_type,
@@ -3930,7 +3936,39 @@ class RAGEngine:
     ) -> List[Dict[str, Any]]:
         """Serialize chunks exactly as done.sources does: to_source_metadata
         with 1-based source labels. evidence_type is NOT set here; it is a
-        done-time distinction assigned only to final sources."""
+        done-time distinction assigned only for final sources.
+
+        Issue #800 AC8 (F13d/F13e): the answer-time ``files.file_hash``
+        snapshot is attached HERE — the final-source serialization seam both
+        the candidates payload and the done sources flow through, after
+        filtering/window expansion by construction. ``attach_file_hashes``
+        is write-once per chunk, so the second serialization (done sources)
+        can never refresh a snapshot the first (candidates) took before a
+        files-table replacement.
+
+        This does a synchronous pooled SELECT, so it MUST be dispatched off the
+        event loop by the caller (``asyncio.to_thread`` at both call sites —
+        issue #1153/#800 review F-04): an earlier revision ran it directly in the
+        async stream generator and under pool exhaustion ``pool.get`` waited up
+        to ~15s on the loop, stalling every concurrent request.
+
+        When every chunk already carries the write-once ``_file_hash`` key
+        (the done path re-serializes the same chunk objects the candidate path
+        stamped), the SELECT is skipped entirely — the second checkout is pure
+        waste.
+        """
+        if any("_file_hash" not in chunk.metadata for chunk in relevant_chunks):
+            try:
+                pool = _get_pool()
+                with pool.connection() as conn:
+                    attach_file_hashes(relevant_chunks, conn)
+            except Exception as exc:  # noqa: BLE001 — defensive
+                # Enrichment must never break serialization: unenriched chunks
+                # keep the explicit missing-marker (None) instead.
+                logger.debug("file-hash enrichment skipped: %s", exc)
+                for chunk in relevant_chunks:
+                    if "_file_hash" not in chunk.metadata:
+                        chunk.metadata["_file_hash"] = None
         return [
             self.document_retrieval.to_source_metadata(chunk, source_index=idx + 1)
             for idx, chunk in enumerate(relevant_chunks)

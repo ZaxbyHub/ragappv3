@@ -65,7 +65,10 @@ async function sendQuestion(page: Page, question: string) {
 // compensating padding settle.
 async function openEvidenceSheet(page: Page) {
   await sendQuestion(page, "What did the maintenance manual say about coolant?");
-  await expect(page.getByText(/Here is the streamed answer/i)).toBeVisible({ timeout: 20_000 });
+  await expect(page
+      .getByRole("log", { name: "Chat messages" })
+      .getByRole("article")
+      .filter({ hasText: /Here is the streamed answer/i })).toBeVisible({ timeout: 20_000 });
   await page.getByRole("button", { name: /Source S1: handbook\.pdf/i }).first().click();
   await expect(page.locator(SHEET_SELECTOR)).toBeVisible({ timeout: 10_000 });
   await page.waitForTimeout(600);

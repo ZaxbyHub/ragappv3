@@ -111,5 +111,94 @@ class TestCleanupRows(unittest.TestCase):
         self.assertEqual(second, [])
 
 
+class AnswerWrapperFenceAwarenessTest(unittest.TestCase):
+    """Review F-07: <answer> wrapper tags are stripped outside code fences but
+    a literal <answer> inside a fenced block is preserved (runtime AND the
+    startup re-sanitize migration, which would otherwise rewrite history)."""
+
+    def test_real_wrapper_tags_outside_fence_are_stripped(self):
+        self.assertEqual(
+            sanitize_assistant_content("<answer>the capital is Paris</answer>"),
+            "the capital is Paris",
+        )
+
+    def test_literal_answer_inside_backtick_fence_survives(self):
+        text = (
+            "Here is an example:\n"
+            "```xml\n"
+            "<answer>\n"
+            "  <value>42</value>\n"
+            "</answer>\n"
+            "```\n"
+            "That was the example."
+        )
+        self.assertEqual(sanitize_assistant_content(text), text)
+
+    def test_literal_answer_inside_tilde_fence_survives(self):
+        text = "~~~\n<answer>keep me</answer>\n~~~"
+        self.assertEqual(sanitize_assistant_content(text), text)
+
+    def test_wrapper_outside_fence_still_stripped_when_fence_present(self):
+        text = (
+            "<answer>real answer</answer>\n"
+            "```\n<answer>not a wrapper</answer>\n```\n"
+        )
+        cleaned = sanitize_assistant_content(text)
+        self.assertIn("real answer", cleaned)
+        self.assertIn("<answer>not a wrapper</answer>", cleaned)
+
+    def test_fence_aware_strip_is_idempotent(self):
+        text = "```\n<answer>x</answer>\n```\n<answer>y</answer>"
+        once = sanitize_assistant_content(text)
+        self.assertEqual(once, sanitize_assistant_content(once))
+
+    def test_longer_closing_fence_keeps_literal_answer(self):
+        # CommonMark: a closing fence may be longer than the opening one.
+        text = "```\n<answer>keep</answer>\n````"
+        self.assertEqual(sanitize_assistant_content(text), text)
+
+    def test_unclosed_fence_runs_to_eof_keeps_literal_answer(self):
+        text = "```\n<answer>keep</answer>"
+        self.assertEqual(sanitize_assistant_content(text), text)
+
+    def test_wrapper_outside_unclosed_fence_is_still_stripped(self):
+        # A real wrapper BEFORE an unterminated fence has its tags removed (inner
+        # text kept, per AC1); the fence then consumes the rest to EOF
+        # (CommonMark), protecting the later literal markup.
+        text = "<answer>strip me</answer>\n```\n<answer>keep me</answer>"
+        cleaned = sanitize_assistant_content(text)
+        self.assertIn("strip me", cleaned)
+        self.assertNotIn("<answer>strip me", cleaned)
+        self.assertIn("<answer>keep me</answer>", cleaned)
+
+    def test_crlf_fence_closes_and_protects(self):
+        # CRLF line endings: the closing fence must still be recognized so the
+        # fenced literal is protected AND the prose after the closer is stripped.
+        text = "<answer>strip</answer>\r\n```\r\n<answer>keep</answer>\r\n```\r\n<answer>strip2</answer>"
+        cleaned = sanitize_assistant_content(text)
+        self.assertNotIn("<answer>strip", cleaned)
+        self.assertNotIn("<answer>strip2", cleaned)
+        self.assertIn("<answer>keep</answer>", cleaned)
+
+    def test_multiline_wrapper_outside_fence_is_stripped(self):
+        # A wrapper tag that spans lines (outside any fence) is still removed —
+        # the whole-run strip, not a per-line one.
+        text = '<answer\n  style="plain">keep the inner</answer\n>'
+        self.assertEqual(sanitize_assistant_content(text), "keep the inner")
+
+    def test_invalid_backtick_opener_does_not_shield(self):
+        # A backtick info string containing a backtick is not a valid fence
+        # opener (CommonMark), so the following prose is still stripped.
+        text = "```a`b\n<answer>strip me</answer>"
+        self.assertNotIn("<answer", sanitize_assistant_content(text))
+
+    def test_longer_closer_terminates_protection(self):
+        # A 4-backtick closer ends a 3-backtick fence; prose after it is stripped.
+        text = "```\n<answer>keep</answer>\n````\n<answer>strip</answer>"
+        cleaned = sanitize_assistant_content(text)
+        self.assertIn("<answer>keep</answer>", cleaned)
+        self.assertNotIn("<answer>strip", cleaned)
+
+
 if __name__ == "__main__":
     unittest.main()

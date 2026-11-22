@@ -68,7 +68,7 @@ describe("useSendMessage admission-rejection error cause (A07 AC5)", () => {
     });
 
     const refreshHistory = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ activeChatId: "42", input: "Admission check question" });
+    useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "Admission check question" });
 
     const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 

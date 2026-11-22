@@ -64,6 +64,9 @@ interface TranscriptPaneProps {
 interface EmptyTranscriptProps {
   onPromptClick: (prompt: string) => void;
   hasIndexedDocs: boolean;
+  /** Issue #1153 AC4: render the choose-a-vault empty state (no single
+   * vault selected while accessible vaults hold indexed documents). */
+  showChooseVaultState?: boolean;
   onNavigateToDocuments?: () => void;
   vaultName?: string | null;
   documentCount?: number;
@@ -87,6 +90,7 @@ const SUGGESTED_PROMPTS = [
 export function EmptyTranscript({
   onPromptClick,
   hasIndexedDocs,
+  showChooseVaultState = false,
   onNavigateToDocuments,
   vaultName,
   documentCount,
@@ -100,9 +104,24 @@ export function EmptyTranscript({
         className="flex max-w-md flex-col items-center text-center"
       >
         <div className="mb-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-primary/10 border border-border" aria-hidden>
-          <Sparkles className="h-8 w-8 text-primary" />
+          <Sparkles className="h-8 w-8 text-primary" aria-hidden />
         </div>
 
+        {showChooseVaultState ? (
+          // Issue #1153 AC4: no single vault selected while accessible vaults
+          // hold indexed documents — the transcript asks for a vault choice,
+          // not for an upload.
+          <>
+            <h2 className="mb-2 text-lg font-semibold text-foreground">
+              Choose a vault to start chatting
+            </h2>
+            <p className="mb-8 text-sm text-muted-foreground">
+              Your documents live in specific vaults. Pick one from the vault
+              selector above to ask questions about its indexed documents.
+            </p>
+          </>
+        ) : (
+          <>
         <h2 className="mb-2 text-lg font-semibold text-foreground">
           {hasIndexedDocs ? "What would you like to know?" : "Upload documents to get started"}
         </h2>
@@ -146,6 +165,8 @@ export function EmptyTranscript({
             <Database className="h-4 w-4" aria-hidden />
             Go to Documents
           </Button>
+        )}
+          </>
         )}
       </motion.div>
     </div>
@@ -450,7 +471,22 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
   // does NOT subscribe to the full message body or sources/feedback fields.
   const streamingContentLength = useStreamingMessageContentLength();
 
-  const hasIndexedDocs = activeVault ? activeVault.file_count > 0 : false;
+  const hasIndexedDocs = activeVault
+    ? (activeVault.indexed_file_count ?? 0) > 0
+    : false;
+
+  // Issue #1153 AC4 (F4c): with "All Vaults" selected (activeVaultId null),
+  // the vault the empty state points at is ambiguous — when at least one
+  // accessible vault has INDEXED documents, the empty state must ask the
+  // user to choose a vault rather than claiming there is nothing to chat
+  // over. file_count is NOT the signal: pending/failed uploads do not count
+  // (indexed_file_count mirrors the backend's files.status='indexed' count).
+  const allVaults = useVaultStore((s) => s.vaults);
+  const noSingleVaultSelected = vaultId == null;
+  const anyAccessibleVaultIndexed = (allVaults ?? []).some(
+    (v) => (v.indexed_file_count ?? 0) > 0
+  );
+  const showChooseVaultState = noSingleVaultSelected && anyAccessibleVaultIndexed;
 
   /**
    * Centralized auto-scroll using normal document flow.
@@ -681,7 +717,7 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
       try {
         const detail = await getChatSession(parseInt(sessionId));
         if (useChatStore.getState().activeChatId !== sessionId) return;
-        loadChat(sessionId, (detail.messages ?? []).map(mapSessionMessage));
+        loadChat(sessionId, (detail.messages ?? []).map(mapSessionMessage), detail.vault_id);
         toast.info("Conversation changed elsewhere — reloaded the latest history.");
       } catch {
         toast.error("Couldn't update conversation history");
@@ -980,18 +1016,6 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
   // retrieval call, no LLM call. Only the latest exchange is offered; older
   // turns keep a stable transcript on reload.
   const lastMessage = useMessage(messageIds.length > 0 ? messageIds[messageIds.length - 1] : "__none__");
-  // Primitive selector (re-renders only when the last user content string
-  // changes) — keeps the pane off full-store subscriptions (#616) and off
-  // getState()-in-render (partial store mocks in existing suites).
-  const lastUserContent = useChatStore((s) => {
-    for (let i = s.messageIds.length - 1; i >= 0; i--) {
-      const msg = s.messagesById[s.messageIds[i]];
-      if (msg?.role === "user") {
-        return typeof msg.content === "string" ? msg.content : "";
-      }
-    }
-    return "";
-  });
   const followUpSuggestions = useMemo(() => {
     if (isStreaming || !lastMessage || lastMessage.role !== "assistant") return [];
     if (lastMessage.status && lastMessage.status !== "complete") return [];
@@ -1003,8 +1027,13 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
       .map((s) => (typeof s.filename === "string" ? s.filename : ""))
       .filter((t) => t.length > 0)
       .slice(0, 3);
-    return deriveFollowUps(lastUserContent, titles);
-  }, [isStreaming, lastMessage, lastUserContent]);
+    // Issue #1153 AC6: the topic derives from the ASSISTANT ANSWER
+    // (lastMessage.content) — what the turn established — not from the
+    // user question that prompted it.
+    const assistantAnswer =
+      typeof lastMessage.content === "string" ? lastMessage.content : "";
+    return deriveFollowUps(assistantAnswer, titles);
+  }, [isStreaming, lastMessage]);
 
   const handleSuggestionSelect = useCallback(
     (suggestion: string) => {
@@ -1047,7 +1076,9 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
         return;
       }
       const forkMessages = forked.messages.map(mapSessionMessage);
-      loadChat(String(forked.id), forkMessages);
+      // Issue #1153 AC5: the fork inherits the source session's stored vault
+      // scope — bind it so follow-ups in the forked session use it.
+      loadChat(String(forked.id), forkMessages, forked.vault_id);
       await refreshHistory();
       navigate(`/chat/${forked.id}`);
     } catch (err) {
@@ -1082,6 +1113,7 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
               <EmptyTranscript
                 onPromptClick={handlePromptClick}
                 hasIndexedDocs={hasIndexedDocs}
+                showChooseVaultState={showChooseVaultState}
                 onNavigateToDocuments={() => navigate("/documents")}
                 vaultName={activeVault?.name ?? null}
                 documentCount={activeVault?.file_count}

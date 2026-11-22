@@ -1512,7 +1512,11 @@ function SessionRailContent({
   // any indexed documents — if not, the more useful next step is uploading
   // documents, not opening another empty chat.
   if (sessions.length === 0) {
-    const hasIndexedDocs = activeVault ? activeVault.file_count > 0 : false;
+    // #1153 AC4 parity: gate the empty state on indexed documents, not the
+    // legacy total file_count (which includes pending/failed uploads), the
+    // same signal TranscriptPane uses.
+    const hasIndexedDocs =
+      activeVault ? (activeVault.indexed_file_count ?? 0) > 0 : false;
     return (
       <>
         {paletteAction}

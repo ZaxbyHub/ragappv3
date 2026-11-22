@@ -9,6 +9,8 @@ persisted in chat history. It handles four distinct patterns:
 3. Standard ``<think>...</think>`` thinking blocks (gpt-oss-120b and others).
 4. ``Thinking Process:`` followed by a ``</think>`` close even without an
    opening tag (defensive — fragmented streams may emit just the close).
+5. ``<answer>`` / ``</answer>`` wrapper TAGS (content preserved — the inner
+   text is the answer; issue #1153 AC1).
 
 All functions are idempotent: calling them twice on already-sanitized text
 returns the same result.
@@ -21,7 +23,7 @@ sanitization which lives in ``LLMClient.chat_completion_stream`` and uses
 from __future__ import annotations
 
 import re
-from typing import Iterable, List
+from typing import Iterable, List, Tuple
 
 # Module-level constants — each is a literal regex pattern.
 # Use ``re.DOTALL`` so ``.`` spans newlines.
@@ -38,6 +40,106 @@ _THINKING_PROCESS_BLOCK_RE = re.compile(
 _THINKING_PROCESS_PREFIX_RE = re.compile(
     r"^Thinking Process:[^\n]*\n", re.IGNORECASE
 )
+# Answer wrapper TAGS (issue #1153 AC1): some models wrap the final answer in
+# ``<answer>...</answer>`` elements. Unlike thinking blocks (removed with their
+# content), only the TAGS are stripped — the inner text IS the answer. Matches
+# openers with attributes and any casing; the pair need not be balanced on this
+# pass (a lone closer is equally stripped), and the pass is idempotent.
+_ANSWER_WRAPPER_OPEN_RE = re.compile(r"<answer\b[^>]*>", re.IGNORECASE)
+_ANSWER_WRAPPER_CLOSE_RE = re.compile(r"</answer\s*>", re.IGNORECASE)
+
+_OPEN_FENCE_RE = re.compile(r"(`{3,}|~{3,})")
+
+
+def _strip_answer_tags(text: str) -> str:
+    """Remove ``<answer>``/``</answer>`` wrapper tags from a run of text.
+
+    Applied to the WHOLE run (not line-by-line) so a wrapper tag that spans
+    lines is still removed.
+    """
+    return _ANSWER_WRAPPER_CLOSE_RE.sub(
+        "", _ANSWER_WRAPPER_OPEN_RE.sub("", text)
+    )
+
+
+def _find_code_fence_spans(text: str) -> List[Tuple[int, int]]:
+    """Return the ``(start, end)`` char offsets of fenced code blocks.
+
+    Honours the CommonMark rules that matter for protecting literal markup:
+    - an opening fence is 3+ backticks or tildes, indented at most 3 spaces;
+      a backtick opener's info string may not itself contain a backtick, so
+      `` ```a`b `` is NOT a fence and does not shield the rest of the text;
+    - a closing fence is the same marker character, at least as long as the
+      opener, with only trailing spaces/tabs — so a longer closer (```` for a
+      ``` block) terminates it, and a line with any other content does not;
+    - an unterminated fence runs to the end of the text.
+
+    Line endings are tolerated (a trailing ``\\r`` from CRLF is ignored for
+    detection but preserved in the returned offsets). Indentation is matched
+    against spaces/tabs only — a non-breaking space or other character in the
+    closer keeps the fence open, so protected content is never released early.
+    """
+    spans: List[Tuple[int, int]] = []
+    pos = 0
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    fence_start = 0
+    for line in text.split("\n"):
+        line_start = pos
+        core = line.rstrip("\r")  # CRLF: drop the CR, keep everything else
+        stripped = core.lstrip(" \t")  # up to 3 leading spaces/tabs are indent
+        indent = len(core) - len(stripped)
+        if not in_fence:
+            if indent <= 3:
+                open_match = _OPEN_FENCE_RE.match(stripped)
+                if open_match:
+                    marker = open_match.group(1)
+                    info = stripped[len(marker):]
+                    if marker[0] == "`" and "`" in info:
+                        pass  # invalid backtick opener — not a fence
+                    else:
+                        in_fence = True
+                        fence_char = marker[0]
+                        fence_len = len(marker)
+                        fence_start = line_start
+        elif indent <= 3 and stripped and re.fullmatch(
+            rf"{re.escape(fence_char)}{{{fence_len},}}[ \t]*", stripped
+        ):
+            # Closing fence: protect through the end of this line (the "\n"
+            # separator belongs to the following text, not the fence).
+            spans.append((fence_start, line_start + len(core)))
+            in_fence = False
+        pos = line_start + len(line) + 1
+    if in_fence:
+        spans.append((fence_start, len(text)))
+    return spans
+
+
+def _strip_answer_wrappers_outside_code_fences(text: str) -> str:
+    """Strip ``<answer>``/``</answer>`` wrapper tags only in non-fenced text.
+
+    A literal ``<answer>`` inside a fenced code block (an XML/HTML example, a
+    documentation snippet) is real content and must survive — both at runtime
+    and in the startup re-sanitize migration, which would otherwise
+    permanently rewrite historical messages. Only the wrapper tags outside
+    fences are removed (issue #1153 AC1).
+
+    Known limitation: fences nested inside block quotes / list items, and a
+    wrapper tag sitting on the same line as a fence marker, are not handled —
+    the rare cases where this matters are documented rather than special-cased.
+    """
+    spans = _find_code_fence_spans(text)
+    if not spans:
+        return _strip_answer_tags(text)
+    out: List[str] = []
+    last = 0
+    for start, end in spans:
+        out.append(_strip_answer_tags(text[last:start]))
+        out.append(text[start:end])  # fenced block: verbatim
+        last = end
+    out.append(_strip_answer_tags(text[last:]))
+    return "".join(out)
 
 
 def sanitize_assistant_content(content: str) -> str:
@@ -74,6 +176,11 @@ def sanitize_assistant_content(content: str) -> str:
     out = _UNTERMINATED_THINK_TAIL_RE.sub("", out)
     # 5. Leading "Thinking Process:" line without a close — defensive last pass
     out = _THINKING_PROCESS_PREFIX_RE.sub("", out)
+    # 6. Answer wrapper TAGS — strip the delimiters, keep the inner answer
+    #    (issue #1153 AC1: the tags reached persisted/returned content on a
+    #    deployed build). Fenced-code-aware so a literal ``<answer>`` inside a
+    #    code example is not corrupted (review F-07); idempotent.
+    out = _strip_answer_wrappers_outside_code_fences(out)
 
     return out.strip()
 

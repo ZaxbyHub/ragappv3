@@ -36,6 +36,7 @@ from app.services.eval_adapter import (
     RunResult,
     _get_release_id,
 )
+from app.services.eval_compare import environment_fingerprint
 
 #: Fixed release_id injected into all score_run calls in unit tests.
 _FIXED_RELEASE_ID = "test-run-abc123"
@@ -440,26 +441,89 @@ class TestPersistence:
 class TestReleaseId:
     """Test release_id acquisition via git or fallback."""
 
-    def test_release_id_from_git(self):
-        """_get_release_id returns a non-empty string (git or fallback)."""
+    def test_release_id_from_git(self, monkeypatch):
+        """_get_release_id returns the git short hash when git is available.
+
+        Points data_dir at the repo root so the git lookup runs in a real repo
+        regardless of the ambient cwd / DATA_DIR (CI sets neither reliably).
+        """
+        import shutil
+        from pathlib import Path
+
+        import app.services.eval_adapter as adapter_module
+
+        if shutil.which("git") is None:
+            pytest.skip("git not on PATH")
+        repo_root = Path(__file__).resolve().parents[3]
+        monkeypatch.setattr(adapter_module.settings, "data_dir", repo_root / "data")
         release_id = _get_release_id()
         assert release_id is not None
         assert isinstance(release_id, str)
         assert len(release_id) > 0
 
-    def test_release_id_fallback_unknown_when_git_unavailable(self):
-        """When git fails, falls back to 'unknown' (settings has no app_version attr)."""
+    def test_release_id_none_when_git_unavailable_and_no_env(self, monkeypatch):
+        """When git fails AND no env override, returns None (not a cached marker).
+
+        Issue #800 AC4: a synthetic 'unknown' that gets cached for the process
+        life is the defect. ``None`` signals the caller to retry.
+        """
         import subprocess
 
-        import app.services.eval_adapter as adapter_module
+        monkeypatch.delenv("APP_RELEASE_ID", raising=False)
+        monkeypatch.delenv("APP_VERSION", raising=False)
 
-        # Patch subprocess.run to simulate git not being available
-        with patch.object(
-            subprocess, "run", side_effect=FileNotFoundError("git not found")
-        ):
-            release_id = _get_release_id()
-            # Since settings has no app_version, fallback is "unknown"
-            assert release_id == "unknown"
+        def _boom(*a, **k):
+            raise FileNotFoundError("git not found")
+
+        monkeypatch.setattr(subprocess, "run", _boom)
+        assert _get_release_id() is None
+
+    def test_release_id_env_override_when_git_unavailable(self, monkeypatch):
+        """A stable env override is returned (and is safe to cache) when git fails."""
+        import subprocess
+
+        monkeypatch.delenv("APP_RELEASE_ID", raising=False)
+        monkeypatch.delenv("APP_VERSION", raising=False)
+        monkeypatch.setenv("APP_RELEASE_ID", "ci-build-42")
+        monkeypatch.setattr(
+            subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(
+                FileNotFoundError("git not found"))
+        )
+        assert _get_release_id() == "ci-build-42"
+
+    def test_release_id_empty_git_output_falls_through_to_env(self, monkeypatch):
+        """A successful git with EMPTY stdout must not shadow the env override
+        (review r2): it falls through to APP_RELEASE_ID, then to None."""
+        import subprocess
+
+        class _Empty:
+            returncode = 0
+            stdout = "   \n"
+
+        monkeypatch.delenv("APP_RELEASE_ID", raising=False)
+        monkeypatch.delenv("APP_VERSION", raising=False)
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Empty())
+        assert _get_release_id() is None
+
+        monkeypatch.setenv("APP_RELEASE_ID", "ci-build-99")
+        assert _get_release_id() == "ci-build-99"
+
+
+class TestFingerprintReleaseIdNoneSafe(unittest.TestCase):
+    """r2: the environment fingerprint hashes its release_id, so a None
+    (unresolved git + no env override) must be coerced before hashing, not
+    passed to hashlib (which raises on None.encode)."""
+
+    def test_fingerprint_tolerates_none_release_id(self):
+        fp = environment_fingerprint(
+            release_id=None,
+            model_identity={"model": "m", "release_id": "unknown"},
+            config_snapshot={"top_k": 10},
+            resource_ids=["a", "b"],
+        )
+        # Does not raise on None; code_hash is a stable 64-char hex digest.
+        self.assertIn("code_hash", fp)
+        self.assertEqual(len(fp["code_hash"]), 64)
 
 
 class TestDuplicateIdRejection(unittest.TestCase):

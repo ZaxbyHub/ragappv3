@@ -293,7 +293,7 @@ describe("TranscriptPane cancel-restore (issue #991 review PRR-003(b))", () => {
       seedRow(3, "user", "question-2", 3),
       seedRow(4, "assistant", "answer-2", 4),
     ];
-    useChatStore.getState().loadChat("42", server.rows.map(mapSessionMessage));
+    useChatStore.getState().loadChat("42", server.rows.map(mapSessionMessage), 7);
 
     // Foreign stream: starts, feeds one token, then stays LIVE (no terminal
     // callback) so streamingMessageId is non-null when the revision's
@@ -400,7 +400,7 @@ describe("TranscriptPane cancel-restore (issue #991 review PRR-003(b))", () => {
       seedRow(3, "user", "question-2", 3),
       seedRow(4, "assistant", "answer-2", 4),
     ];
-    useChatStore.getState().loadChat("42", server.rows.map(mapSessionMessage));
+    useChatStore.getState().loadChat("42", server.rows.map(mapSessionMessage), 7);
 
     apiMocks.chatStream.mockImplementation(
       async (

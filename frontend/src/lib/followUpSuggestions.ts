@@ -1,8 +1,10 @@
 // frontend/src/lib/followUpSuggestions.ts
-// Issue #573 (AC1): derive 2-3 short suggested next questions for a completed
-// assistant turn from the context that turn ALREADY retrieved (its sources)
-// plus the user's own question — deterministic, no LLM call, and crucially no
-// new retrieval call (the issue's constraint).
+// Issue #573 (AC1) / #1153 AC6: derive 2-3 short suggested next questions for
+// a completed assistant turn from the context that turn ALREADY produced
+// (its answer text and its sources) — deterministic, no LLM call, and
+// crucially no new retrieval call (the issue's constraint). The topic comes
+// from the ASSISTANT ANSWER (issue #1153 AC6): the answer names what the
+// turn actually established, while the user question names what was asked.
 
 /** Interrogatives/fillers stripped from the front of the user query so the
  * topic embeds grammatically ("…risks around the coolant interval"). */
@@ -39,14 +41,57 @@ function capAtWordBoundary(text: string, max: number): string {
   return out || text;
 }
 
-/** Trim to a short topic phrase suitable for embedding in a question. */
-function topicFrom(userContent: string): string {
-  const cleaned = userContent
+/** Trim to a short topic phrase suitable for embedding in a question.
+ * Issue #1153 AC6: the input is the ASSISTANT ANSWER text — the topic must
+ * name what the turn established, not what the user asked. */
+/** Answer-chrome that must not leak into a follow-up topic (review F-05):
+ *  citation labels the prompt builder emits (`[S1]`, `[M2]`, `[A1]`), inline
+ *  markdown (`**bold**`, `*italic*`, `` `code` ``), and boilerplate openers
+ *  ("Based on the documents,", "Here is"). Stripped before the topic phrase
+ *  is chosen so a chip reads "coolant interval" not "Based on the documents,
+ *  the coolant". */
+const ANSWER_OPENERS = [
+  "based on the documents",
+  "based on the sources",
+  "based on the provided",
+  "based on this",
+  "according to the documents",
+  "according to the sources",
+  "according to",
+  "here is",
+  "here are",
+  "here's",
+];
+
+function stripAnswerChrome(text: string): string {
+  return text
+    // Citation labels the backend emits: [S#] source, [M#] memory, [W#] wiki,
+    // [K#] KMS, [D#] document (citation_validator's allowed set), multi-digit.
+    .replace(/\[[SMWKD]\d+\]/gi, "")
+    // Markdown headings ("# Title") and inline emphasis / code delimiters.
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/(\*\*|\*|`)/g, "")
     .replace(/\s+/g, " ")
-    .replace(/[?.!]+\s*$/, "")
-    .trim()
-    .replace(/^(please|could you|can you|would you)\s+/i, "")
     .trim();
+}
+
+function stripLeadingOpener(text: string): string {
+  for (const opener of ANSWER_OPENERS) {
+    const re = new RegExp(`^${opener}\\s*,?\\s*`, "i");
+    const next = text.replace(re, "");
+    if (next !== text) return next.trim();
+  }
+  return text;
+}
+
+function topicFrom(assistantAnswer: string): string {
+  const cleaned = stripLeadingOpener(
+    stripAnswerChrome(assistantAnswer)
+      .replace(/[?.!]+\s*$/, "")
+      .trim()
+      .replace(/^(please|could you|can you|would you)\s+/i, "")
+      .trim()
+  );
   if (!cleaned) return "";
   let words = cleaned.split(" ");
   // Strip ONE leading imperative verb — even when it is the only word, so a
@@ -81,14 +126,16 @@ function truncate(text: string, max: number): string {
 }
 
 /**
- * Derive follow-up suggestions from the turn's already-retrieved context.
- * Returns 0-3 strings; empty when there is nothing to work from.
+ * Derive follow-up suggestions from the turn's already-produced context.
+ * Issue #1153 AC6: the FIRST argument is the assistant ANSWER text (the
+ * topic source); source titles ground the comparison suggestions. Returns
+ * 0-3 strings; empty when there is nothing to work from.
  */
 export function deriveFollowUps(
-  userContent: string,
+  assistantContent: string,
   sourceTitles: string[]
 ): string[] {
-  const topic = topicFrom(userContent ?? "");
+  const topic = topicFrom(assistantContent ?? "");
   const titles = (sourceTitles ?? [])
     .map((t) => (typeof t === "string" ? t.trim() : ""))
     .filter((t) => t.length > 0)

@@ -60,6 +60,7 @@ function resetStores(): void {
     inputError: null,
     expandedSources: new Set(),
     activeChatId: null,
+    activeSessionVaultId: null,
     pendingTurnPersist: null,
     messageEditVersions: {},
     activeEditVersion: {},
@@ -140,7 +141,10 @@ describe("useSendMessage turn persistence across a remount (issue #685 / PRR-001
   });
 
   it("onSessionCreated is not invoked when the send uses an existing session (F-004)", async () => {
-    useChatStore.setState({ activeChatId: "7" });
+    // Bind the existing session's scope explicitly — an unbound existing
+    // session (activeSessionVaultId null) hits the AC5 loud block instead of
+    // sending, so this test would otherwise pass only on a leaked scope.
+    useChatStore.setState({ activeChatId: "7", activeSessionVaultId: 7 });
     // Complete immediately so the send settles.
     apiMocks.chatStream.mockImplementation(
       (

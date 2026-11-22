@@ -49,7 +49,7 @@ function savedRows(
 
 async function startSend(refreshHistory: ReturnType<typeof vi.fn>) {
   await act(async () => {
-    useChatStore.setState({ activeChatId: "42", input: "question" });
+    useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "question" });
   });
   installAbortableStream();
 

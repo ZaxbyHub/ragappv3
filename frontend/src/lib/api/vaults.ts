@@ -7,6 +7,11 @@ export interface Vault {
   created_at: string;
   updated_at: string;
   file_count: number;
+  /** Documents actually retrievable by chat (files.status='indexed' — the
+   * same admission unscoped retrieval applies). file_count counts every row
+   * including pending/failed uploads, so "has content to chat over" checks
+   * must read THIS field (issue #1153 AC4). */
+  indexed_file_count: number;
   memory_count: number;
   session_count: number;
   org_id: number | null;
