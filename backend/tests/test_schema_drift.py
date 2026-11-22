@@ -54,7 +54,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # for background workers (ingestion first; wiki/KMS, reindex and draft follow).
 # 72 -> 73: issue #782 (UI-ENH-07 stage 2) adds user_onboarding_state (the
 # per-user first-run milestone record: first citation open + checklist dismissal).
-EXPECTED_BASE_TABLE_COUNT = 73
+# 73 -> 74: PR #1193 (#800 AC3) adds quality_eval_cases_archive — the reversible
+# archive for distinct legacy eval cases the one-case-per-report index converges.
+EXPECTED_BASE_TABLE_COUNT = 74
 
 # Curated set of critical application tables that must always exist. If any of
 # these disappears, the drift test fails with a clear message naming the table.

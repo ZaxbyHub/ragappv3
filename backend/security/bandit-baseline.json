@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 102987,
+      "loc": 103037,
       "nosec": 0,
       "skipped_tests": 73
     },
@@ -569,7 +569,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 7322,
+      "loc": 7331,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1908,7 +1908,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 125,
+      "loc": 166,
       "nosec": 0,
       "skipped_tests": 0
     },

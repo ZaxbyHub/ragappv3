@@ -3310,6 +3310,11 @@ def migrate_add_quality_idempotency_indexes(sqlite_path: str) -> None:
       journaled via ``record_migration_outcome`` inside the same transaction.
     """
     conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
+    # Autocommit mode (isolation_level=None) so the up-front DDL commits on its
+    # own and a failed-attempt journal row (written after rollback, on the same
+    # connection) commits immediately — matching the sibling journaled dedups.
+    conn.isolation_level = None
+    _journal = "migrate_add_quality_idempotency_indexes"
     try:
         # The archive table must exist before the convergence runs (and on every
         # fresh install), so create it up front — even when the fast path below
@@ -3483,8 +3488,20 @@ def migrate_add_quality_idempotency_indexes(sqlite_path: str) -> None:
         ):
             conn.execute(index_stmt)
         conn.commit()
-    except Exception:
+    except Exception as exc:
         conn.rollback()
+        # Best-effort failure journal (autocommit mode: this row commits even
+        # though the convergence rolled back). record_migration_outcome is
+        # itself fail-safe (it catches sqlite3.Error and only warns), so a
+        # journaling failure cannot mask the original error; then re-raise so
+        # run_migrations' degraded-startup surface is unchanged.
+        record_migration_outcome(
+            conn,
+            migration_name=_journal,
+            phase="failed",
+            outcome="error",
+            detail=f"{type(exc).__name__}: {exc}"[:500],
+        )
         raise
     finally:
         conn.close()
