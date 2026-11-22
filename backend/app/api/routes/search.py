@@ -631,7 +631,15 @@ async def unified_search(
             placeholders = ",".join("?" * len(scope_vaults))
             chat_sql += f" AND vault_id IN ({placeholders})"
             chat_params.extend(scope_vaults)
-        if user.get("role") not in ("admin", "superadmin"):
+        if user.get("is_service_account"):
+            # Service accounts are minted role="superadmin"
+            # (deps.py get_current_user_or_service_account), but their
+            # scope vocabulary (documents:read) never includes chat, and
+            # chat titles are the first 50 chars of a user's message
+            # (chat.py title seeding) — an unscoped read here would leak
+            # other users' message content through unified search.
+            chat_sql += " AND user_id IS NULL"
+        elif user.get("role") not in ("admin", "superadmin"):
             chat_sql += " AND (user_id = ? OR user_id IS NULL)"
             chat_params.append(user.get("id"))
         chat_sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"

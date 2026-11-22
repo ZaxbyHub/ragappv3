@@ -588,6 +588,36 @@ class TestCompanions(unittest.TestCase):
 
     # Leg 12: missing-vs-denied envelope identity -----------------------------
 
+    # Leg 13: SA principals never read other users' chat titles -------------
+
+    def test_leg13_sa_cannot_read_other_users_chat_titles(self):
+        conn = self._pool.get_connection()
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO users (id, username, hashed_password, full_name, role, is_active) "
+                "VALUES (77, 'alice', 'x', 'Alice', 'member', 1)"
+            )
+            conn.execute(
+                "INSERT INTO chat_sessions (id, vault_id, user_id, title, created_at, updated_at) "
+                "VALUES (1, 2, 77, 'zqprobe alice private salary negotiation', ?, ?)",
+                (datetime.now(timezone.utc).isoformat(),) * 2,
+            )
+            conn.commit()
+        finally:
+            self._pool.release_connection(conn)
+        for params in ({"q": "zqprobe", "types": "chat"}, {"q": "zqprobe", "types": "chat", "vault_id": 2}):
+            r = self.client.get("/api/search/unified", params=params, headers=self._auth)
+            self.assertEqual(r.status_code, 200, r.text[:200])
+            chat_rows = [
+                item for item in r.json().get("results", []) if item.get("type") == "chat"
+            ]
+            self.assertEqual(
+                chat_rows,
+                [],
+                "service-account key must never receive other users' chat rows "
+                f"(params={params}); observed: {chat_rows}",
+            )
+
     def test_leg12_missing_vs_denied_identical_envelopes(self):
         calls = []
 

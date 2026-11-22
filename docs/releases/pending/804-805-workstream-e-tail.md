@@ -9,7 +9,15 @@
   as before (JWT first), and scoped `sak_` service-account keys are accepted
   with the shipped `documents:read` scope check (a write-only key gets 403).
   The vault-read policy seam (`_require_vault_read`) is unchanged and now
-  runs for service-account principals on every wiki read path.
+  runs for service-account principals on the two swapped wiki read routes
+  (the other wiki read routes remain JWT-only by design — see the PR's
+  recurrence census). Service-account principals are minted
+  role="superadmin" by the shipped mechanism (deps.py), so the vault
+  policy allows them every vault — the documented SA global-read model,
+  identical to POST /api/search. The unified-search chat arm is the one
+  deliberate exception: SA principals are scoped to unowned sessions
+  only (their scope vocabulary never includes chat, and chat titles are
+  the first 50 characters of a user's message).
 - **New `WikiReadTool` (#804).** A read-only agentic tool
   (`app/services/agentic_tools.py`) that resolves a wiki page by id and
   returns its markdown, gated on a single
