@@ -311,13 +311,21 @@ def test_queued_cancel_before_entry_restores_without_waiting(
 def test_cancel_at_await_waits_for_worker_then_restores(tmp_path: Path) -> None:
     """Release ordering + composite interleaving: cancel, worker unblocks to
     raise inside the still-open transaction (BaseException -> no
-    transaction_context rollback), backstop rolls back and restores."""
+    transaction_context rollback), backstop rolls back and restores.
+    PR #1198 feedback F-04: (1) a deterministic cancellation-observed
+    handshake — with the worker still parked on `release`, the cancel must be
+    HELD by the settle-wait for the whole wait window (the skip-the-settle-wait
+    mutant completes inside it, before release.set()); (2) the finally samples
+    the settled state BEFORE releasing — settlement (restore applied) must
+    already hold when the release runs."""
     release = threading.Event()
     env = _OutcomesEnv(
         tmp_path,
         block_after_user_delete=release,
         raise_after_user_delete=asyncio.CancelledError(),
     )
+    release_time_state: list[tuple[bool, bool]] = []
+    settle_wait_entries: list[bool] = []
     try:
 
         async def drive() -> None:
@@ -327,27 +335,56 @@ def test_cancel_at_await_waits_for_worker_then_restores(tmp_path: Path) -> None:
             try:
                 while not env.conn.after_delete_ran.is_set():
                     await asyncio.sleep(0.01)
-                await asyncio.sleep(0.05)  # backstop parks on the settle-wait
                 task.cancel()
+                # PR #1198 feedback F-04 (Stage-B reviews r1+r2): the handshake
+                # now OBSERVES settle-wait ENTRY, not just task pendingness. A
+                # spy on asyncio.to_thread records the backstop's settlement
+                # wait (`delete_settled.wait`, a bound threading.Event method)
+                # the moment the BaseException arm reaches it; the poll below
+                # fires only after that entry. The skip-the-settle-wait mutant
+                # NEVER calls delete_settled.wait (its recovery path threads
+                # only the rollback lambda and restore_purge), so the poll
+                # times out and the test fails deterministically — independent
+                # of how long the mutant's delayed recovery takes.
+                orig_to_thread = users_mod.asyncio.to_thread
+
+                def _spy_to_thread(fn, *args, **kwargs):
+                    if (
+                        getattr(fn, "__name__", "") == "wait"
+                        and isinstance(getattr(fn, "__self__", None), threading.Event)
+                    ):
+                        settle_wait_entries.append(True)
+                    return orig_to_thread(fn, *args, **kwargs)
+
+                with patch.object(
+                    users_mod.asyncio, "to_thread", _spy_to_thread
+                ):
+                    deadline = time.monotonic() + 2.0
+                    while not settle_wait_entries and time.monotonic() < deadline:
+                        await asyncio.sleep(0.01)
+                assert settle_wait_entries, (
+                    "settle-wait ENTRY was never observed: the backstop "
+                    "skipped the settlement wait (delete_settled.wait never "
+                    "called)"
+                )
+                release.set()  # worker wakes, raises CancelledError inside txn
                 with pytest.raises(asyncio.CancelledError):
                     await task
             finally:
                 # Request-scoped release (the Depends(get_db) finally in
                 # production): after the coroutine settles, on any outcome.
+                # Sample BEFORE releasing (PR #1198 feedback F-04): the
+                # settled restore must hold at release time.
+                release_time_state.append((env.rows_survive(), env.input_live()))
                 env.facade.release_connection(env.conn)
 
-        async def runner() -> None:
-            task = asyncio.create_task(drive())
-            while not env.conn.after_delete_ran.is_set():
-                await asyncio.sleep(0.01)
-            await asyncio.sleep(0.05)
-            release.set()  # worker wakes, raises CancelledError inside txn
-            await task
-
-        asyncio.run(runner())
+        asyncio.run(drive())
         assert env.rows_survive()
         assert env.input_live(), "rolled-back worker outcome must restore"
         assert env.facade.hook_done_at_release, "connection was released"
+        assert release_time_state == [(True, True)], (
+            "settlement (restore applied) must already hold when the release runs"
+        )
         assert all(
             env.facade.hook_done_at_release
         ), "connection released only after the worker settled"
@@ -393,16 +430,28 @@ def test_cancel_at_await_worker_commits_keeps_tombstones(tmp_path: Path) -> None
 
 def test_restore_failure_logs_and_original_exception_wins(tmp_path: Path) -> None:
     env = _OutcomesEnv(tmp_path, raise_after_user_delete=ValueError)
+    restore_calls: list[tuple[object, ...]] = []
+
+    def _failing_restore(*args, **kwargs):
+        # PR #1198 feedback F-05: assert the backstop actually runs — record
+        # the attempt before the scripted failure.
+        restore_calls.append(args)
+        raise OSError("scripted restore failure")
+
     try:
         with (
             patch.object(
                 DraftDeletionService,
                 "restore_purge",
-                side_effect=OSError("scripted restore failure"),
+                side_effect=_failing_restore,
             ),
             pytest.raises(ValueError),
         ):
             asyncio.run(delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t", db=env.conn))
+        assert restore_calls, (
+            "the restore backstop must actually be attempted before the "
+            "primary exception is reported"
+        )
     finally:
         env.close()
 
@@ -480,11 +529,11 @@ def test_second_cancel_during_settle_wait_is_drained_not_abandoning(tmp_path: Pa
     worker no longer aborts the wait — the settle-wait is DRAINED, so
     settlement is observed, the (non-committed) restore runs, and only then
     does the original CancelledError propagate. Containment still holds:
-    the worker reaches its terminal outcome, and the connection is
-    released exactly once, only AFTER settlement (release modeled by the
-    test's own request-scope finally, mirroring the Depends(get_db)
-    teardown in production — the assertions still catch an early or
-    double release by the route)."""
+    the worker reaches its terminal outcome, and the connection is released
+    exactly once by the test's own request-scope finally (mirroring the
+    Depends(get_db) teardown in production) — after settlement. The route
+    itself holds no release call at head; the facade records that single
+    release (PR #1198 feedback F-04 docstring correction)."""
     release = threading.Event()
     env = _OutcomesEnv(
         tmp_path,

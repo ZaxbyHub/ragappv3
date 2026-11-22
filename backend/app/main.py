@@ -174,7 +174,14 @@ class _TrustedHostWithHealthExempt(TrustedHostMiddleware):
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            path = (scope.get("path") or "/").rstrip("/") or "/"
+            # Exact-path match only (PR #1198 feedback F-02): a trailing-slash
+            # form (/health/, /api/healthz/) is NOT exempt and stays under host
+            # validation — under the previous rstrip normalization Starlette's
+            # redirect_slashes built a 307 Location from the unvalidated,
+            # attacker-chosen Host header on exactly those forms. Health probes
+            # hit the canonical paths (docker-compose probes /health with no
+            # slash), so no probe flow changes.
+            path = scope.get("path") or "/"
             if path in _HEALTH_EXEMPT_PATHS:
                 await self.app(scope, receive, send)
                 return

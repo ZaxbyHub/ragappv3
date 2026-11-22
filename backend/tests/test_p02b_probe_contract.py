@@ -165,3 +165,89 @@ class TestModeGateBoundary:
             checker = LLMHealthChecker(llm_client=client, timeout=5.0)
             result = asyncio.run(checker.check_chat())
         assert result["ok"] is True
+
+
+class TestHotRebindConcurrentActivation:
+    def test_concurrent_first_activations_cannot_double_wire(self):
+        # PR #1198 feedback F-08: post_settings/put_settings are sync handlers
+        # (threadpool); _hot_rebind_llm_clients is the sole writer of the
+        # client slots. Two concurrent first-time activations must serialize:
+        # with the module lock, the second caller re-reads the slot the first
+        # wired and takes the reconfigure branch — exactly ONE client is
+        # constructed and wired. Without the lock both callers pass the
+        # None-check while the other is inside construction (the rendezvous
+        # barrier below) and construct divergent clients — the count asserts
+        # 1, so removing the lock turns this test red.
+        import threading
+
+        from app.api.routes import settings as settings_routes
+
+        constructions: list[object] = []
+        ctor_entered = threading.Event()
+        rendezvous = threading.Barrier(2)
+
+        class _FakeClient:
+            def reconfigure(self, **kwargs):
+                pass
+
+        def _fake_create_thinking_client():
+            constructions.append(_FakeClient())
+            ctor_entered.set()
+            try:
+                rendezvous.wait(timeout=1.5)
+            except threading.BrokenBarrierError:
+                pass
+            return constructions[-1]
+
+        app = MagicMock()
+        app.state.thinking_llm_client = None
+        app.state.instant_llm_client = None
+        app.state.llm_client = None
+        app.state.rag_engine = None
+        app.state.llm_health_checker = None
+        update = MagicMock()
+        update.ollama_chat_url = "http://test"
+        update.chat_model = "test-model"
+        update.thinking_max_tokens = None
+        update.chat_api_key = None
+        update.instant_chat_url = None
+        update.instant_chat_model = None
+        update.instant_enable_thinking = None
+
+        # Stage-B review r3: BOTH patches are installed ONCE in the test
+        # body, outside both worker threads — per-thread patch contexts can
+        # overlap (thread 2 saves thread 1's mocks as its "originals") and
+        # restore out of order, leaking mocks into later tests.
+        with patch("app.api.routes.settings.settings") as ms, patch(
+            "app.services.llm_client.create_thinking_client",
+            _fake_create_thinking_client,
+        ):
+            ms.ollama_chat_url = "http://test"
+            ms.chat_model = "test-model"
+            ms.thinking_max_tokens = 4096
+            ms.chat_api_key = ""
+            ms.instant_chat_url = ""
+            ms.instant_chat_model = ""
+            ms.instant_max_tokens = 256
+            ms.instant_enable_thinking = False
+            ms.instant_api_key = ""
+
+            def _caller():
+                settings_routes._hot_rebind_llm_clients(app, update)
+
+            first = threading.Thread(target=_caller)
+            first.start()
+            assert ctor_entered.wait(timeout=5.0), "first activation never reached construction"
+            second = threading.Thread(target=_caller)
+            second.start()
+            first.join(timeout=15.0)
+            second.join(timeout=15.0)
+        assert not first.is_alive() and not second.is_alive(), (
+            "concurrent activations deadlocked (lock not released?)"
+        )
+        assert len(constructions) == 1, (
+            "two first-time activations must serialize to ONE constructed "
+            f"client (got {len(constructions)}; lock removed or bypassed?)"
+        )
+        assert app.state.thinking_llm_client is constructions[0]
+        assert app.state.llm_client is constructions[0]

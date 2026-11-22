@@ -1,6 +1,7 @@
 import json
 import logging
 import sqlite3
+import threading
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -1471,7 +1472,21 @@ def _compute_effective_sources(conn: Optional[sqlite3.Connection]) -> dict[str, 
     return out
 
 
+# PR #1198 feedback F-08: post_settings/put_settings are sync handlers
+# (threadpool) and _hot_rebind_llm_clients is the sole writer of the client
+# slots on app.state; serialize concurrent saves so two racing first-time
+# activations cannot both see `client is None` and wire divergent client
+# objects into app.state / rag_engine / the health checker.
+_HOT_REBIND_LOCK = threading.Lock()
+
+
 def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
+    """Serialize the rebind work (race note above); see the locked body."""
+    with _HOT_REBIND_LOCK:
+        _hot_rebind_llm_clients_locked(app, update)
+
+
+def _hot_rebind_llm_clients_locked(app, update: SettingsUpdate) -> None:
     """Apply live URL/model updates to the running LLMClient instances.
 
     The ``settings`` singleton has already been mutated by

@@ -48,9 +48,20 @@ candidate; the pool-hold fix removes one saturation source).
 
 No schema or config migration. Databases whose startup migration was
 skipped or failed now fail auth LOUDLY instead of silently disabling
-password-change token invalidation — that is the intended fail-fast; run
-migrations (normal startup does) to restore service. Rollback: revert the
-PR; the silent fallback returns on revert only for such degraded schemas.
+password-change token invalidation — that is the intended fail-fast.
+Be aware of the concrete shape: every authenticated password-user request
+returns a generic 500 (admins included) and `/api/healthz` reports 503
+until the operator repairs the schema. Run migrations (normal startup
+does) to restore service. If startup migration failed on a deterministic
+step, a restart does NOT converge — the failing step refuses every boot,
+so repair the schema out-of-band, then restart.
+
+## Rollback
+
+Revert the PR; the silent fallback returns on revert only for such
+degraded schemas. Note that bounded health-probe timeouts no longer
+charge the LLM circuit breaker (the probe's inner call is cancelled, so
+`record_failure` is skipped) — user traffic still charges it normally.
 
 ## Caveats
 

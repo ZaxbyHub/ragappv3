@@ -397,7 +397,9 @@ middleware's reach — on every launch path, so these requests produce no
 access line anywhere: CORS preflight OPTIONS responses (the CORS layer,
 outermost of the always-registered core, answers them itself) and
 invalid-Host 400s (answered by the host-header validator, which registers
-outside CORS when allowed_hosts is configured).
+outside CORS when allowed_hosts is configured; health endpoints are exempt
+from host validation so probes without the probe hostname in
+ALLOWED_HOSTS keep working).
 
 Operators who want uvicorn's own access lines back (for example to
 correlate raw connection behavior) can re-enable them by launching without
@@ -1225,7 +1227,7 @@ For a subpath deployment such as `https://example.com/knowledgevault/`, configur
 | `VITE_API_URL` | Build arg (optional) | API URL override. Derived from `VITE_APP_BASENAME` when empty |
 | `BACKEND_CORS_ORIGINS` | Runtime env | Allowed CORS origins for your domain |
 | `FORWARDED_ALLOW_IPS` | Runtime env | Trusted proxy IPs for forwarded headers |
-| `ALLOWED_HOSTS` | Runtime env | Allowed Host header values for TrustedHostMiddleware |
+| `ALLOWED_HOSTS` | Runtime env | Allowed Host header values for TrustedHostMiddleware; health endpoints (`/health`, `/api/health`, `/api/healthz`) are exempt so probes without the probe hostname in `ALLOWED_HOSTS` keep working |
 
 **Minimal configuration** (`.env` or environment):
 

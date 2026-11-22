@@ -61,10 +61,30 @@ class TestExemptionSurface:
         r = c.get("/ordinary", headers={"Host": "example.com"})
         assert r.status_code == 200
 
-    def test_trailing_slash_normalization(self):
+    def test_trailing_slash_allowed_host_redirects_and_serves(self):
+        # Exact-path exemption (PR #1198 feedback F-02): a trailing-slash form
+        # is NOT exempt, so it goes through host validation — an ALLOWED host
+        # passes and the router 307s to the canonical path. Stage-B review r1:
+        # pin the INTERMEDIATE redirect (follow_redirects=False) before the
+        # served canonical response, so a direct-200 regression cannot satisfy
+        # the same assertion.
         c = _client(_app())
-        r = c.get("/health/", headers={"Host": "localhost"})
-        assert r.status_code == 200
+        r = c.get("/health/", headers={"Host": "example.com"}, follow_redirects=False)
+        assert r.status_code == 307
+        assert r.headers["location"] == "http://example.com/health"
+        served = c.get("/health", headers={"Host": "example.com"})
+        assert served.status_code == 200
+
+    def test_trailing_slash_invalid_host_rejected_before_redirect(self):
+        # FB-001 discriminator (PR #1198 feedback F-02): with the exemption
+        # exact-matched, an invalid Host on a trailing-slash health form is
+        # rejected (400) BEFORE the router can build a 307 Location from the
+        # unvalidated, attacker-chosen header (was an attacker-reflecting
+        # Location under the rstrip normalization).
+        c = _client(_app())
+        r = c.get("/health/", headers={"Host": "evil.example"})
+        assert r.status_code == 400
+        assert "location" not in {k.lower() for k in r.headers}
 
     def test_bare_path_with_root_path_scope(self):
         # Supported subpath shape (admin-guide: the proxy strips the mount
@@ -104,9 +124,27 @@ class TestExemptionSurface:
 
     def test_non_http_scope_delegates_to_base(self):
         # A websocket-style scope must pass through the base implementation
-        # unharmed (its host check answers 403-close, not crash).
+        # unharmed. PR #1198 feedback F-05 (closeout review r1 correction):
+        # the installed Starlette base class validates WEBSOCKET hosts too
+        # (trustedhost.py checks scope["type"] in ("http", "websocket")) and
+        # denies an invalid host with a WRAPPED denial — http.response.start
+        # re-emitted as websocket.http.response.start (responses.py
+        # _wrap_websocket_denial_send). This leg pins that boundary: an
+        # invalid-Host websocket scope on an EXEMPT path must be denied by
+        # the BASE host validation (app never called) — if the subclass's
+        # scope-type guard were removed (mutant: every scope takes the
+        # exempt branch), the scope would route to the app instead and the
+        # app's router would answer with a bare websocket.close, so BOTH
+        # assertions below fail.
         app = _app()
-        wrapped = _TrustedHostWithHealthExempt(app, allowed_hosts=["example.com"])
+        app_called: list[str] = []
+
+        class _Spy:
+            async def __call__(self, scope, receive, send):
+                app_called.append(scope["type"])
+                await app(scope, receive, send)
+
+        wrapped = _TrustedHostWithHealthExempt(_Spy(), allowed_hosts=["example.com"])
 
         async def _drive():
             events = []
@@ -121,9 +159,9 @@ class TestExemptionSurface:
                 "type": "websocket",
                 "http_version": "1.1",
                 "scheme": "ws",
-                "path": "/ws",
+                "path": "/health",
                 "root_path": "",
-                "headers": [(b"host", b"localhost")],
+                "headers": [(b"host", b"evil.example")],
                 "query_string": b"",
                 "server": ("localhost", 80),
                 "client": ("127.0.0.1", 1),
@@ -138,12 +176,12 @@ class TestExemptionSurface:
         import asyncio
 
         outcome, events = asyncio.run(_drive())
-        # What matters for the exemption fix: a non-HTTP scope traverses
-        # __call__ without crashing and without the health exemption
-        # misfiring (no http.response.start events, no pass-through of an
-        # http-style response). The base/app stack owns the exact reject
-        # shape (host check close vs router 403-close).
         assert outcome == "ok", outcome
-        assert not [e for e in events if e.get("type") == "http.response.start"], (
-            "a websocket scope must not be served as an exempt HTTP response"
+        assert app_called == [], (
+            "an invalid-Host websocket scope must be denied by the base host "
+            "validation, never routed to the app (scope-type guard bypassed?)"
+        )
+        assert [e for e in events if e.get("type") == "websocket.http.response.start"], (
+            "the denial must be the base validator's wrapped 400 "
+            "(websocket.http.response.start), not an app-side websocket.close"
         )

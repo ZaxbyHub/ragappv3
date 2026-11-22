@@ -17,6 +17,7 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.middleware.logging import LoggingMiddleware  # noqa: E402
+from app.utils.request_context import RequestIdFilter, request_id_var  # noqa: E402
 
 
 def _capture_logger():
@@ -30,9 +31,19 @@ def _records_for(logger):
             if record.getMessage() == "http_request":
                 out.append(record)
     h = _Cap()
+    # PR #1198 feedback F-05: production filter-chain parity — the capture
+    # handler carries RequestIdFilter like the lifespan-wired root handler.
+    h.addFilter(RequestIdFilter())
     logger.addHandler(h)
+    h._saved_level = logger.level
     logger.setLevel(logging.INFO)
     return h, out
+
+
+def _release_capture(logger, handler):
+    """Restore the level _records_for raised and drop the capture handler."""
+    logger.setLevel(handler._saved_level)
+    logger.removeHandler(handler)
 
 
 class TestExceptionAccessRecord:
@@ -40,8 +51,15 @@ class TestExceptionAccessRecord:
         app = FastAPI()
         app.add_middleware(LoggingMiddleware)
 
+        seen_request_ids: list[str] = []
+
         @app.get("/boom")
         async def boom():
+            # Sample the LIVE request id inside the handler (PR #1198 feedback
+            # F-05): the 500 record must carry THIS id — emitted while the
+            # request context is still set, before any reset — not a
+            # post-reset empty value.
+            seen_request_ids.append(request_id_var.get(""))
             raise RuntimeError("probe")
 
         logger = _capture_logger()
@@ -51,14 +69,18 @@ class TestExceptionAccessRecord:
             resp = client.get("/boom?secret=abc123&q=x")
             assert resp.status_code == 500
         finally:
-            logger.removeHandler(handler)
+            _release_capture(logger, handler)
         assert len(out) == 1, "exactly one http_request record"
         rec = out[0]
         assert rec.status_code == 500
         assert rec.method == "GET"
         assert rec.path == "/boom"
         assert rec.duration_ms >= 0
-        assert rec.request_id, "request_id present through the contextvar"
+        assert rec.request_id, "request_id present through the filter chain"
+        assert rec.request_id == seen_request_ids[0], (
+            "the record carries the LIVE request id (emit happened before "
+            "the request-context reset), not a post-reset value"
+        )
         # query sanitized: the sensitive param is masked, not raw
         assert "abc123" not in str(rec.query)
 
@@ -85,7 +107,7 @@ class TestExceptionAccessRecord:
             else:
                 propagated = False
             finally:
-                logger.removeHandler(handler)
+                _release_capture(logger, handler)
             return propagated, out
 
         propagated, out = asyncio.run(_run())
@@ -109,6 +131,6 @@ class TestExceptionAccessRecord:
             resp = client.get("/ok")
             assert resp.status_code == 200
         finally:
-            logger.removeHandler(handler)
+            _release_capture(logger, handler)
         assert len(out) == 1
         assert out[0].status_code == 200

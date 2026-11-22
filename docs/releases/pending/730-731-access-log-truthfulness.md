@@ -117,3 +117,8 @@
   error middleware). The shipped container disables uvicorn's own access log,
   so these three classes have no per-request log line at all in that
   deployment; deployments that run uvicorn's access log get them there.
+  *(Superseded in part by #1179 (PR #1198): unhandled 500s now emit an
+  `http_request` record — the logging middleware's exception arm logs
+  status_code 500 before re-raising; the blind spot remains for CORS
+  preflight and invalid-Host 400s only, and 500 responses still carry no
+  `X-Request-ID` header.)*

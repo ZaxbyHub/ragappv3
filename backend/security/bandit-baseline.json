@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 102571,
+      "loc": 102579,
       "nosec": 0,
       "skipped_tests": 72
     },
@@ -348,7 +348,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1832,
+      "loc": 1838,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -478,7 +478,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 129,
+      "loc": 130,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1349,7 +1349,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 233,
+      "loc": 234,
       "nosec": 0,
       "skipped_tests": 0
     },

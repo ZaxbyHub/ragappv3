@@ -6,6 +6,7 @@ requests make no second checkout, and checkouts are released on success,
 denial, and exception outcomes. NOT a frozen check file.
 """
 import os
+import shutil
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -93,6 +94,8 @@ class _Env:
         settings.jwt_secret_key = self._saved_jwt
         self.pool.close_all()
         _pool_cache.clear()
+        # PR #1198 feedback F-05: the fixture leaked its SQLite dir per run.
+        shutil.rmtree(self.dir, ignore_errors=True)
 
 
 def test_admin_list_users_is_one_checkout_one_release(tmp_path):
