@@ -1,7 +1,7 @@
 """Content pin for the Backend CI flake-signature table (issue #1101).
 
 Issue #1101's deliverable is documentation: the ci-compatibility-audit skill
-must carry the five documented Backend flake families — each row with its log
+must carry the documented Backend flake families — each row with its log
 signature and its diff-foreign discriminator — plus the rerun decision rule,
 with the classification protocol stated BEFORE that rule (AC1 + AC2, both
 classed NON-EXECUTABLE(DOCS_ONLY)). This module is the executing substitute
@@ -47,6 +47,11 @@ FAMILIES = [
         "test_wedge_starved_pool_join_aborted_by_configured_timeout",
         "RUN_CI_HANG_CANARY",
     ),
+    (
+        "admission-cleanup load sensitivity",
+        "backend/tests/test_c08_admission_rejected_cleanup.py",
+        "backend/tests/eval/test_live_eval_adapter.py",
+    ),
 ]
 
 # Every file a signature row names must stay real — a moved test or script
@@ -56,6 +61,8 @@ REFERENCED_PATHS = [
     "backend/app/api/deps.py",
     "backend/tests/issue513_checks/test_c32_embedding_reuse_enrichment_retry.py",
     "backend/tests/test_ci_hang_canary.py",
+    "backend/tests/test_c08_admission_rejected_cleanup.py",
+    "backend/tests/eval/test_live_eval_adapter.py",
     "scripts/check_secretscan.py",
 ]
 
@@ -83,7 +90,7 @@ def test_section_sits_between_environment_caveats_and_output() -> None:
     assert caveats < section < output, "table must stay between caveats and Output"
 
 
-def test_all_five_families_carry_signature_and_discriminator() -> None:
+def test_all_documented_families_carry_signature_and_discriminator() -> None:
     section = _section()
     for label, signature, discriminator in FAMILIES:
         assert label in section, f"family row missing from table: {label}"
