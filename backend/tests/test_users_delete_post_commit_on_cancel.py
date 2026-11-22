@@ -40,6 +40,7 @@ from unittest.mock import patch  # noqa: E402
 import pytest  # noqa: E402
 from starlette.requests import Request  # noqa: E402
 
+from app.api import deps as deps_mod
 from app.api.routes import users as users_mod  # noqa: E402
 from app.api.routes.users import delete_user  # noqa: E402
 from app.config import settings  # noqa: E402
@@ -100,7 +101,7 @@ class _ScriptedConn:
         return getattr(self._inner, name)
 
 
-class _ReleaseTrackingPool:
+class _PassThroughPool:
     """Pool facade over the real pool handing the route the scripted conn."""
 
     def __init__(self, real_pool: SQLiteConnectionPool, conn: _ScriptedConn) -> None:
@@ -199,9 +200,9 @@ class _CancelCommitEnv:
         assert self.storage.exists(self.input_relpath)
         self.gate = threading.Event()
         self.conn = _ScriptedConn(self.real_pool.get_connection(), self.gate)
-        self.facade = _ReleaseTrackingPool(self.real_pool, self.conn)
-        self._saved_get_pool = users_mod.get_pool
-        users_mod.get_pool = lambda _path: self.facade
+        self.facade = _PassThroughPool(self.real_pool, self.conn)
+        self._saved_get_pool = deps_mod.get_pool
+        deps_mod.get_pool = lambda _path: self.facade
         self._saved_data_dir = settings.data_dir
         settings.data_dir = tmp_path
 
@@ -219,7 +220,7 @@ class _CancelCommitEnv:
         return sorted(entry.name for entry in trash_dir.iterdir())
 
     def close(self) -> None:
-        users_mod.get_pool = self._saved_get_pool
+        deps_mod.get_pool = self._saved_get_pool
         settings.data_dir = self._saved_data_dir
         self.real_pool.close_all()
         _pool_cache.clear()
@@ -246,6 +247,7 @@ def test_cancel_at_await_with_commit_still_runs_post_commit_bookkeeping(
                     delete_user(
                         VICTIM_USER_ID,
                         _request_for(VICTIM_USER_ID),
+                        db=env.conn,
                         user=_ADMIN_USER,
                         _csrf_token="t",
                     )

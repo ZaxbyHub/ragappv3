@@ -75,7 +75,7 @@ def test_second_cancel_while_settling_with_commit(tmp_path: Path) -> None:
 
         async def scenario() -> None:
             task = asyncio.create_task(
-                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t")
+                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t", db=env.conn)
             )
             _deadline = time.monotonic() + 30
             while not env.conn.after_delete_ran.is_set():
@@ -119,7 +119,7 @@ def test_normal_path_cancel_during_commit_purge(tmp_path: Path) -> None:
     try:
         async def scenario() -> None:
             task = asyncio.create_task(
-                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t")
+                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t", db=env.conn)
             )
             _deadline = time.monotonic() + 30
             while not env.conn.after_delete_ran.is_set():
@@ -172,7 +172,7 @@ def test_normal_path_cancel_during_audit_await(tmp_path: Path) -> None:
     try:
         async def scenario() -> None:
             task = asyncio.create_task(
-                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t")
+                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t", db=env.conn)
             )
             _deadline = time.monotonic() + 30
             while not env.conn.after_delete_ran.is_set():
@@ -220,7 +220,7 @@ def test_cache_invalidation_failure_still_records_audit(tmp_path: Path) -> None:
                 # Mid-test gate release: the 10s scripted fallback must never
                 # be this test's timing source (fix-review round 1).
                 task = asyncio.create_task(
-                    delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t")
+                    delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t", db=env.conn)
                 )
                 _deadline = time.monotonic() + 30
                 while not env.conn.after_delete_ran.is_set():
@@ -257,7 +257,7 @@ def test_audit_exception_alone_returns_success(tmp_path: Path) -> None:
                 # user DELETE lands — waiting out the scripted 10s fallback
                 # made this test a dead-clock pass (fix-review round 1).
                 task = asyncio.create_task(
-                    delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t")
+                    delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t", db=env.conn)
                 )
                 _deadline = time.monotonic() + 30
                 while not env.conn.after_delete_ran.is_set():
@@ -296,7 +296,7 @@ def test_cancel_during_finalization_combined_with_audit_exception(
     try:
         async def scenario() -> None:
             task = asyncio.create_task(
-                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t")
+                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t", db=env.conn)
             )
             _deadline = time.monotonic() + 30
             while not env.conn.after_delete_ran.is_set():

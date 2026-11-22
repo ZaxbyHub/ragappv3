@@ -42,6 +42,7 @@ import pytest
 from starlette.requests import Request
 from starlette.responses import Response
 
+from app.api import deps as deps_mod
 from app.api.routes import auth as auth_mod
 from app.api.routes import draft_room as draft_room_mod
 from app.api.routes import users as users_mod
@@ -195,7 +196,7 @@ class _World:
 
 
 def _site_users_update_user_role(tmp_path: Path) -> dict:
-    world = _World(tmp_path, users_mod, "audit-users.db")
+    world = _World(tmp_path, deps_mod, "audit-users.db")
     seed = world.pool.get_connection()
     try:
         seed.execute(
@@ -217,6 +218,7 @@ def _site_users_update_user_role(tmp_path: Path) -> dict:
                 2,
                 _request_for("PATCH", "/api/users/2/role"),
                 UpdateRoleRequest(role="admin"),
+                db=world.conn,
                 user=_SUPERADMIN,
                 _csrf_token="t",
             ),
@@ -474,7 +476,7 @@ def test_control_leg_no_cancellation_records_audit_exactly_once(
     scripted cancellation the same users.py site records exactly one audit
     row — proving row absence in the interleaved legs is the cancellation,
     not a seeding artifact."""
-    world = _World(tmp_path, users_mod, "audit-control.db")
+    world = _World(tmp_path, deps_mod, "audit-control.db")
     seed = world.pool.get_connection()
     try:
         seed.execute(
@@ -496,6 +498,7 @@ def test_control_leg_no_cancellation_records_audit_exactly_once(
                 2,
                 _request_for("PATCH", "/api/users/2/role"),
                 UpdateRoleRequest(role="admin"),
+                db=world.conn,
                 user=_SUPERADMIN,
                 _csrf_token="t",
             )

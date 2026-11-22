@@ -84,12 +84,6 @@ class TestMustChangePasswordInCreateUserInsert:
             finally:
                 test_pool.release_connection(conn)
 
-        # Patch get_pool in users module to return our test pool
-        from app.api.routes import users
-
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         from app.security import csrf_protect
@@ -98,7 +92,6 @@ class TestMustChangePasswordInCreateUserInsert:
 
         # Store for cleanup
         self.test_pool = test_pool
-        self.original_get_pool = original_get_pool
 
         from app.config import settings
         self._orig_users_enabled = settings.users_enabled
@@ -117,10 +110,6 @@ class TestMustChangePasswordInCreateUserInsert:
         _pool_cache.clear()
         self.conn.close()
 
-        # Restore original get_pool
-        from app.api.routes import users
-
-        users.get_pool = self.original_get_pool
         self.test_pool.close_all()
         settings.users_enabled = self._orig_users_enabled
         settings.jwt_secret_key = self._orig_jwt_secret
@@ -339,11 +328,6 @@ class TestMustChangePasswordBehaviorVsAdminReset:
             finally:
                 test_pool.release_connection(conn)
 
-        from app.api.routes import users
-
-        original_get_pool = users.get_pool
-        users.get_pool = lambda path: test_pool
-
         app.dependency_overrides[deps.get_db] = override_get_db
 
         from app.security import csrf_protect
@@ -410,7 +394,6 @@ class TestMustChangePasswordBehaviorVsAdminReset:
             client.close()
             _pool_cache.clear()
             conn.close()
-            users.get_pool = original_get_pool
             test_pool.close_all()
             settings.users_enabled = _orig_users_enabled
             settings.jwt_secret_key = _orig_jwt_secret

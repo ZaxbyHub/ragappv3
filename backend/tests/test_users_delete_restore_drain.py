@@ -49,7 +49,7 @@ from pathlib import Path  # noqa: E402
 import pytest  # noqa: E402
 from starlette.requests import Request  # noqa: E402
 
-from app.api.routes import users as users_mod  # noqa: E402
+from app.api import deps as deps_mod
 from app.api.routes.users import delete_user  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.models.database import SQLiteConnectionPool, _pool_cache, init_db  # noqa: E402
@@ -230,8 +230,8 @@ class _RestoreEnv:
         assert self.storage.exists(self.input_relpath)
         self.conn = None
         self.facade = None
-        self._saved_get_pool = users_mod.get_pool
-        users_mod.get_pool = lambda _path: self.facade
+        self._saved_get_pool = deps_mod.get_pool
+        deps_mod.get_pool = lambda _path: self.facade
         self._saved_data_dir = settings.data_dir
         settings.data_dir = tmp_path
 
@@ -254,7 +254,7 @@ class _RestoreEnv:
         return sorted(entry.name for entry in trash_dir.rglob("*") if entry.is_file())
 
     def close(self) -> None:
-        users_mod.get_pool = self._saved_get_pool
+        deps_mod.get_pool = self._saved_get_pool
         settings.data_dir = self._saved_data_dir
         try:
             self.real_pool.release_connection(self.conn._inner)
@@ -302,6 +302,7 @@ def test_second_cancel_at_rollback_await_still_restores_purge(tmp_path: Path) ->
             delete_user(
                 VICTIM_USER_ID,
                 _request_for(VICTIM_USER_ID),
+                db=await deps_mod.get_pool("").get_connection_async(),
                 user=_ADMIN_USER,
                 _csrf_token="t",
             )
@@ -380,6 +381,7 @@ def test_failing_settle_wait_task_settles_on_event_truth(tmp_path: Path) -> None
                     delete_user(
                         VICTIM_USER_ID,
                         _request_for(VICTIM_USER_ID),
+                        db=env.conn,
                         user=_ADMIN_USER,
                         _csrf_token="t",
                     )

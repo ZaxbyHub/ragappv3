@@ -1,6 +1,7 @@
 import json
 import logging
 import sqlite3
+import threading
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -1471,7 +1472,21 @@ def _compute_effective_sources(conn: Optional[sqlite3.Connection]) -> dict[str, 
     return out
 
 
+# PR #1198 feedback F-08: post_settings/put_settings are sync handlers
+# (threadpool) and _hot_rebind_llm_clients is the sole writer of the client
+# slots on app.state; serialize concurrent saves so two racing first-time
+# activations cannot both see `client is None` and wire divergent client
+# objects into app.state / rag_engine / the health checker.
+_HOT_REBIND_LOCK = threading.Lock()
+
+
 def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
+    """Serialize the rebind work (race note above); see the locked body."""
+    with _HOT_REBIND_LOCK:
+        _hot_rebind_llm_clients_locked(app, update)
+
+
+def _hot_rebind_llm_clients_locked(app, update: SettingsUpdate) -> None:
     """Apply live URL/model updates to the running LLMClient instances.
 
     The ``settings`` singleton has already been mutated by
@@ -1548,6 +1563,13 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
                 if getattr(rag_engine, "llm_client", None) is None:
                     engine_kwargs["llm_client"] = thinking_client
                 rag_engine.rebind_clients(**engine_kwargs)
+            # #1179 AC2: the health checker must see the new client too, or
+            # /api/llm-health/modes keeps reporting the thinking mode
+            # unavailable until restart. getattr no-op covers checker-less
+            # test applications.
+            health_checker = getattr(app.state, "llm_health_checker", None)
+            if health_checker is not None:
+                health_checker.rebind_clients(thinking_client=thinking_client)
             logger.info(
                 "Thinking chat model configured; client activated live (no restart needed)"
             )
@@ -1610,6 +1632,11 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
             rag_engine = getattr(app.state, "rag_engine", None)
             if rag_engine is not None:
                 rag_engine.rebind_clients(instant_client=instant_client)
+            # #1179 AC2 (instant sibling): same wiring as the thinking
+            # branch above.
+            health_checker = getattr(app.state, "llm_health_checker", None)
+            if health_checker is not None:
+                health_checker.rebind_clients(instant_client=instant_client)
             logger.info(
                 "Instant chat model configured; client activated live (no restart needed)"
             )
