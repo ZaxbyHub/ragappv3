@@ -171,6 +171,34 @@ class AnswerWrapperFenceAwarenessTest(unittest.TestCase):
         self.assertNotIn("<answer>strip me", cleaned)
         self.assertIn("<answer>keep me</answer>", cleaned)
 
+    def test_crlf_fence_closes_and_protects(self):
+        # CRLF line endings: the closing fence must still be recognized so the
+        # fenced literal is protected AND the prose after the closer is stripped.
+        text = "<answer>strip</answer>\r\n```\r\n<answer>keep</answer>\r\n```\r\n<answer>strip2</answer>"
+        cleaned = sanitize_assistant_content(text)
+        self.assertNotIn("<answer>strip", cleaned)
+        self.assertNotIn("<answer>strip2", cleaned)
+        self.assertIn("<answer>keep</answer>", cleaned)
+
+    def test_multiline_wrapper_outside_fence_is_stripped(self):
+        # A wrapper tag that spans lines (outside any fence) is still removed —
+        # the whole-run strip, not a per-line one.
+        text = '<answer\n  style="plain">keep the inner</answer\n>'
+        self.assertEqual(sanitize_assistant_content(text), "keep the inner")
+
+    def test_invalid_backtick_opener_does_not_shield(self):
+        # A backtick info string containing a backtick is not a valid fence
+        # opener (CommonMark), so the following prose is still stripped.
+        text = "```a`b\n<answer>strip me</answer>"
+        self.assertNotIn("<answer", sanitize_assistant_content(text))
+
+    def test_longer_closer_terminates_protection(self):
+        # A 4-backtick closer ends a 3-backtick fence; prose after it is stripped.
+        text = "```\n<answer>keep</answer>\n````\n<answer>strip</answer>"
+        cleaned = sanitize_assistant_content(text)
+        self.assertIn("<answer>keep</answer>", cleaned)
+        self.assertNotIn("<answer>strip", cleaned)
+
 
 if __name__ == "__main__":
     unittest.main()

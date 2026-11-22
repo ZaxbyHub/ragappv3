@@ -23,7 +23,7 @@ sanitization which lives in ``LLMClient.chat_completion_stream`` and uses
 from __future__ import annotations
 
 import re
-from typing import Iterable, List
+from typing import Iterable, List, Tuple
 
 # Module-level constants — each is a literal regex pattern.
 # Use ``re.DOTALL`` so ``.`` spans newlines.
@@ -48,7 +48,66 @@ _THINKING_PROCESS_PREFIX_RE = re.compile(
 _ANSWER_WRAPPER_OPEN_RE = re.compile(r"<answer\b[^>]*>", re.IGNORECASE)
 _ANSWER_WRAPPER_CLOSE_RE = re.compile(r"</answer\s*>", re.IGNORECASE)
 
-_OPEN_FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
+_OPEN_FENCE_RE = re.compile(r"(`{3,}|~{3,})")
+
+
+def _strip_answer_tags(text: str) -> str:
+    """Remove ``<answer>``/``</answer>`` wrapper tags from a run of text.
+
+    Applied to the WHOLE run (not line-by-line) so a wrapper tag that spans
+    lines is still removed — the pre-fence-awareness behavior.
+    """
+    return _ANSWER_WRAPPER_CLOSE_RE.sub(
+        "", _ANSWER_WRAPPER_OPEN_RE.sub("", text)
+    )
+
+
+def _find_code_fence_spans(text: str) -> List[Tuple[int, int]]:
+    """Return the ``(start, end)`` char offsets of fenced code blocks.
+
+    Honours CommonMark so the protection is correct, not just present:
+    - an opening fence is 3+ backticks or tildes (up to 3 spaces indented); a
+      backtick fence's info string may not itself contain a backtick, so
+      `` ```a`b `` is NOT a fence and does not shield the rest of the text;
+    - a closing fence is the same marker character, at least as long, with only
+      trailing whitespace — so a longer closer (```` vs ```) terminates it;
+    - an unterminated fence runs to the end of the text.
+    CRLF line endings are handled (the ``\\r`` is whitespace for detection).
+    """
+    spans: List[Tuple[int, int]] = []
+    pos = 0
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    fence_start = 0
+    for line in text.split("\n"):
+        line_start = pos
+        trimmed = line.strip()
+        if not in_fence:
+            open_match = _OPEN_FENCE_RE.match(trimmed)
+            if open_match:
+                marker = open_match.group(1)
+                marker_char = marker[0]
+                info = trimmed[len(marker):]
+                # A backtick info string may not contain a backtick.
+                if marker_char == "`" and "`" in info:
+                    pass  # not a valid opener
+                else:
+                    in_fence = True
+                    fence_char = marker_char
+                    fence_len = len(marker)
+                    fence_start = line_start
+        elif trimmed and all(c == fence_char for c in trimmed) and len(
+            trimmed
+        ) >= fence_len:
+            # Closing fence: include through the end of this line (the "\n"
+            # separator is added by the next iteration's accounting).
+            spans.append((fence_start, line_start + len(line)))
+            in_fence = False
+        pos = line_start + len(line) + 1
+    if in_fence:
+        spans.append((fence_start, len(text)))
+    return spans
 
 
 def _strip_answer_wrappers_outside_code_fences(text: str) -> str:
@@ -59,41 +118,18 @@ def _strip_answer_wrappers_outside_code_fences(text: str) -> str:
     and in the startup re-sanitize migration, which would otherwise
     permanently rewrite historical messages. Only the wrapper tags outside
     fences are removed (issue #1153 AC1).
-
-    Fence tracking is line-based (not a single regex) so it honours CommonMark:
-    a closing fence may be LONGER than the opening one, and an unterminated
-    fence runs to the end of the text — both must keep their literal markup.
     """
-
-    def _strip_tags(line: str) -> str:
-        return _ANSWER_WRAPPER_CLOSE_RE.sub(
-            "", _ANSWER_WRAPPER_OPEN_RE.sub("", line)
-        )
-
+    spans = _find_code_fence_spans(text)
+    if not spans:
+        return _strip_answer_tags(text)
     out: List[str] = []
-    in_fence = False
-    fence_char = ""
-    fence_len = 0
-    for line in text.split("\n"):
-        stripped = line.lstrip()
-        if not in_fence:
-            open_match = _OPEN_FENCE_RE.match(stripped)
-            if open_match:
-                in_fence = True
-                fence_char = open_match.group(1)[0]
-                fence_len = len(open_match.group(1))
-                out.append(line)
-                continue
-            out.append(_strip_tags(line))
-            continue
-        # Inside a fence: a closing fence is the same marker, at least as long,
-        # with only trailing whitespace. Otherwise the line is protected.
-        if re.match(
-            rf"^{re.escape(fence_char)}{{{fence_len},}}[ \t]*$", stripped
-        ):
-            in_fence = False
-        out.append(line)
-    return "\n".join(out)
+    last = 0
+    for start, end in spans:
+        out.append(_strip_answer_tags(text[last:start]))
+        out.append(text[start:end])  # fenced block: verbatim
+        last = end
+    out.append(_strip_answer_tags(text[last:]))
+    return "".join(out)
 
 
 def sanitize_assistant_content(content: str) -> str:
