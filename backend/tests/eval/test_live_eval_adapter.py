@@ -441,8 +441,21 @@ class TestPersistence:
 class TestReleaseId:
     """Test release_id acquisition via git or fallback."""
 
-    def test_release_id_from_git(self):
-        """_get_release_id returns a non-empty string (git or fallback)."""
+    def test_release_id_from_git(self, monkeypatch):
+        """_get_release_id returns the git short hash when git is available.
+
+        Points data_dir at the repo root so the git lookup runs in a real repo
+        regardless of the ambient cwd / DATA_DIR (CI sets neither reliably).
+        """
+        import shutil
+        from pathlib import Path
+
+        import app.services.eval_adapter as adapter_module
+
+        if shutil.which("git") is None:
+            pytest.skip("git not on PATH")
+        repo_root = Path(__file__).resolve().parents[3]
+        monkeypatch.setattr(adapter_module.settings, "data_dir", repo_root / "data")
         release_id = _get_release_id()
         assert release_id is not None
         assert isinstance(release_id, str)
