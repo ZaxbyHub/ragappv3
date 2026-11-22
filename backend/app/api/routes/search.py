@@ -16,7 +16,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
-    get_current_active_user,
     get_current_user_or_service_account,
     get_db,
     get_embedding_service,
@@ -493,7 +492,7 @@ async def unified_search(
     ),
     limit: int = Query(20, ge=1, le=50, description="Maximum results per entity type"),
     db: sqlite3.Connection = Depends(get_db),
-    user: dict = Depends(get_current_active_user),
+    user: dict = Depends(get_current_user_or_service_account),
     evaluate: Callable = Depends(get_evaluate_policy),
 ):
     """Unified discovery search across documents, wiki pages, KMS entries and

@@ -21,6 +21,7 @@ from app.api.deps import (
     _evaluate_policy,
     _resolve_active_user,
     get_current_active_user,
+    get_current_user_or_service_account,
     get_db,
     get_evaluate_policy,
     log_db_released,
@@ -303,7 +304,7 @@ async def list_wiki_pages(
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
     db: sqlite3.Connection = Depends(get_db),
-    user: dict = Depends(get_current_active_user),
+    user: dict = Depends(get_current_user_or_service_account),
     evaluate: Callable = Depends(get_evaluate_policy),
 ):
     await _require_vault_read(evaluate, user, vault_id)
@@ -352,7 +353,7 @@ async def create_wiki_page(
 async def get_wiki_page(
     page_id: int,
     db: sqlite3.Connection = Depends(get_db),
-    user: dict = Depends(get_current_active_user),
+    user: dict = Depends(get_current_user_or_service_account),
     evaluate: Callable = Depends(get_evaluate_policy),
 ):
     store = WikiStore(db)
