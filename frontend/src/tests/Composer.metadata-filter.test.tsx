@@ -193,7 +193,7 @@ describe("metadata_filter serialization into the chat stream request (issue #510
     const refreshHistory = vi.fn().mockResolvedValue(undefined);
     // Existing session id → no createChatSession round-trip; only the
     // stubbed fetch (chat/stream) is exercised.
-    useChatStore.setState({ activeChatId: "42", input: "filter me" });
+    useChatStore.setState({ activeChatId: "42", activeSessionVaultId: 7, input: "filter me" });
 
     const { result } = renderHook(() => useSendMessage(7, refreshHistory));
     await act(async () => {

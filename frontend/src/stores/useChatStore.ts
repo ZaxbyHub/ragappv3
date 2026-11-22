@@ -73,6 +73,17 @@ export interface ChatState {
   expandedSources: Set<string>;
   activeChatId: string | null;
   /**
+   * Issue #1153 AC5 (F5c): the STORED vault scope of the active session.
+   * Bound atomically with activeChatId (loadChat/bindSession); null when no
+   * session is active. Follow-up sends in an existing session use THIS
+   * scope — never the global vault selector — so a mid-conversation vault
+   * switch cannot re-scope an existing session (the backend additionally
+   * clamps body.vault_id to the session's stored vault for direct clients).
+   */
+  activeSessionVaultId: number | null;
+  /** Atomic bind of activeChatId + its stored vault scope (issue #1153 AC5). */
+  bindSession: (chatId: string | null, vaultId: number | null) => void;
+  /**
    * In-flight durable turn save (issue #507 / PRR-003). Revision operations
    * (retry/edit truncate, fork) must await this before issuing server-side
    * history changes so a just-interrupted turn's background batch save can
@@ -129,7 +140,9 @@ export interface ChatState {
   toggleSource: (sourceId: string) => void;
   clearExpandedSources: () => void;
   stopStreaming: () => void;
-  loadChat: (chatId: string, messages: Message[]) => void;
+  /** Load a session's messages; `vaultId` (issue #1153 AC5) is the session's
+   * STORED vault scope, bound atomically with activeChatId. */
+  loadChat: (chatId: string, messages: Message[], vaultId?: number | null) => void;
   newChat: () => void;
   /**
    * Append an edit-version snapshot for a transcript slot (issue #573 AC3).
@@ -156,10 +169,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
   inputError: null,
   expandedSources: new Set(),
   activeChatId: null,
+  activeSessionVaultId: null,
   pendingTurnPersist: null,
   pendingTurnPersists: new Set(),
   messageEditVersions: {},
   activeEditVersion: {},
+
+  bindSession: (chatId, vaultId) => {
+    set({ activeChatId: chatId, activeSessionVaultId: vaultId });
+  },
 
   addMessage: (message) => {
     set((state) => ({
@@ -239,7 +257,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   clearMessages: () => {
-    set({ messageIds: [], messagesById: {}, expandedSources: new Set(), activeChatId: null, streamingMessageId: null });
+    set({ messageIds: [], messagesById: {}, expandedSources: new Set(), activeChatId: null, activeSessionVaultId: null, streamingMessageId: null });
   },
 
   setInput: (input) => set({ input }),
@@ -305,7 +323,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set(updates);
   },
 
-  loadChat: (chatId, messages) => {
+  loadChat: (chatId, messages, vaultId) => {
     // Abort any in-flight stream before switching sessions. Otherwise the orphan
     // stream keeps running: its onComplete fires later and the assistant reply is
     // silently dropped (its message id no longer exists), and the new session's
@@ -316,14 +334,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const messageIds = messages.map((m) => m.id);
     const messagesById: Record<string, Message> = {};
     for (const m of messages) messagesById[m.id] = m;
-    set({ activeChatId: chatId, messageIds, messagesById, expandedSources: new Set(), streamingMessageId: null, isStreaming: false, abortFn: null, messageEditVersions: {}, activeEditVersion: {} });
+    // activeSessionVaultId binds atomically with the session id (issue
+    // #1153 AC5): callers pass the session's STORED vault scope.
+    set({ activeChatId: chatId, activeSessionVaultId: vaultId ?? null, messageIds, messagesById, expandedSources: new Set(), streamingMessageId: null, isStreaming: false, abortFn: null, messageEditVersions: {}, activeEditVersion: {} });
   },
 
   newChat: () => {
     // Abort any in-flight stream before starting a new chat (see loadChat).
     const { abortFn } = get();
     if (abortFn) abortFn();
-    set({ activeChatId: null, messageIds: [], messagesById: {}, expandedSources: new Set(), streamingMessageId: null, isStreaming: false, abortFn: null, messageEditVersions: {}, activeEditVersion: {} });
+    set({ activeChatId: null, activeSessionVaultId: null, messageIds: [], messagesById: {}, expandedSources: new Set(), streamingMessageId: null, isStreaming: false, abortFn: null, messageEditVersions: {}, activeEditVersion: {} });
   },
 
   recordEditVersion: (slotKey, content) => {

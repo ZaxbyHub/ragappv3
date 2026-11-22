@@ -494,7 +494,10 @@ test.describe("first-run baseline (trace 781-vaultgate-first-run-baseline / C1)"
       } else {
         // The send went through vault-agnostically — no dead end on this leg.
         const answered = await visibleWithin(
-          page.getByText(/Here is the streamed answer/i),
+          page
+      .getByRole("log", { name: "Chat messages" })
+      .getByRole("article")
+      .filter({ hasText: /Here is the streamed answer/i }),
           20_000
         );
         completed.push(
@@ -524,7 +527,10 @@ test.describe("first-run baseline (trace 781-vaultgate-first-run-baseline / C1)"
       await doPress(composer, "Enter");
 
       const answerVisible = await visibleWithin(
-        page.getByText(/Here is the streamed answer/i),
+        page
+      .getByRole("log", { name: "Chat messages" })
+      .getByRole("article")
+      .filter({ hasText: /Here is the streamed answer/i }),
         30_000
       );
       if (answerVisible) completed.push("assistant-answer-streamed");

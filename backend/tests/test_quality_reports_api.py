@@ -325,14 +325,22 @@ class QualityReportsApiTest(unittest.TestCase):
         response = self.client.get("/api/quality/reports")
         self.assertEqual(response.status_code, 422)
 
-    # -- duplicate submission (PRR-024a): insert-only contract -------------
+    # -- duplicate submission (PRR-024a; rebound to the #800 AC2 retry-identity
+    # -- contract per the issue's September reconstruction constraint) ---------
 
     def test_duplicate_submit_creates_independent_reports(self):
+        # INDEPENDENT reports (different message ids) are never suppressed:
+        # each submission is its own row. A same-identity RETRY is idempotent
+        # (one row, same id) — that leg is pinned by the frozen checks in
+        # test_p04_misc_routes.py; this test retains the independent-report
+        # coverage the September suite demanded.
         first = self.client.post("/api/quality/reports", json=self._report())
-        second = self.client.post("/api/quality/reports", json=self._report())
+        second = self.client.post(
+            "/api/quality/reports",
+            json=self._report(message_id=self.orphan_msg_id),
+        )
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 200)
-        # Insert-only: no dedup constraint — each submission is its own row.
         self.assertNotEqual(first.json()["id"], second.json()["id"])
         listing = self.client.get(
             "/api/quality/reports", params={"session_id": self.session_id}

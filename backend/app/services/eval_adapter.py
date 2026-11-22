@@ -180,7 +180,7 @@ class RunResult:
 
     run_id: str
     timestamp: str
-    release_id: str
+    release_id: Optional[str]
     top_k: int
     query_metrics: List[QueryMetrics] = field(default_factory=list)
     mrr_mean: Optional[float] = None
@@ -217,8 +217,16 @@ def _get_runs_dir() -> Path:
     return runs_dir
 
 
-def _get_release_id() -> str:
-    """Return the git short commit hash, falling back to env-var or 'unknown'."""
+def _get_release_id() -> Optional[str]:
+    """Return the git short commit hash, or an env-var override, or ``None``.
+
+    Returns ``None`` when no real release id can be determined (git failed AND
+    no env override) rather than a synthetic ``"unknown"`` marker. Callers that
+    cache the result (``quality_reports._config_ref``, issue #800 AC4) must treat
+    ``None`` as "retry next call" so a transient git failure is never cached for
+    the life of the process — that was the defect AC4 was written to close.
+    Containerized deployments pass the id via ``APP_RELEASE_ID``/``APP_VERSION``.
+    """
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -227,17 +235,21 @@ def _get_release_id() -> str:
             timeout=10,
             cwd=settings.data_dir.parent,  # repo root
         )
-        if result.returncode == 0:
+        # A successful git with non-empty output is the release id. An empty
+        # output (checked-out detached/short form produced nothing) is NOT a
+        # hit — fall through to the env overrides rather than shadowing them.
+        if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
     except Exception as exc:
         logger.warning("Failed to get git commit hash: %s", exc)
-    # Env-var fallback for containerized deployments
+    # Env-var fallback for containerized deployments (stable config — safe to cache).
     for env_key in ("APP_RELEASE_ID", "APP_VERSION"):
         val = os.environ.get(env_key)
         if val:
             return val
-    # Safe fallback — never crashes the run
-    return getattr(settings, "app_version", "unknown") or "unknown"
+    # No real release id available: signal failure so the caller retries rather
+    # than caching a synthetic marker.
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -495,8 +507,12 @@ class LiveEvalAdapter:
                 )
             )
 
-        # Compute release_id off the event loop (subprocess/git call).
-        release_id = await asyncio.to_thread(_get_release_id)
+        # Compute release_id off the event loop (subprocess/git call). A
+        # total failure (git unavailable AND no env override) yields None
+        # from _get_release_id; the persistence/fingerprint path needs a
+        # string, so fall back to the 'unknown' marker HERE (this path does
+        # not cache — issue #800 AC4 is the quality-report _config_ref only).
+        release_id = await asyncio.to_thread(_get_release_id) or "unknown"
 
         # Delegate to score_run for metric computation (injecting progress events).
         # score_run uses effective_top_k for both the nDCG/recall cutoff and the

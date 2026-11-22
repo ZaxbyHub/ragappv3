@@ -315,7 +315,7 @@ describe("TranscriptPane fork durable anchor (issue #684)", () => {
     // Turn 1: durable on the server, loaded into the store through the real
     // mapper (store rows carry seq 1/2).
     server.rows = [seedRow(1, "user", "question-1", 1), seedRow(2, "assistant", "answer-1", 2)];
-    useChatStore.getState().loadChat("42", server.rows.map(mapSessionMessage));
+    useChatStore.getState().loadChat("42", server.rows.map(mapSessionMessage), 7);
 
     const { result } = renderHook(() => useSendMessage(7, mockRefreshHistory));
 

@@ -406,7 +406,9 @@ export default function ChatShell() {
         const detail = await getChatSession(parseInt(sessionId));
         if (seq !== loadSeqRef.current) return; // a newer selection superseded this fetch (UI-001)
         const loadedMessages: Message[] = (detail.messages ?? []).map(mapSessionMessage);
-        useChatStore.getState().loadChat(sessionId, loadedMessages);
+        // Issue #1153 AC5: bind the session's STORED vault scope atomically
+        // with the messages — follow-up sends use it, not the global selector.
+        useChatStore.getState().loadChat(sessionId, loadedMessages, detail.vault_id);
       } catch (err) {
         // A superseded failure is as stale as a superseded success: it must
         // not clobber the newer selection's state.
