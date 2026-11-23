@@ -10,13 +10,18 @@ Exposes the two allowlisted read-only tools (``retrieval`` and
 
 Every route authenticates through
 :func:`app.api.deps.get_current_user_or_service_account` (human JWTs
-first, then scoped ``sak_`` service-account keys). Every tool invocation
-passes through the vault-read policy BEFORE any retrieval or page read
-executes. The surface is read-only: no route writes to the database, and
-the tool allowlist deliberately excludes the generative synthesis tool.
+first, then scoped ``sak_`` service-account keys). The ``retrieval``
+tool is gated on the vault-read policy by the adapter BEFORE anything
+executes; ``wiki_read`` is gated inside the tool, after the (read-only,
+off-loop) page lookup that yields the vault id, and reports denial
+through the same failure envelope as a missing page. The surface is
+read-only: no route writes to the database, and the tool allowlist
+deliberately excludes the generative synthesis tool.
 
 The adapter neither reads nor gates on ``settings.agentic_rag_enabled``
-(it is independent of the agentic RAG feature flag).
+(it is independent of the agentic RAG feature flag). It DOES honor
+``settings.wiki_enabled`` for ``wiki_read``, matching the wiki router's
+master switch.
 """
 
 import inspect
@@ -24,7 +29,7 @@ import logging
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.deps import (
     get_current_user_or_service_account,
@@ -43,6 +48,11 @@ TOOL_ALLOWLIST = frozenset({"retrieval", "wiki_read"})
 
 _RETRIEVAL_ARGUMENT_KEYS = frozenset({"query", "vault_id"})
 _WIKI_READ_ARGUMENT_KEYS = frozenset({"page_id"})
+
+# SQLite binds 64-bit signed integers; anything at or above 2**63 raises
+# OverflowError at execute() time and would surface as a 500. Ids are
+# validated against this ceiling so an oversized id is a 400 instead.
+_MAX_SQLITE_INT = 2**63 - 1
 
 # Strict wire whitelist for fallback-path source dicts. Anything a search
 # row carries beyond these keys (metadata blobs, internal ``_``-prefixed
@@ -64,15 +74,22 @@ _RETRIEVAL_INPUT_SCHEMA: Dict[str, Any] = {
     "properties": {
         "query": {
             "type": "string",
-            "description": "Natural-language search query (1-1000 chars).",
+            "minLength": 1,
+            "maxLength": 1000,
+            "description": "Natural-language search query (1-1000 chars; must be "
+            "non-blank after trimming, which the schema cannot express).",
         },
         "vault_id": {
             "type": "integer",
+            "minimum": 1,
+            "maximum": 2**63 - 1,
             "description": "Vault to search (required; the adapter never "
-            "retrieves unscoped).",
+            "retrieves unscoped). JSON integer without a fractional part - "
+            "a decoded float such as 1.0 is rejected by the validator.",
         },
     },
     "required": ["query", "vault_id"],
+    "additionalProperties": False,
 }
 
 _WIKI_READ_INPUT_SCHEMA: Dict[str, Any] = {
@@ -80,10 +97,15 @@ _WIKI_READ_INPUT_SCHEMA: Dict[str, Any] = {
     "properties": {
         "page_id": {
             "type": "integer",
-            "description": "Id of the wiki page to read.",
+            "minimum": 1,
+            "maximum": 2**63 - 1,
+            "description": "Id of the wiki page to read. JSON integer without a "
+            "fractional part - a decoded float such as 1.0 is rejected by the "
+            "validator.",
         },
     },
     "required": ["page_id"],
+    "additionalProperties": False,
 }
 
 _TOOL_DESCRIPTIONS = {
@@ -103,6 +125,8 @@ _TOOL_DESCRIPTIONS = {
 class ToolCallRequest(BaseModel):
     """Envelope for POST /api/mcp/tools/call."""
 
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(..., min_length=1)
     arguments: Dict[str, Any] = Field(default_factory=dict)
 
@@ -113,15 +137,17 @@ router = APIRouter()
 def register_mcp_routes(app) -> None:
     """Mount the adapter surface on the application under /api.
 
-    The module-level ``router`` documents the surface (two routes, no
-    prefix) for introspection; this registrar attaches the SAME endpoint
-    functions directly to the app with the /api prefix. Direct
-    registration (the register_metrics_route pattern from
+    The module-level ``router`` carries the ``@router`` decorators that the
+    frozen AC10 introspection check reads (``app.services.mcp_server`` must
+    expose an ``APIRouter`` named ``router``), while this registrar attaches
+    the SAME endpoint functions directly to the app with the /api prefix.
+    Direct registration (the register_metrics_route pattern from
     app/services/telemetry.py) keeps the routes materialized in
-    ``app.routes`` at import time — FastAPI 0.139 defers
-    ``include_router`` mounts behind lazy ``_IncludedRouter`` wrappers,
-    which would leave the endpoints invisible to route introspection
-    until the first request materializes them.
+    ``app.routes`` at import time. ``include_router`` mounts can be
+    deferred behind lazy ``_IncludedRouter`` wrappers — observed on the
+    FastAPI 0.139.0 installed in the dev environment; the pinned lock
+    (0.163.0) was not probed here, so direct registration is the
+    version-independent choice.
     """
     app.add_api_route(
         "/api/mcp/tools",
@@ -205,17 +231,33 @@ def _validate_retrieval_arguments(arguments: Dict[str, Any]) -> tuple[str, int]:
         raise HTTPException(
             status_code=400, detail="invalid arguments for tool retrieval: query must be a string"
         )
+    # Length is checked on the RAW string so the advertised schema
+    # (minLength/maxLength) and this validator agree exactly; the blank
+    # check then runs on the trimmed value (the only intentional
+    # divergence: the schema admits whitespace-only, the validator does not).
+    if not 1 <= len(query) <= 1000:
+        raise HTTPException(
+            status_code=400,
+            detail="invalid arguments for tool retrieval: query must be 1-1000 non-blank characters",
+        )
     query = query.strip()
-    if not query or len(query) > 1000:
+    if not query:
         raise HTTPException(
             status_code=400,
             detail="invalid arguments for tool retrieval: query must be 1-1000 non-blank characters",
         )
     vault_id = arguments["vault_id"]
-    if isinstance(vault_id, bool) or not isinstance(vault_id, int) or vault_id <= 0:
+    if (
+        isinstance(vault_id, bool)
+        or not isinstance(vault_id, int)
+        or not 0 < vault_id <= _MAX_SQLITE_INT
+    ):
         raise HTTPException(
             status_code=400,
-            detail="invalid arguments for tool retrieval: vault_id must be a positive integer",
+            detail=(
+                "invalid arguments for tool retrieval: vault_id must be a "
+                "positive integer within the SQLite integer range"
+            ),
         )
     return query, vault_id
 
@@ -235,10 +277,17 @@ def _validate_wiki_read_arguments(arguments: Dict[str, Any]) -> int:
             ),
         )
     page_id = arguments["page_id"]
-    if isinstance(page_id, bool) or not isinstance(page_id, int) or page_id <= 0:
+    if (
+        isinstance(page_id, bool)
+        or not isinstance(page_id, int)
+        or not 0 < page_id <= _MAX_SQLITE_INT
+    ):
         raise HTTPException(
             status_code=400,
-            detail="invalid arguments for tool wiki_read: page_id must be a positive integer",
+            detail=(
+                "invalid arguments for tool wiki_read: page_id must be a "
+                "positive integer within the SQLite integer range"
+            ),
         )
     return page_id
 
@@ -259,11 +308,18 @@ async def _run_retrieval(
     """Execute retrieval through the engine when present, else minimally.
 
     Engine-present path (production): mirrors RetrievalTool.execute
-    without ever writing engine attributes — the engine's
-    operator-configured ``retrieval_top_k`` governs, rerank status is
-    propagated into ``filter_relevant`` exactly as the agentic path does,
-    and no private ``_chunk_text`` channel is attached (this is a wire
-    boundary).
+    without persisting any engine state — the engine's
+    operator-configured ``retrieval_top_k`` governs (with the pre-existing
+    caveat that ``RetrievalTool`` itself can overwrite
+    ``engine.retrieval_top_k`` on the shared engine, so a prior agentic
+    call in the same process can change what "configured" means here),
+    rerank status is propagated into ``filter_relevant`` exactly as the
+    agentic path does, and no private ``_chunk_text`` channel is attached
+    (this is a wire boundary). The one in-memory touch is
+    ``engine._sync_document_retrieval_settings()``, which refreshes the
+    engine's own retrieval sub-service settings from live config (the
+    same call RetrievalTool makes); it writes no database or on-disk
+    state.
 
     No-engine path (pre-lifespan or DI-override fixtures): embed via the
     DI-honoring embedding seam, then a typed ``vector_store.search`` with
@@ -346,7 +402,9 @@ async def _run_retrieval(
 
 
 @router.get("/mcp/tools")
+@limiter.limit(settings.search_rate_limit)
 async def list_mcp_tools(
+    request: Request,
     user: dict = Depends(get_current_user_or_service_account),
 ):
     """List the allowlisted read-only tools with JSON-schema inputs.
@@ -380,26 +438,55 @@ async def call_mcp_tool(
     evaluate=Depends(get_evaluate_policy),
     vector_store=Depends(get_vector_store),
 ):
-    """Invoke one allowlisted read-only tool with authorization first.
+    """Invoke one allowlisted read-only tool, authorizing per tool.
 
-    Response matrix: 422 malformed envelope (FastAPI); 404 unknown tool;
-    400 invalid per-tool arguments; 403 vault-read denial on the
-    adapter-owned retrieval gate (nothing executed); 200 with the
-    ``{"result": ...}`` payload otherwise (tool-level failures surface as
-    ``success=False`` inside the envelope with empty output/sources).
+    ``retrieval`` is gated by the adapter BEFORE anything executes;
+    ``wiki_read`` is gated inside the tool, after the read-only page
+    lookup that yields the vault id (no content leaves the tool before
+    the policy call).
+
+    Response matrix: 422 malformed envelope (FastAPI; unknown top-level
+    keys are rejected too); 404 unknown tool; 400 invalid per-tool
+    arguments (including ids outside the SQLite integer range); 503 when
+    ``wiki_read`` is called while the wiki subsystem is disabled; 403
+    vault-read denial on the adapter-owned retrieval gate (nothing
+    executed); 200 with the ``{"result": ...}`` payload otherwise —
+    tool-level failures, including a vault-policy evaluator fault, surface
+    as ``success=False`` inside the envelope with empty output/sources.
     """
     if body.name not in TOOL_ALLOWLIST:
         raise HTTPException(status_code=404, detail=f"Unknown tool: {body.name}")
 
     if body.name == "retrieval":
         query, vault_id = _validate_retrieval_arguments(body.arguments)
-        allowed = await evaluate(user, "vault", vault_id, "read")
+        try:
+            allowed = await evaluate(user, "vault", vault_id, "read")
+        except Exception as exc:  # noqa: BLE001
+            # A policy-evaluator fault is not a denial we can prove, so it
+            # fails closed through the same envelope as any other tool
+            # failure instead of escaping as an unhandled 500.
+            logger.warning(
+                "[mcp_server] vault policy check failed for vault_id=%s: %s",
+                vault_id,
+                exc,
+                exc_info=True,
+            )
+            tool_result = ToolResult(
+                output="", sources=[], success=False, error="retrieval unavailable"
+            )
+            return {"result": build_result_payload(body.name, tool_result)}
         if not allowed:
             raise HTTPException(status_code=403, detail="No read access to vault")
         tool_result = await _run_retrieval(request, vector_store, query, vault_id)
     else:
         page_id = _validate_wiki_read_arguments(body.arguments)
-        tool = WikiReadTool(db, evaluate, user)
+        if not settings.wiki_enabled:
+            # Match require_wiki_enabled on the wiki router: with the wiki
+            # subsystem disabled, no wiki content leaves the system.
+            raise HTTPException(status_code=503, detail="Wiki subsystem is disabled")
+        # The pooled connection is opened with check_same_thread=False, so the
+        # tool's synchronous store read can run off the event loop.
+        tool = WikiReadTool(db, evaluate, user, offload_store_read=True)
         tool_result = await tool.execute(page_id=page_id)
 
     return {"result": build_result_payload(body.name, tool_result)}

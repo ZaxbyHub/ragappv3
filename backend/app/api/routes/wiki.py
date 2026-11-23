@@ -297,7 +297,7 @@ class WikiBulkRequest(BaseModel):
 
 @router.get("/wiki/pages")
 async def list_wiki_pages(
-    vault_id: int = Query(..., description="Vault ID"),
+    vault_id: int = Query(..., ge=1, le=2**63 - 1, description="Vault ID"),
     page_type: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
@@ -356,6 +356,11 @@ async def get_wiki_page(
     user: dict = Depends(get_current_user_or_service_account),
     evaluate: Callable = Depends(get_evaluate_policy),
 ):
+    # SQLite binds 64-bit signed integers; an id at or above 2**63 raises
+    # OverflowError at execute() time and would surface as a 500. Reject it
+    # as a plain 404 (the id cannot name a stored page).
+    if not 0 < page_id <= 2**63 - 1:
+        raise HTTPException(status_code=404, detail="Wiki page not found")
     store = WikiStore(db)
     page = store.get_page(page_id)
     if not page:

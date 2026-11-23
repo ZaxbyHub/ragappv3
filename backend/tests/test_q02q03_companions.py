@@ -15,11 +15,12 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -70,6 +71,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.api.deps import (  # noqa: E402
     get_current_active_user,
+    get_current_user_or_service_account,
     get_db,
     get_embedding_service,
     get_evaluate_policy,
@@ -90,6 +92,24 @@ from app.services.citation_validator import (  # noqa: E402
 
 _MARKER = "companion-unique-marker-4d71"
 _SECRET = "TOPSECRET-companion-8f13"
+
+
+def _dependency_calls(route):
+    """Every callable in ONE route's dependency tree (endpoint + sub-deps).
+
+    Same flat-``Dependant`` walk the frozen AC16 check uses (FastAPI 0.139
+    stores sub-dependencies directly in ``dependant.dependencies``), kept
+    here so the per-route assertion below does not depend on the frozen
+    file's helper. Callers must apply it per route: flattening the calls of
+    SEVERAL routes into one list proves only the union.
+    """
+    calls = []
+    stack = [route.dependant]
+    while stack:
+        dependant = stack.pop()
+        calls.append(dependant.call)
+        stack.extend(dependant.dependencies)
+    return calls
 
 
 def _hash_tables(conn):
@@ -431,12 +451,22 @@ class TestCompanions(unittest.TestCase):
         self.assertEqual(r.status_code, 403)
         self.assertEqual(self._embed.calls, embed_before)
         self.assertEqual(len(self._vstore.calls), search_before)
+        # The adapter-owned retrieval gate ran the policy exactly once.
+        self.assertEqual(calls, [("vault", 2, "read")])
 
         r = self._call("wiki_read", {"page_id": 2})
         body = r.json()["result"]
         self.assertFalse(body["success"])
         self.assertNotIn(_MARKER, body["output"])
         self.assertEqual(body["sources"], [])
+        # The tool-owned wiki gate ran the policy exactly once for the
+        # denial (the spy is not dead code: it proves wiki_read invokes the
+        # vault policy on its own path, not only through the adapter gate).
+        self.assertEqual(
+            calls,
+            [("vault", 2, "read"), ("vault", 2, "read")],
+            "wiki_read must invoke the vault-read policy exactly once on denial",
+        )
 
     # Leg 7: mutation sentinel (content hashes) --------------------------
 
@@ -462,7 +492,9 @@ class TestCompanions(unittest.TestCase):
             conn.commit()
         finally:
             self._pool.release_connection(conn)
-        self.assertEqual(before, _hash_tables(self._pool.get_connection().__class__ and self._pool.get_connection()) if False else before)
+        # (The dead `... if False else before` comparison that used to sit
+        # here was a tautology and leaked two pooled connections; the real
+        # before/after sentinel is asserted after the tool calls below.)
 
         self._spy_policy()
         self._call("retrieval", {"query": "probe", "vault_id": 1})
@@ -490,8 +522,11 @@ class TestCompanions(unittest.TestCase):
             if key in ("filter_recorder", "recorded_top_k"):
                 continue
             self.assertEqual(attrs_before[key], attrs_after[key], f"engine attr {key} mutated")
+        # The adapter must pass the engine's OWN configured top_k through to
+        # the retrieval sub-service (no hardcoded limit of its own). The fake's
+        # configured value is not itself a production contract, so only the
+        # pass-through equality is asserted.
         self.assertEqual(engine.recorded_top_k, engine.retrieval_top_k)
-        self.assertEqual(engine.retrieval_top_k, 7)
 
     # Leg 9: two-vault semantics -------------------------------------------
 
@@ -519,10 +554,22 @@ class TestCompanions(unittest.TestCase):
             self._pool.release_connection(conn)
         app.dependency_overrides[get_current_active_user] = lambda: human
         try:
+            # Denied detail: page 2 lives in vault 2, which this human cannot
+            # read, so the vault denial must collapse to the concealed 404
+            # (never a 200, and never a 403 that would confirm existence).
             r = self.client.get("/api/wiki/pages/2")
-            self.assertIn(r.status_code, (403, 404), "denied detail must not be 200")
-            if r.status_code == 404:
-                pass  # concealed
+            self.assertEqual(r.status_code, 404, "denied detail must be the concealed 404")
+            # Positive control: the SAME unscoped search must still return the
+            # vault this human CAN read, so the exclusion below is a real
+            # filter rather than an empty result set.
+            r = self.client.get("/api/search/unified", params={"q": _MARKER, "vault_id": 1})
+            self.assertEqual(r.status_code, 200)
+            allowed_ids = {
+                item.get("vault_id")
+                for arm in r.json().get("results", [])
+                for item in (arm if isinstance(arm, list) else [arm])
+            }
+            self.assertIn(1, allowed_ids, "scoped search for an accessible vault must return it")
             r = self.client.get("/api/search/unified", params={"q": _MARKER, "vault_id": 2})
             self.assertEqual(r.status_code, 403)
             r = self.client.get("/api/search/unified", params={"q": _MARKER})
@@ -532,6 +579,12 @@ class TestCompanions(unittest.TestCase):
                 for arm in r.json().get("results", [])
                 for item in (arm if isinstance(arm, list) else [arm])
             }
+            self.assertIn(
+                1,
+                vault_ids,
+                "unscoped search must still return the accessible vault (positive "
+                f"control: an empty result would pass the exclusion vacuously); got {vault_ids}",
+            )
             self.assertNotIn(2, vault_ids, "unscoped search must exclude inaccessible vaults")
 
             # Non-admin human through the MCP adapter: allowed on V1, denied on V2.
@@ -564,10 +617,14 @@ class TestCompanions(unittest.TestCase):
         adapter = self._call("wiki_read", {"page_id": 1}).json()["result"]
         detail = self.client.get("/api/wiki/pages/1", headers=self._auth).json()
         self.assertEqual(adapter["sources"][0]["page_id"], detail["id"])
-        self.assertEqual(adapter["sources"][0]["vault_id"], detail.get("vault_id", 1))
+        # Assert the real vault id from the detail body (no defaulted read:
+        # the seeded page lives in vault 1, so the adapter and the route
+        # must both report 1).
+        self.assertEqual(adapter["sources"][0]["vault_id"], detail["vault_id"])
+        self.assertEqual(detail["vault_id"], 1)
         body = self._call("retrieval", {"query": "probe", "vault_id": 1}).json()["result"]
         for src in body["sources"]:
-            self.assertEqual(src.get("vault_id", "1") in (1, "1"), True)
+            self.assertIn(src["vault_id"], (1, "1"), "fallback sources must name vault 1")
 
     # Leg 11: sanitization ---------------------------------------------------
 
@@ -630,6 +687,281 @@ class TestCompanions(unittest.TestCase):
         denied = self._call("wiki_read", {"page_id": 2}).json()["result"]
         self.assertEqual(missing, denied, "missing and denied pages must be indistinguishable")
         self.assertEqual(calls, [("vault", 2, "read")], "no policy call for a missing page")
+
+    # Leg 14: per-route combined dependency ---------------------------------
+    #
+    # The frozen AC16 check (test_q03_mcp_surface.py) flattens the
+    # dependency calls of ALL adapter routes into one list, so it proves
+    # only the union. #805 AC7 requires the combined dependency in EACH
+    # such route's tree; this non-frozen leg pins the per-route property.
+
+    def test_leg14_each_mcp_route_carries_combined_dependency(self):
+        mcp_routes = [
+            route
+            for route in app.routes
+            if getattr(getattr(route, "endpoint", None), "__module__", None)
+            == "app.services.mcp_server"
+        ]
+        self.assertEqual(
+            len(mcp_routes),
+            2,
+            "both adapter routes (GET /api/mcp/tools, POST /api/mcp/tools/call) "
+            f"must be mounted; found {len(mcp_routes)}",
+        )
+        for route in mcp_routes:
+            self.assertIn(
+                get_current_user_or_service_account,
+                _dependency_calls(route),
+                f"route {getattr(route, 'path', '?')} lost the combined "
+                "service-account dependency (AC7 requires it per route)",
+            )
+
+    # Leg 15: write-only key denied on every SA-accepting route -------------
+
+    def test_leg15_write_only_sa_key_denied_on_every_sa_route(self):
+        write_only_key = "sak_companion_write_key_000000000002"
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._pool.get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO service_accounts (name, key_hash, scopes, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    "C-Write",
+                    hashlib.sha256(write_only_key.encode()).hexdigest(),
+                    "documents:write",
+                    now,
+                ),
+            )
+            conn.commit()
+        finally:
+            self._pool.release_connection(conn)
+        headers = {"Authorization": f"Bearer {write_only_key}"}
+        probes = [
+            ("get", "/api/wiki/pages", {"params": {"vault_id": 1}}),
+            ("get", "/api/wiki/pages/1", {}),
+            ("get", "/api/search/unified", {"params": {"q": _MARKER}}),
+            ("get", "/api/mcp/tools", {}),
+            (
+                "post",
+                "/api/mcp/tools/call",
+                {"json": {"name": "retrieval", "arguments": {"query": "q", "vault_id": 1}}},
+            ),
+        ]
+        for method, path, kwargs in probes:
+            r = getattr(self.client, method)(path, headers=headers, **kwargs)
+            self.assertEqual(
+                r.status_code,
+                403,
+                f"{method.upper()} {path} must reject a documents:write-only key "
+                f"with 403, got {r.status_code}: {r.text[:200]}",
+            )
+
+    # Leg 16: input-boundary matrix -----------------------------------------
+
+    def test_leg16_input_boundary_matrix(self):
+        # Ids at or above 2**63 overflow the SQLite bind; they must be a 400,
+        # never an unhandled 500 (the adapter validators and the swapped wiki
+        # detail route both enforce the range).
+        self._call("retrieval", {"query": "q", "vault_id": 2**63}, expect_status=400)
+        self._call("wiki_read", {"page_id": 2**63}, expect_status=400)
+        r = self.client.get(
+            f"/api/wiki/pages/{2**63}", headers=self._auth
+        )
+        self.assertEqual(
+            r.status_code, 404, f"oversized page id must be a bounded 404, got {r.status_code}"
+        )
+        # Query length cap.
+        self._call("retrieval", {"query": "x" * 1001, "vault_id": 1}, expect_status=400)
+        self._call("retrieval", {"query": "x" * 1000, "vault_id": 1})
+        # A NUL inside the query must be bounded (never a 500).
+        r = self._call(
+            "retrieval", {"query": "q\x00probe", "vault_id": 1}, expect_status=(200, 400)
+        )
+        self.assertIn(
+            r.status_code, (200, 400), f"a NUL query must be bounded, got {r.status_code}"
+        )
+        # Unknown top-level envelope keys are rejected, not silently ignored.
+        r = self.client.post(
+            "/api/mcp/tools/call",
+            json={"name": "wiki_read", "arguments": {"page_id": 1}, "extra": 1},
+            headers=self._auth,
+        )
+        self.assertEqual(
+            r.status_code, 422, f"unknown top-level keys must be rejected, got {r.status_code}"
+        )
+        # The swapped routes' own vault_id parameter carries the same bound:
+        # an oversized value is a validation error, never a SQLite overflow.
+        r = self.client.get(
+            "/api/wiki/pages", params={"vault_id": 2**63}, headers=self._auth
+        )
+        self.assertEqual(
+            r.status_code, 422, f"oversized vault_id must be rejected, got {r.status_code}"
+        )
+        r = self.client.get(
+            "/api/search/unified",
+            params={"q": _MARKER, "vault_id": 2**63},
+            headers=self._auth,
+        )
+        self.assertEqual(
+            r.status_code, 422, f"oversized vault_id must be rejected, got {r.status_code}"
+        )
+        # The upper valid boundary is accepted (empty result, not a 500).
+        # Vault ids are INTEGER PRIMARY KEY, so every legitimate id is >= 1.
+        self._spy_policy()
+        r = self.client.get(
+            "/api/wiki/pages", params={"vault_id": 2**63 - 1}, headers=self._auth
+        )
+        self.assertEqual(
+            r.status_code, 200, f"the max valid vault_id must be accepted, got {r.status_code}"
+        )
+        r = self.client.get(
+            "/api/search/unified",
+            params={"q": _MARKER, "vault_id": 2**63 - 1},
+            headers=self._auth,
+        )
+        self.assertEqual(
+            r.status_code,
+            200,
+            f"the max valid vault_id must be accepted on unified search, got {r.status_code}",
+        )
+
+    # Leg 17: wiki subsystem master switch ----------------------------------
+
+    def test_leg17_wiki_disabled_blocks_adapter_wiki_read(self):
+        original = settings.wiki_enabled
+        settings.wiki_enabled = False
+        try:
+            r = self._call("wiki_read", {"page_id": 1}, expect_status=503)
+            self.assertEqual(
+                r.status_code,
+                503,
+                "wiki_read must honor the wiki subsystem master switch the wiki "
+                f"router enforces, got {r.status_code}: {r.text[:200]}",
+            )
+            # The adapter surface itself (tool listing) stays available: only
+            # the wiki_read call is gated, matching require_wiki_enabled.
+            r = self.client.get("/api/mcp/tools", headers=self._auth)
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(
+                sorted(t["name"] for t in r.json()["tools"]),
+                ["retrieval", "wiki_read"],
+            )
+        finally:
+            settings.wiki_enabled = original
+
+    # Leg 18: policy-evaluator fault fails closed ---------------------------
+
+    def test_leg18_policy_evaluator_fault_fails_closed(self):
+        async def exploding(principal, resource_type, resource_id, action):
+            raise RuntimeError("policy backend unavailable")
+
+        app.dependency_overrides[get_evaluate_policy] = lambda: exploding
+        embed_before = self._embed.calls
+        search_before = len(self._vstore.calls)
+        r = self._call("retrieval", {"query": "probe", "vault_id": 1})
+        self.assertEqual(
+            r.status_code, 200, "a policy-evaluator fault must not escape as a 500"
+        )
+        body = r.json()["result"]
+        self.assertFalse(body["success"], "a policy fault must report failure")
+        self.assertNotIn(_MARKER, body["output"], "a policy fault must return no content")
+        self.assertEqual(
+            self._embed.calls,
+            embed_before,
+            "no retrieval may execute after a policy-evaluator fault",
+        )
+        self.assertEqual(len(self._vstore.calls), search_before)
+
+    # Leg 19: the store read runs off the loop and loads no relations -------
+
+    def test_leg19_store_read_off_loop_without_relations(self):
+        from app.services.wiki_store import WikiStore
+
+        seen = {}
+        real_get_page = WikiStore.get_page
+
+        def recording_get_page(self, page_id, load_relations=True):
+            seen["thread"] = threading.get_ident()
+            seen["load_relations"] = load_relations
+            return real_get_page(self, page_id, load_relations=load_relations)
+
+        relation_calls = []
+
+        def recording_relation(self, *args, **kwargs):
+            relation_calls.append(1)
+            return []
+
+        loop_thread = {}
+
+        async def spy(principal, resource_type, resource_id, action):
+            loop_thread["ident"] = threading.get_ident()
+            return True
+
+        app.dependency_overrides[get_evaluate_policy] = lambda: spy
+        page_patcher = patch.object(WikiStore, "get_page", recording_get_page)
+        page_patcher.start()
+        self.addCleanup(page_patcher.stop)
+        for name in ("list_claims", "list_entities", "list_lint_findings"):
+            relation_patcher = patch.object(WikiStore, name, recording_relation)
+            relation_patcher.start()
+            self.addCleanup(relation_patcher.stop)
+
+        r = self._call("wiki_read", {"page_id": 1})
+        self.assertTrue(r.json()["result"]["success"])
+        self.assertIn(_MARKER, r.json()["result"]["output"])
+        self.assertEqual(
+            relation_calls, [], "the tool reads only the page row; relations must not load"
+        )
+        self.assertFalse(
+            seen["load_relations"], "the tool must request the page without relations"
+        )
+        self.assertNotEqual(
+            seen["thread"],
+            loop_thread["ident"],
+            "the synchronous store read must run off the event-loop thread",
+        )
+
+    # Leg 20: human JWT failure keeps its own 401 contract ------------------
+
+    def test_leg20_human_jwt_failure_keeps_token_specific_401(self):
+        for path, kwargs in (
+            ("/api/wiki/pages", {"params": {"vault_id": 1}}),
+            ("/api/wiki/pages/1", {}),
+            ("/api/search/unified", {"params": {"q": _MARKER}}),
+        ):
+            r = self.client.get(
+                path, headers={"Authorization": "Bearer not-a-valid-jwt"}, **kwargs
+            )
+            self.assertEqual(r.status_code, 401, f"{path}: {r.status_code} {r.text[:200]}")
+            self.assertEqual(
+                r.headers.get("www-authenticate"),
+                "Bearer",
+                f"{path}: the human-path 401 must keep its WWW-Authenticate challenge",
+            )
+            self.assertNotEqual(
+                r.json().get("detail"),
+                "Not authenticated",
+                f"{path}: the human-path 401 must keep its token-specific detail",
+            )
+
+    # Leg 21: an allowed retrieval is actually successful -------------------
+
+    def test_leg21_successful_retrieval_reports_success(self):
+        """Non-frozen positive control for the frozen AC13 shape.
+
+        The frozen check accepts any 200 carrying a "result" key, so a
+        failure envelope (success=false) would satisfy it. This leg pins
+        that an ALLOWED retrieval really succeeds and really returns
+        content through the no-engine path.
+        """
+        self._spy_policy()
+        r = self._call("retrieval", {"query": "probe", "vault_id": 1})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()["result"]
+        self.assertTrue(body["success"], "an allowed retrieval must report success")
+        self.assertTrue(body["output"], "an allowed retrieval must return output")
+        self.assertTrue(body["sources"], "an allowed retrieval must return sources")
 
 
 if __name__ == "__main__":

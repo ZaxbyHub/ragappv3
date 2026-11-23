@@ -551,19 +551,28 @@ class WikiReadTool(AgenticTool):
     Resolves a single wiki page by id and returns its markdown as the
     tool output, but only after the injected policy evaluator authorizes
     ``("vault", page.vault_id, "read")`` for the requesting principal.
+    The page row is read first because the vault id is only known from
+    that row; no page content leaves the tool before the policy call.
+    Callers holding a thread-safe pooled connection can pass
+    ``offload_store_read=True`` so that read runs off the event loop.
     Missing pages, policy denials, and execution failures all surface the
     SAME public failure (empty output/sources, ``success=False``) so the
     tool never leaks whether a page id exists in a vault the principal
     cannot read; the distinct cause is logged server-side only.
     """
 
-    def __init__(self, db, evaluate, user):
+    def __init__(self, db, evaluate, user, offload_store_read: bool = False):
         # db: sqlite3 connection; evaluate: async callable
         # (principal, resource_type, resource_id, action) -> bool; user:
-        # the requesting principal dict.
+        # the requesting principal dict. offload_store_read: run the
+        # synchronous store read in a worker thread. Only safe when the
+        # connection was opened with check_same_thread=False (the pooled
+        # connections are); the default keeps the tool usable with any
+        # sqlite3 connection, including thread-affine ones.
         self._db = db
         self._evaluate = evaluate
         self._user = user
+        self._offload_store_read = offload_store_read
         self._next_label = 1
 
     @property
@@ -586,7 +595,19 @@ class WikiReadTool(AgenticTool):
 
         try:
             store = WikiStore(self._db)
-            page = store.get_page(page_id)
+            # load_relations=False keeps the query to the page row: this tool
+            # reads only vault_id/markdown/title, and the relation loads
+            # (claims/entities/lint findings) are pure overhead here. When the
+            # caller owns a thread-safe (check_same_thread=False) pooled
+            # connection, the synchronous read runs off the event loop — the
+            # same asyncio.to_thread pattern deps.py uses for the
+            # service-account lookup.
+            if self._offload_store_read:
+                page = await asyncio.to_thread(
+                    store.get_page, page_id, load_relations=False
+                )
+            else:
+                page = store.get_page(page_id, load_relations=False)
             if page is None:
                 logger.info("[WikiReadTool] page not found: page_id=%s", page_id)
                 return ToolResult(

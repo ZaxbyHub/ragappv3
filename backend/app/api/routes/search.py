@@ -485,7 +485,9 @@ def _tiered_score(
 @router.get("/search/unified", response_model=UnifiedSearchResponse)
 async def unified_search(
     q: str = Query(..., min_length=1, max_length=200, description="Search query"),
-    vault_id: Optional[int] = Query(None, description="Restrict to a vault"),
+    vault_id: Optional[int] = Query(
+        None, ge=1, le=2**63 - 1, description="Restrict to a vault"
+    ),
     types: Optional[str] = Query(
         None,
         description="Comma-separated subset of document,wiki,kms,chat (default: all)",

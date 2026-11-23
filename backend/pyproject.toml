@@ -17,10 +17,12 @@ ignore = ["E501"]
 # harness block sits between import groups by design and re-sorting the
 # block would change the blob the frozen checkpoint manifest pins.
 "tests/test_g04_embedding_readiness_and_metric.py" = ["I001"]
-# Checkpoint-frozen test files (issue #804/#805 trace): same
-# sys.path-insert harness rationale as the g04 entry above.
-"tests/test_q02_service_account_wiki_reads.py" = ["I001"]
-"tests/test_q02_wiki_read_tool.py" = ["I001"]
+# Checkpoint-frozen test file (issue #804/#805 trace): its sys.path-insert
+# harness block sits between import groups by design and re-sorting the
+# block would change the blob the frozen checkpoint manifest pins. Only
+# this file of the 804/805 set actually violates I001 (verified with an
+# isolated ruff --select I run that bypasses per-file-ignores); the sibling
+# q02 files were listed here before that check and are correctly sorted.
 "tests/test_q03_mcp_surface.py" = ["I001"]
 # c04 fixture consumers (issues #946/#900 shared-fixture dedup): the imported
 # fixtures from tests/c04_fixtures.py are registered by name, so every test

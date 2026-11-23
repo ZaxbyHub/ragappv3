@@ -1161,6 +1161,19 @@ Service accounts with the `documents:read` scope can authenticate to the followi
 | POST | `/api/search` | Semantic search |
 | GET | `/api/search/chunks/{chunk_id}/context` | Fetch chunk context |
 | GET | `/api/tags/documents/{file_id}` | List tags for a document |
+| GET | `/api/wiki/pages` | List wiki pages (any vault — see the global-read note) |
+| GET | `/api/wiki/pages/{page_id}` | Fetch one wiki page (any vault) |
+| GET | `/api/search/unified` | Unified cross-type search (wiki, documents, chat titles scoped to unowned sessions) |
+| GET | `/api/mcp/tools` | List the read-only MCP-style tool allowlist (`retrieval`, `wiki_read`) |
+| POST | `/api/mcp/tools/call` | Invoke one allowlisted read-only tool (`retrieval` for any vault, `wiki_read` for any page) |
+
+Because the SA principal bypasses per-vault scoping for reads, the wiki and
+MCP routes above return wiki content from **every** vault for a
+`documents:read` key — the same global-read model the document and search
+routes already had. Per-vault service-account entitlement is not
+implemented (the `service_accounts` table carries scopes, not vault
+bindings); the unified-search chat arm is the one exception and never
+returns other users' chat-session rows to an SA key.
 
 ### Organization Invites
 
