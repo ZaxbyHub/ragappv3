@@ -152,7 +152,10 @@ export interface WikiLintFinding {
   // Producer provenance (issue #949): which subsystem wrote the row — the
   // wiki_lint_findings CHECK vocabulary. Optional so payloads cached before
   // the field was exposed keep parsing; the backend now always sends it.
-  origin?: "linter" | "invalidation" | "compiler" | "curator";
+  origin?: string;
+  /** Joined source filename (#1161): the file this finding rests on via
+   *  its related claims/pages; null when unresolvable. */
+  source_filename?: string | null;
 }
 
 export interface WikiSearchResponse {

@@ -821,6 +821,55 @@ async def delete_wiki_claim(
 # Lint endpoints
 # ---------------------------------------------------------------------------
 
+def _lint_source_filename(db: sqlite3.Connection, finding) -> Optional[str]:
+    """Issue #1161 (D7/F10): the source filename a lint finding rests on.
+
+    Joined over the finding's JSON relationship columns: claim findings
+    reach files through the claim's sources; page findings through the
+    page's file associations (fallback: the page's claims' sources). The
+    lexicographically smallest name wins for multi-file relationships
+    (deterministic); malformed JSON columns contribute nothing (the #950
+    malformed-JSON class), and unresolvable findings yield None.
+    """
+    try:
+        claim_ids = json.loads(finding.related_claim_ids_json or "[]")
+    except ValueError:
+        claim_ids = []
+    try:
+        page_ids = json.loads(finding.related_page_ids_json or "[]")
+    except ValueError:
+        page_ids = []
+    names: list[str] = []
+
+    def _collect(sql: str, ids: list) -> None:
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        rows = db.execute(sql.format(ph=placeholders), ids).fetchall()
+        names.extend(r[0] for r in rows if r[0])
+
+    _collect(
+        "SELECT MIN(f.file_name) FROM wiki_claim_sources wcs "
+        "JOIN files f ON f.id = wcs.file_id "
+        "WHERE wcs.claim_id IN ({ph}) AND f.file_name IS NOT NULL",
+        [int(c) for c in claim_ids if str(c).lstrip("-").isdigit()],
+    )
+    _collect(
+        "SELECT MIN(f.file_name) FROM wiki_page_files wpf "
+        "JOIN files f ON f.id = wpf.file_id "
+        "WHERE wpf.page_id IN ({ph}) AND f.file_name IS NOT NULL",
+        [int(p) for p in page_ids if str(p).lstrip("-").isdigit()],
+    )
+    _collect(
+        "SELECT MIN(f.file_name) FROM wiki_claims wc "
+        "JOIN wiki_claim_sources wcs ON wcs.claim_id = wc.id "
+        "JOIN files f ON f.id = wcs.file_id "
+        "WHERE wc.page_id IN ({ph}) AND f.file_name IS NOT NULL",
+        [int(p) for p in page_ids if str(p).lstrip("-").isdigit()],
+    )
+    return min(names) if names else None
+
+
 @router.get("/wiki/lint")
 async def get_lint_findings(
     vault_id: int = Query(...),
@@ -833,7 +882,12 @@ async def get_lint_findings(
     await _require_vault_read(evaluate, user, vault_id)
     store = WikiStore(db)
     findings = store.list_lint_findings(vault_id, status=status, severity=severity)
-    return {"findings": [_as_dict(f) for f in findings]}
+    return {
+        "findings": [
+            {**_as_dict(f), "source_filename": _lint_source_filename(db, f)}
+            for f in findings
+        ]
+    }
 
 
 @router.post("/wiki/lint/run")

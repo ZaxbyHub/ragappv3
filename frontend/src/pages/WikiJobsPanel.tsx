@@ -18,6 +18,8 @@ import { EmptyState } from "@/components/EmptyState";
 import { toast } from "sonner";
 import {
   listWikiJobs,
+  listWikiLintFindings,
+  type WikiLintFinding,
   retryWikiJob,
   cancelWikiJob,
   recompileVaultWiki,
@@ -36,6 +38,15 @@ const STATUS_COLORS: Record<WikiCompileJob["status"], string> = {
   completed: "bg-success/10 text-success",
   failed: "bg-destructive/10 text-destructive",
   cancelled: "bg-muted text-muted-foreground line-through",
+};
+
+// #1161: lint-finding status colors (distinct vocabulary from job statuses).
+const LINT_STATUS_COLORS: Partial<Record<WikiLintFinding["status"], string>> = {
+  open: "bg-warning/10 text-warning",
+  acknowledged: "bg-muted text-muted-foreground",
+  resolved: "bg-success/10 text-success",
+  dismissed: "bg-muted text-muted-foreground line-through",
+  auto_resolved: "bg-muted text-muted-foreground",
 };
 
 const TRIGGER_LABELS: Record<WikiCompileJob["trigger_type"], string> = {
@@ -91,6 +102,10 @@ function WikiJobsPanelState({
   principalGeneration,
 }: WikiJobsPanelStateProps) {
   const [jobs, setJobs] = useState<WikiCompileJob[]>([]);
+  // #1161 AC3: the persisted lint surface — a lint run's findings stay
+  // visible from the Jobs view (server-side wiki_lint_findings; the
+  // wiki hook's client-side array is NOT the source here).
+  const [lintFindings, setLintFindings] = useState<WikiLintFinding[]>([]);
   const [statusFilter, setStatusFilter] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [jobsPhase, setJobsPhase] = useState<"loading" | "ready" | "error">("loading");
@@ -157,6 +172,16 @@ function WikiJobsPanelState({
       if (currentRead() && loadingTokenRef.current === token) {
         setLoading((current) => currentRead() && loadingTokenRef.current === token ? false : current);
       }
+    }
+    // #1161 AC3: persisted lint travels with the same read token — a
+    // lint failure is supplementary and never flips the jobs phase.
+    try {
+      const lintRes = await listWikiLintFindings({ vault_id: vaultId });
+      if (currentRead() && Array.isArray(lintRes?.findings)) {
+        setLintFindings(lintRes.findings);
+      }
+    } catch {
+      // keep the previously rendered lint section
     }
   }, [mayPublish, queryContext, statusFilter, vaultId]);
   refreshRef.current = refresh;
@@ -310,6 +335,57 @@ function WikiJobsPanelState({
           </Button>
         </div>
       </div>
+
+      {/* #1161 AC3: persisted lint results — kept available here after
+          every lint run, with filename/time labels from the enriched
+          response. */}
+      {jobsDataContext === queryContext && (
+        <section
+          className="rounded-md border p-3"
+          aria-label="Latest wiki lint findings"
+          data-testid="jobs-lint-section"
+        >
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="font-medium text-sm">Wiki lint</span>
+            <span className="text-muted-foreground">
+              open: {lintFindings.filter((f) => f.status === "open").length} · resolved:{" "}
+              {lintFindings.filter((f) => f.status === "resolved").length} · dismissed:{" "}
+              {lintFindings.filter((f) => f.status === "dismissed").length}
+            </span>
+          </div>
+          {lintFindings.length === 0 ? (
+            <p className="text-xs text-muted-foreground mt-1">
+              No lint findings recorded for this vault.
+            </p>
+          ) : (
+            <ul className="mt-2 space-y-1" aria-label="Lint findings">
+              {lintFindings.slice(0, 8).map((f) => (
+                <li
+                  key={f.id}
+                  className="text-xs flex flex-wrap items-center gap-2"
+                  data-testid={`jobs-lint-finding-${f.id}`}
+                >
+                  <span className={"rounded-sm px-1.5 py-0.5 font-medium " + (LINT_STATUS_COLORS[f.status] ?? "")}>
+                    {f.status}
+                  </span>
+                  <span className="truncate max-w-[60%]">{f.title}</span>
+                  {f.origin && (
+                    <span className="text-muted-foreground">{f.origin}</span>
+                  )}
+                  {f.source_filename && (
+                    <span className="text-muted-foreground">
+                      {f.source_filename}
+                    </span>
+                  )}
+                  <span className="ml-auto text-muted-foreground/80">
+                    {f.updated_at ? formatDate(f.updated_at) : ""}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
 
       {/* Job list */}
       {jobsPhase === "error" && jobsContext === queryContext && (

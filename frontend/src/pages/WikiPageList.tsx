@@ -6,9 +6,10 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { EmptyState } from "@/components/EmptyState";
-import { FileText, Trash2, RefreshCw } from "lucide-react";
+import { CheckCircle2, FileText, Trash2, RefreshCw } from "lucide-react";
 import type { WikiPage } from "@/lib/api";
 import { bulkWikiPageAction } from "@/lib/api";
+import { formatDate } from "@/lib/formatters";
 
 export const PAGE_TYPES = [
   { value: "", label: "All" },
@@ -122,6 +123,16 @@ export function WikiPageList({ pages, loading, onSelect, vaultId, onRefresh, has
           <Button
             variant="outline"
             size="sm"
+            onClick={() => handleBulkStatusChange("verified")}
+            disabled={bulkLoading}
+            className="text-xs h-7"
+          >
+            <CheckCircle2 className="w-3 h-3 mr-1" />
+            Mark Reviewed
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
             onClick={() => handleBulkStatusChange("archived")}
             disabled={bulkLoading}
             className="text-xs h-7"
@@ -147,7 +158,7 @@ export function WikiPageList({ pages, loading, onSelect, vaultId, onRefresh, has
         />
       )}
       {!loading && pages.length > 0 && (
-        <div className="flex items-center gap-2 px-1 mb-1">
+        <div className="flex flex-wrap items-center gap-2 px-1 mb-1">
           <Checkbox
             checked={selectedIds.length === pages.length && pages.length > 0}
             onCheckedChange={toggleSelectAll}
@@ -155,6 +166,23 @@ export function WikiPageList({ pages, loading, onSelect, vaultId, onRefresh, has
             aria-label="Select all pages"
           />
           <span className="text-xs text-muted-foreground">Select all</span>
+          {/* #1161: category totals over the loaded window (labeled as
+              window counts — the list paginates). */}
+          <span
+            className="ml-auto flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground"
+            aria-label="Category totals for the loaded pages"
+          >
+            {Object.entries(
+              pages.reduce<Record<string, number>>((acc, p) => {
+                acc[p.page_type] = (acc[p.page_type] ?? 0) + 1;
+                return acc;
+              }, {})
+            ).map(([type, count]) => (
+              <span key={type} className="rounded bg-secondary px-1.5 py-0.5">
+                {type}: {count}
+              </span>
+            ))}
+          </span>
         </div>
       )}
       {pages.map((page) => (
@@ -191,6 +219,12 @@ export function WikiPageList({ pages, loading, onSelect, vaultId, onRefresh, has
                     {page.title}
                   </button>
                   <p className="text-xs text-muted-foreground truncate">{page.slug}</p>
+                  {/* #1161: time label — the page's last update. */}
+                  {page.updated_at && (
+                    <p className="text-xs text-muted-foreground/80">
+                      Updated {formatDate(page.updated_at)}
+                    </p>
+                  )}
                   {page.summary && (
                     <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{page.summary}</p>
                   )}

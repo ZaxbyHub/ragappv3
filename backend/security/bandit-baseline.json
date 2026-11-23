@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 103120,
+      "loc": 103869,
       "nosec": 0,
       "skipped_tests": 73
     },
@@ -313,6 +313,19 @@
       "nosec": 0,
       "skipped_tests": 0
     },
+    "backend/app/api/routes/review_queue.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 198,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
     "backend/app/api/routes/search.py": {
       "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
@@ -413,7 +426,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1195,
+      "loc": 1244,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -465,7 +478,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 244,
+      "loc": 246,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -803,7 +816,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 526,
+      "loc": 547,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -830,6 +843,19 @@
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
       "loc": 624,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "backend/app/services/content_classifiers.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 183,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -907,7 +933,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 4951,
+      "loc": 4976,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1297,7 +1323,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 403,
+      "loc": 417,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1323,7 +1349,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 3,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 644,
+      "loc": 647,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1804,7 +1830,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1153,
+      "loc": 1385,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1817,7 +1843,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 563,
+      "loc": 568,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1882,7 +1908,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 13,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 2324,
+      "loc": 2341,
       "nosec": 0,
       "skipped_tests": 3
     },
@@ -3423,7 +3449,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "89     settings.users_enabled\n90     and settings.jwt_secret_key == \"change-me-to-a-random-64-char-string\"\n91 ):\n",
+      "code": "90     settings.users_enabled\n91     and settings.jwt_secret_key == \"change-me-to-a-random-64-char-string\"\n92 ):\n",
       "col_offset": 35,
       "end_col_offset": 73,
       "filename": "backend/app/main.py",
@@ -3434,9 +3460,9 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'change-me-to-a-random-64-char-string'",
-      "line_number": 90,
+      "line_number": 91,
       "line_range": [
-        90
+        91
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
@@ -3644,7 +3670,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1806                 cursor = conn.execute(\n1807                     f\"\"\"\n1808                     UPDATE files\n1809                     SET enrichment_status = {status_sql},\n1810                         enrichment_error = ?,\n1811                         enrichment_updated_at = ?\n1812                     {where}\n1813                     \"\"\",\n1814                     params,\n",
+      "code": "1843                 cursor = conn.execute(\n1844                     f\"\"\"\n1845                     UPDATE files\n1846                     SET enrichment_status = {status_sql},\n1847                         enrichment_error = ?,\n1848                         enrichment_updated_at = ?\n1849                     {where}\n1850                     \"\"\",\n1851                     params,\n",
       "col_offset": 20,
       "end_col_offset": 23,
       "filename": "backend/app/services/document_processor.py",
@@ -3655,22 +3681,22 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1807,
+      "line_number": 1844,
       "line_range": [
-        1807,
-        1808,
-        1809,
-        1810,
-        1811,
-        1812,
-        1813
+        1844,
+        1845,
+        1846,
+        1847,
+        1848,
+        1849,
+        1850
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2643                     conn.execute(\n2644                         f\"DELETE FROM failed_chunks WHERE id IN ({placeholders})\",\n2645                         clear_ids,\n",
+      "code": "2680                     conn.execute(\n2681                         f\"DELETE FROM failed_chunks WHERE id IN ({placeholders})\",\n2682                         clear_ids,\n",
       "col_offset": 24,
       "end_col_offset": 81,
       "filename": "backend/app/services/document_processor.py",
@@ -3681,9 +3707,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2644,
+      "line_number": 2681,
       "line_range": [
-        2644
+        2681
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
@@ -4026,7 +4052,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "347         cur = self._db.execute(\n348             f\"UPDATE kms_entries SET {set_clause} WHERE id = ? AND vault_id = ?\", values\n349         )\n",
+      "code": "349         cur = self._db.execute(\n350             f\"UPDATE kms_entries SET {set_clause} WHERE id = ? AND vault_id = ?\", values\n351         )\n",
       "col_offset": 12,
       "end_col_offset": 80,
       "filename": "backend/app/services/kms_store.py",
@@ -4037,9 +4063,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 348,
+      "line_number": 350,
       "line_range": [
-        348
+        350
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
@@ -4896,7 +4922,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2650                 for r in self._db.execute(\n2651                     f\"SELECT id, slug FROM wiki_pages WHERE vault_id = ? AND slug IN ({placeholders})\",\n2652                     [vault_id, *unique_slugs],\n",
+      "code": "2669                 for r in self._db.execute(\n2670                     f\"SELECT id, slug FROM wiki_pages WHERE vault_id = ? AND slug IN ({placeholders})\",\n2671                     [vault_id, *unique_slugs],\n",
       "col_offset": 20,
       "end_col_offset": 102,
       "filename": "backend/app/services/wiki_store.py",
@@ -4907,9 +4933,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2651,
+      "line_number": 2670,
       "line_range": [
-        2651
+        2670
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
