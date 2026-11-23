@@ -30,7 +30,6 @@ __all__ = [
     "content_text",
     "entry_summary",
     "is_toc_text",
-    "is_boilerplate_text",
     "extract_procedures",
     "document_has_qualifying_items",
 ]
@@ -141,14 +140,6 @@ def is_toc_text(block_text: str) -> bool:
     if not lines:
         return False
     return _classify_block(lines) == "toc"
-
-
-def is_boilerplate_text(block_text: str) -> bool:
-    """True when a standalone block classifies as boilerplate."""
-    lines = [ln for ln in (block_text or "").splitlines() if ln.strip()]
-    if not lines:
-        return False
-    return _classify_block(lines) in ("boilerplate", "toc")
 
 
 def entry_summary(body: str, limit: int = ENTRY_SUMMARY_CHARS) -> str:
