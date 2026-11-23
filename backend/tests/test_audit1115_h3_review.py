@@ -282,3 +282,28 @@ class TestReviewQueueAccess(_ReviewQueueTestBase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Module-level frozen-check entry points (issue #1163 / trace 1161-1162-1163):
+# the frozen drivers address tests as file::<name> node ids.
+# ---------------------------------------------------------------------------
+
+def _run_case(cls, method: str) -> None:
+    suite = unittest.TestSuite([cls(method)])
+    result = unittest.TestResult()
+    suite.run(result)
+    assert not result.errors, f"{cls.__name__}.{method} errors: {result.errors}"
+    assert not result.failures, f"{cls.__name__}.{method} failures: {result.failures}"
+
+
+def test_review_queue_merges_wiki_and_kms():
+    _run_case(TestReviewQueueMerged, "test_review_queue_merges_wiki_and_kms")
+
+
+def test_batch_approve_is_atomic():
+    _run_case(TestReviewQueueBatch, "test_batch_approve_is_atomic")
+
+
+def test_review_queue_requires_write_access():
+    _run_case(TestReviewQueueAccess, "test_review_queue_requires_write_access")

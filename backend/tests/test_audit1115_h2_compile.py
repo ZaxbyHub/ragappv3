@@ -365,3 +365,35 @@ class TestRecomputeLifecycle(_H2Base):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Module-level frozen-check entry points (issue #1162 / trace 1161-1162-1163).
+# The frozen drivers address these tests as
+# tests/test_audit1115_h2_compile.py::<name> — plain module-level node ids —
+# so each canonical name delegates to its class method through the unittest
+# runner (setUp/addCleanup/tearDown all execute).
+# ---------------------------------------------------------------------------
+
+def _run_case(cls, method: str) -> None:
+    suite = unittest.TestSuite([cls(method)])
+    result = unittest.TestResult()
+    suite.run(result)
+    assert not result.errors, f"{cls.__name__}.{method} errors: {result.errors}"
+    assert not result.failures, f"{cls.__name__}.{method} failures: {result.failures}"
+
+
+def test_numbered_procedure_becomes_procedure_page():
+    _run_case(TestProcedurePages, "test_numbered_procedure_becomes_procedure_page")
+
+
+def test_boilerplate_is_excluded_from_summary():
+    _run_case(TestBoilerplateSummary, "test_boilerplate_is_excluded_from_summary")
+
+
+def test_toc_chunks_are_not_retrievable():
+    _run_case(TestTocChunkFilter, "test_toc_chunks_are_not_retrievable")
+
+
+def test_claim_gate_rejects_subjectless_claim():
+    _run_case(TestClaimGate, "test_claim_gate_rejects_subjectless_claim")
