@@ -977,20 +977,26 @@ class WikiCompiler:
                     DocumentParser,
                     UnsupportedContentTypeError,
                 )
-                # Issue #1162 typed refusal (final-critic round 1): decide
+                # Issue #1162 typed refusal (final-critic rounds 1-2): decide
                 # unsupported content types HERE, in the wiki compile
                 # fallback only, by an explicit extension allowlist plus a
                 # binary sniff — NEVER inside the shared DocumentParser,
                 # whose supported set includes NUL-leading binary formats
                 # (PDF/DOCX/PPTX) that main ingestion must keep parsing.
-                if _wiki_refuses_content_type(_file_path):
+                # The typed error is raised and caught right here so the
+                # signal stays real (one raise site, one handler).
+                try:
+                    if _wiki_refuses_content_type(_file_path):
+                        raise UnsupportedContentTypeError(
+                            f"Binary or unsupported content type for wiki "
+                            f"compile (path_len={len(_file_path)})"
+                        )
+                except UnsupportedContentTypeError:
                     return _suppressed_compile_result("unparseable content type")
                 # Attempt 1: full parser stack (requires unstructured.io).
                 try:
                     _elements = DocumentParser().parse(_file_path)
                     text = "\n".join(str(e) for e in _elements if str(e).strip())
-                except UnsupportedContentTypeError:  # defensive: parser never raises it now
-                    return _suppressed_compile_result("unparseable content type")
                 except _DPE as _exc:
                     logger.debug(
                         "compile_ingest_job: DocumentParser failed for file_id=%d: %s",
