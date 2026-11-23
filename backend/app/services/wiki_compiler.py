@@ -64,6 +64,43 @@ def _suppressed_compile_result(reason: str) -> dict:
         "reason": reason,
     }
 
+
+# Extensions whose content the wiki compile fallback will even attempt to
+# parse (final-critic round 1: the decision lives HERE, not in the shared
+# DocumentParser). Covers the text formats the .txt fallback reaches AND
+# the binary document formats unstructured.auto handles (PDF/DOCX/PPTX
+# are ZIP/binary containers that always carry NULs — refusing them by
+# sniff alone would suppress SUPPORTED types). Anything else combined
+# with a binary head is a typed content-type refusal; a parse crash on
+# one of THESE stays a failure.
+_WIKI_PARSEABLE_SUFFIXES = frozenset({
+    ".txt", ".md", ".markdown", ".rst", ".text", ".log", ".csv", ".tsv",
+    ".json", ".jsonl", ".yaml", ".yml", ".xml", ".html", ".htm",
+    ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx",
+    ".odt", ".odp", ".ods", ".epub", ".eml", ".msg", ".rtf",
+})
+
+
+def _wiki_refuses_content_type(file_path: str) -> bool:
+    """True when the wiki compile fallback refuses the file's content type.
+
+    An extension NOT in the wiki-parseable allowlist whose first kilobyte
+    contains a NUL byte (the Git binary heuristic — ZIP containers like
+    DOCX/PPTX and most raw binaries always carry NULs) is refused BEFORE
+    the parser runs. Text formats never emit NULs in their leading bytes,
+    and the allowlisted extensions go to the parser regardless, so a
+    parser crash on a SUPPORTED type remains an extractor failure.
+    """
+    suffix = Path(file_path).suffix.lower()
+    if suffix in _WIKI_PARSEABLE_SUFFIXES:
+        return False
+    try:
+        with open(file_path, "rb") as fh:
+            head = fh.read(1024)
+    except OSError:
+        return False
+    return b"\x00" in head
+
 # Matches [S#], [M#], [W#] citation markers produced by the chat engine.
 _CITE_STRIP_RE = re.compile(r"\[(?:S|M|W)\d+\]")
 
@@ -940,15 +977,19 @@ class WikiCompiler:
                     DocumentParser,
                     UnsupportedContentTypeError,
                 )
+                # Issue #1162 typed refusal (final-critic round 1): decide
+                # unsupported content types HERE, in the wiki compile
+                # fallback only, by an explicit extension allowlist plus a
+                # binary sniff — NEVER inside the shared DocumentParser,
+                # whose supported set includes NUL-leading binary formats
+                # (PDF/DOCX/PPTX) that main ingestion must keep parsing.
+                if _wiki_refuses_content_type(_file_path):
+                    return _suppressed_compile_result("unparseable content type")
                 # Attempt 1: full parser stack (requires unstructured.io).
                 try:
                     _elements = DocumentParser().parse(_file_path)
                     text = "\n".join(str(e) for e in _elements if str(e).strip())
-                except UnsupportedContentTypeError:
-                    # Typed refusal (binary/unsupported content type): a clean
-                    # skip, not a failure (owner decision distinguishes type
-                    # refusal from an extractor failure; pin:
-                    # test_does_not_open_raw_file_bytes).
+                except UnsupportedContentTypeError:  # defensive: parser never raises it now
                     return _suppressed_compile_result("unparseable content type")
                 except _DPE as _exc:
                     logger.debug(

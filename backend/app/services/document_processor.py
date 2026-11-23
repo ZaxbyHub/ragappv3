@@ -371,30 +371,15 @@ class DocumentParseError(Exception):
 
 
 class UnsupportedContentTypeError(DocumentParseError):
-    """The parser refused the file's CONTENT TYPE (binary/unsupported input).
+    """The wiki compile fallback refused the file's CONTENT TYPE.
 
     Issue #1162: a stable, typed signal distinguishing a type refusal from
-    a parser crash on a supported type. The wiki compile path treats only
-    this class as a clean "unparseable content type" skip; any other
-    DocumentParseError on an accepted type remains an extractor failure
-    that fails the job (owner decision, November 18 2026).
+    a parser crash on a supported type. Raised ONLY by the wiki compile
+    fallback path (wiki_compiler.py), decided by an explicit extension
+    allowlist + binary sniff there — NEVER by the shared DocumentParser,
+    whose supported set includes NUL-leading binary formats (PDF/DOCX/
+    PPTX are ZIP- or binary-container files the parser handles normally).
     """
-
-
-def _sniff_binary_head(path: Path) -> bool:
-    """True when the file's first kilobyte contains a NUL byte.
-
-    Text formats never emit NUL in their leading bytes; binary files
-    almost always do. This is the same heuristic Git uses for diff
-    detection and gives a message-free refusal signal for the compile
-    fallback path (``UnsupportedContentTypeError``).
-    """
-    try:
-        with open(path, "rb") as fh:
-            head = fh.read(1024)
-    except OSError:
-        return False
-    return b"\x00" in head
 
 
 # --- Ingestion error redaction (issue #562 / C26) ---------------------------
@@ -693,16 +678,6 @@ class DocumentParser:
         if not path.is_file():
             raise FileNotFoundError(
                 f"Path is not a file (path_len={len(str(path))})"
-            )
-
-        # Issue #1162: refuse binary input with the TYPED signal before the
-        # heavy parser stack runs — unstructured's own exception for binary
-        # files carries no stable type, and the wiki compile fallback must
-        # distinguish "unsupported content type" (clean skip) from "parser
-        # crashed on a supported type" (extractor failure).
-        if _sniff_binary_head(path):
-            raise UnsupportedContentTypeError(
-                f"Binary or unsupported content type (path_len={len(str(path))})"
             )
 
         try:

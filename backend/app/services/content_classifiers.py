@@ -53,11 +53,27 @@ _TOC_LEADER_RE = re.compile(
     re.IGNORECASE,
 )
 _CONTENTS_HEADING_RE = re.compile(r"^\s*(table of contents|contents)\s*:?\s*$", re.IGNORECASE)
-_BOILERPLATE_RE = re.compile(
-    r"(licence|license|copyright|\u00a9|all rights reserved|"
-    r"revision history|changelog|change record)",
+# Boilerplate is decided by SHAPE, not substring presence (final-critic
+# round 1: an unanchored keyword search classified a "driver license"
+# renewal procedure as boilerplate and suppressed its records). Two
+# shapes count:
+#   (a) a heading-like first line that IS a boilerplate keyword (optionally
+#       Markdown-prefixed or colon-suffixed): "Licence", "# Copyright";
+#   (b) whole-block legal wording: >= half the non-empty lines carry legal
+#       markers (copyright/©/all rights reserved/redistribution/no part of
+#       this/without permission/version or revision history lines).
+_BOILERPLATE_HEADING_RE = re.compile(
+    r"^\s*#{0,3}\s*(licence|license|copyright|\u00a9|all rights reserved|"
+    r"revision history|changelog|change record)s?\s*:?\s*$",
     re.IGNORECASE,
 )
+_BOILERPLATE_LINE_RE = re.compile(
+    r"(copyright|\u00a9|all rights reserved|redistribution and use|"
+    r"no part of (this|the)|without (prior )?(written )?permission|"
+    r"revision history|changelog)",
+    re.IGNORECASE,
+)
+_BOILERPLATE_LINE_FRACTION = 0.5
 _HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+\S")
 
 # A block is a TOC when at least this fraction of its non-empty lines are
@@ -116,8 +132,16 @@ def _classify_block(lines: List[str]) -> str:
     leader_lines = sum(1 for ln in non_empty if _TOC_LEADER_RE.search(ln))
     if non_empty and leader_lines / len(non_empty) >= _TOC_LINE_FRACTION and leader_lines >= _TOC_MIN_ENTRIES:
         return "toc"
-    if _BOILERPLATE_RE.search(non_empty[0]):
+    if _BOILERPLATE_HEADING_RE.match(non_empty[0]):
         return "boilerplate"
+    # Whole-block legal wording: a NOTICE is multi-line; a single line that
+    # merely MENTIONS copyright stays content (over-inclusion suppresses
+    # knowledge under the approved policy; under-inclusion only leaves a
+    # notice line visible in a summary).
+    if len(non_empty) >= 2:
+        legal_lines = sum(1 for ln in non_empty if _BOILERPLATE_LINE_RE.search(ln))
+        if legal_lines / len(non_empty) >= _BOILERPLATE_LINE_FRACTION:
+            return "boilerplate"
     return "content"
 
 
