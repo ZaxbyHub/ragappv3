@@ -48,6 +48,16 @@ const LINT_STATUS_COLORS: Partial<Record<WikiLintFinding["status"], string>> = {
   dismissed: "bg-muted text-muted-foreground line-through",
   auto_resolved: "bg-muted text-muted-foreground",
 };
+// Every status in the finding vocabulary, so the summary line never omits a
+// finding that the list below it shows.
+const LINT_STATUS_ORDER: WikiLintFinding["status"][] = [
+  "open",
+  "acknowledged",
+  "resolved",
+  "dismissed",
+  "auto_resolved",
+];
+const NO_LINT_FINDINGS: WikiLintFinding[] = [];
 
 const TRIGGER_LABELS: Record<WikiCompileJob["trigger_type"], string> = {
   ingest: "Ingest",
@@ -94,6 +104,14 @@ interface EffectLease { id: number; active: boolean }
 interface QueryContext { vaultId: number; statusFilter: string }
 interface ReadToken { id: number; lease: EffectLease; queryContext: QueryContext }
 interface MutationToken { id: number; lease: EffectLease }
+// #1161 AC3: the persisted lint section is supplementary to the jobs read.
+// `status` keeps a failed read from reading as "no findings recorded" (the
+// false-empty-verdict class, #775). Cross-vault staleness is not reachable:
+// WikiJobsPanel keys this state by vault, so a vault switch remounts fresh.
+interface LintState {
+  status: "ready" | "error";
+  findings: WikiLintFinding[];
+}
 
 function WikiJobsPanelState({
   vaultId,
@@ -105,7 +123,7 @@ function WikiJobsPanelState({
   // #1161 AC3: the persisted lint surface — a lint run's findings stay
   // visible from the Jobs view (server-side wiki_lint_findings; the
   // wiki hook's client-side array is NOT the source here).
-  const [lintFindings, setLintFindings] = useState<WikiLintFinding[]>([]);
+  const [lintState, setLintState] = useState<LintState | null>(null);
   const [statusFilter, setStatusFilter] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [jobsPhase, setJobsPhase] = useState<"loading" | "ready" | "error">("loading");
@@ -133,6 +151,32 @@ function WikiJobsPanelState({
       isCurrentAuthOwner(owner) &&
       captureAuthPrincipalGeneration() === principalGeneration,
     [owner, principalGeneration],
+  );
+
+  // #1161 AC3: the persisted lint read travels under the SAME read token as
+  // the jobs read (only the newest read may publish) but is never awaited by
+  // `refresh`: the mutation handlers await refresh to release their action
+  // gate, and a slow or hung supplementary request must not keep
+  // Retry/Cancel/Recompile busy (implementation review round 4 — the client
+  // timeout alone would hold the gate for up to 30 s).
+  const refreshLint = useCallback(
+    async (token: ReadToken, vault: number) => {
+      const lease = token.lease;
+      const mayApply = () => mayPublish(lease) && readTokenRef.current === token;
+      if (!mayApply()) return;
+      try {
+        const lintRes = await listWikiLintFindings({ vault_id: vault });
+        if (!mayApply()) return;
+        setLintState(
+          Array.isArray(lintRes?.findings)
+            ? { status: "ready", findings: lintRes.findings }
+            : { status: "error", findings: [] },
+        );
+      } catch {
+        if (mayApply()) setLintState({ status: "error", findings: [] });
+      }
+    },
+    [mayPublish],
   );
 
   const refresh = useCallback(async () => {
@@ -173,18 +217,16 @@ function WikiJobsPanelState({
         setLoading((current) => currentRead() && loadingTokenRef.current === token ? false : current);
       }
     }
-    // #1161 AC3: persisted lint travels with the same read token — a
-    // lint failure is supplementary and never flips the jobs phase.
-    try {
-      const lintRes = await listWikiLintFindings({ vault_id: vaultId });
-      if (currentRead() && Array.isArray(lintRes?.findings)) {
-        setLintFindings(lintRes.findings);
-      }
-    } catch {
-      // keep the previously rendered lint section
-    }
-  }, [mayPublish, queryContext, statusFilter, vaultId]);
+    // #1161 AC3: the supplementary lint read is started, not awaited (see
+    // refreshLint) — a lint failure never flips the jobs phase and never
+    // delays the release of a job action's busy state.
+    void refreshLint(token, vaultId);
+  }, [mayPublish, queryContext, refreshLint, statusFilter, vaultId]);
   refreshRef.current = refresh;
+
+  // Findings render only from a successful read; a pending or failed read
+  // renders its own line instead of the empty verdict.
+  const lintFindings = lintState?.status === "ready" ? lintState.findings : NO_LINT_FINDINGS;
 
   useEffect(() => {
     const lease: EffectLease = { id: ++nextLeaseIdRef.current, active: true };
@@ -347,42 +389,57 @@ function WikiJobsPanelState({
         >
           <div className="flex flex-wrap items-center gap-2 text-xs">
             <span className="font-medium text-sm">Wiki lint</span>
-            <span className="text-muted-foreground">
-              open: {lintFindings.filter((f) => f.status === "open").length} · resolved:{" "}
-              {lintFindings.filter((f) => f.status === "resolved").length} · dismissed:{" "}
-              {lintFindings.filter((f) => f.status === "dismissed").length}
-            </span>
+            {lintState?.status === "ready" && (
+              <span className="text-muted-foreground">
+                {LINT_STATUS_ORDER.map(
+                  (status) =>
+                    `${status.replace("_", "-")}: ${
+                      lintFindings.filter((f) => f.status === status).length
+                    }`,
+                ).join(" · ")}
+              </span>
+            )}
           </div>
-          {lintFindings.length === 0 ? (
-            <p className="text-xs text-muted-foreground mt-1">
-              No lint findings recorded for this vault.
+          {lintState?.status === "error" ? (
+            <p className="text-xs text-muted-foreground mt-1" data-testid="jobs-lint-error">
+              Could not load lint findings for this vault.
             </p>
-          ) : (
-            <ul className="mt-2 space-y-1" aria-label="Lint findings">
-              {lintFindings.slice(0, 8).map((f) => (
-                <li
-                  key={f.id}
-                  className="text-xs flex flex-wrap items-center gap-2"
-                  data-testid={`jobs-lint-finding-${f.id}`}
-                >
-                  <span className={"rounded-sm px-1.5 py-0.5 font-medium " + (LINT_STATUS_COLORS[f.status] ?? "")}>
-                    {f.status}
-                  </span>
-                  <span className="truncate max-w-[60%]">{f.title}</span>
-                  {f.origin && (
-                    <span className="text-muted-foreground">{f.origin}</span>
-                  )}
-                  {f.source_filename && (
-                    <span className="text-muted-foreground">
-                      {f.source_filename}
+          ) : lintState?.status === "ready" ? (
+            lintFindings.length === 0 ? (
+              <p className="text-xs text-muted-foreground mt-1">
+                No lint findings recorded for this vault.
+              </p>
+            ) : (
+              <ul className="mt-2 space-y-1" aria-label="Lint findings">
+                {lintFindings.slice(0, 8).map((f) => (
+                  <li
+                    key={f.id}
+                    className="text-xs flex flex-wrap items-center gap-2"
+                    data-testid={`jobs-lint-finding-${f.id}`}
+                  >
+                    <span className={"rounded-sm px-1.5 py-0.5 font-medium " + (LINT_STATUS_COLORS[f.status] ?? "")}>
+                      {f.status}
                     </span>
-                  )}
-                  <span className="ml-auto text-muted-foreground/80">
-                    {f.updated_at ? formatDate(f.updated_at) : ""}
-                  </span>
-                </li>
-              ))}
-            </ul>
+                    <span className="truncate max-w-[60%]">{f.title}</span>
+                    {f.origin && (
+                      <span className="text-muted-foreground">{f.origin}</span>
+                    )}
+                    {f.source_filename && (
+                      <span className="text-muted-foreground">
+                        {f.source_filename}
+                      </span>
+                    )}
+                    <span className="ml-auto text-muted-foreground/80">
+                      {f.updated_at ? formatDate(f.updated_at) : ""}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )
+          ) : (
+            <p className="text-xs text-muted-foreground mt-1" data-testid="jobs-lint-loading">
+              Loading lint findings…
+            </p>
           )}
         </section>
       )}

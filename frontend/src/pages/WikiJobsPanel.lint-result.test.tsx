@@ -84,4 +84,54 @@ describe("WikiJobsPanel persisted lint (#1161 AC3 / C3)", () => {
       await screen.findByText(/No lint findings recorded/i)
     ).toBeInTheDocument();
   });
+
+  it("counts every finding status in the summary line", async () => {
+    (listWikiLintFindings as ReturnType<typeof vi.fn>).mockResolvedValue({
+      findings: [
+        finding({ id: 21 }),
+        finding({ id: 22, status: "acknowledged", title: "Acknowledged finding" }),
+        finding({ id: 23, status: "auto_resolved", title: "Auto resolved finding" }),
+      ],
+    });
+    render(<WikiJobsPanel vaultId={7} />);
+    const section = await screen.findByTestId("jobs-lint-section");
+    expect(await screen.findByText("Auto resolved finding")).toBeInTheDocument();
+    // The list shows acknowledged and auto-resolved rows, so the summary
+    // must account for them too.
+    expect(section).toHaveTextContent("open: 1");
+    expect(section).toHaveTextContent("acknowledged: 1");
+    expect(section).toHaveTextContent("resolved: 0");
+    expect(section).toHaveTextContent("dismissed: 0");
+    expect(section).toHaveTextContent("auto-resolved: 1");
+  });
+
+  it("does not present a failed lint read as 'no findings' and recovers on the next read", async () => {
+    (listWikiLintFindings as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(new Error("lint unavailable"))
+      .mockResolvedValue({ findings: [] });
+    const { rerender } = render(<WikiJobsPanel vaultId={7} refreshSignal={0} />);
+
+    expect(await screen.findByTestId("jobs-lint-error")).toHaveTextContent(
+      /Could not load lint findings/i
+    );
+    expect(screen.queryByText(/No lint findings recorded/i)).toBeNull();
+
+    // The next refresh (parent-driven signal) re-reads and lands the verdict.
+    rerender(<WikiJobsPanel vaultId={7} refreshSignal={1} />);
+    expect(await screen.findByText(/No lint findings recorded/i)).toBeInTheDocument();
+    expect(screen.queryByTestId("jobs-lint-error")).toBeNull();
+  });
+
+  it("remounts with fresh lint state on a vault switch", async () => {
+    (listWikiLintFindings as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ findings: [finding()] })
+      .mockRejectedValueOnce(new Error("lint unavailable for vault 8"));
+    const { rerender } = render(<WikiJobsPanel vaultId={7} />);
+    expect(await screen.findByText("Stale claim after recompile")).toBeInTheDocument();
+
+    rerender(<WikiJobsPanel vaultId={8} />);
+    expect(await screen.findByTestId("jobs-lint-error")).toBeInTheDocument();
+    // The previous vault's finding is never shown under the new vault.
+    expect(screen.queryByText("Stale claim after recompile")).toBeNull();
+  });
 });

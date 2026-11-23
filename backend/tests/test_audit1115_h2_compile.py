@@ -10,17 +10,19 @@ qualifying-to-plain recompute lifecycle (existing records refresh and go
 stale; nothing is deleted).
 """
 
-# CI installs the reduced requirements-ci.txt which omits unstructured;
-# per-file stubs are load-bearing there (testing.md §2). Locally the partial
-# install lacks unstructured.partition.text AND the real chunk_by_title
-# drops plain-string elements, so both seams are stubbed deterministically.
-# Seeding is IMPORT-GUARDED (never displaces a real full install) and the
-# seams are RE-ASSERTED per test in _H2Base.setUp: under pytest-xdist every
-# test module in a worker is imported before any test runs, so a sibling
-# file's sys.modules stubs (e.g. test_issue515_wiki_processor.py's
-# chunk_by_title -> []) win process-wide by import order — without per-test
-# patching, this file's chunk_text legs would silently run on the sibling's
-# stubs and see an empty chunk set.
+# The chunking seams this file exercises are optional-dependency seams.
+# backend/conftest.py installs a minimal `unstructured` stub before any test
+# module imports (its chunk_by_title and partition return []), and a handful
+# of test modules REPLACE those stub modules unconditionally at import time
+# (test_contextual_chunking, test_hybrid_logging, test_integration and
+# test_retrieval_logging — every one sorted after this file). Under
+# pytest-xdist each worker imports every module before any test runs, so the
+# module object registered LAST is the one live at test time: seeding
+# sys.modules at import time here is process-global and order-dependent, and
+# it was silently overwritten on CI (PR #1204 CI round 1 — SemanticChunker
+# saw an empty element set). The seams are therefore RE-ASSERTED per test in
+# _H2Base.setUp with mock.patch on the live module object, and the
+# import-time seeding is guarded so it never displaces a real full install.
 import sys
 import tempfile
 import types
