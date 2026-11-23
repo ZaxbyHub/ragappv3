@@ -16,6 +16,7 @@ export * from "./vaults";
 export * from "./organizations";
 export * from "./memories";
 export * from "./auth-sessions";
+export * from "./reviewQueue";
 export * from "./search";
 export { default } from "./core";
 export { withMethodOverride, METHOD_OVERRIDE_HEADER, ERROR_CODE_HEADER } from "./core";

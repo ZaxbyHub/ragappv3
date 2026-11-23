@@ -43,6 +43,7 @@ const ProfilePage = lazy(() => import("@/pages/ProfilePage"));
 const ChangePasswordRequiredPage = lazy(() => import("@/pages/ChangePasswordRequiredPage"));
 const NotFoundPage = lazy(() => import("@/pages/NotFoundPage"));
 const WikiPage = lazy(() => import("@/pages/WikiPage"));
+const ReviewQueuePage = lazy(() => import("@/pages/ReviewQueuePage"));
 const KMSPage = lazy(() => import("@/pages/KMSPage"));
 const KMSDetailPage = lazy(() => import("@/pages/KMSDetailPage"));
 // Unified discovery surface (issue #515 / PRODUCT-ENH-11) — reached via the
@@ -163,6 +164,7 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
     if (pathname.startsWith("/documents")) return "documents";
     if (pathname.startsWith("/memory")) return "memory";
     if (pathname.startsWith("/wiki")) return "wiki";
+    if (pathname.startsWith("/review-queue")) return "reviewQueue";
     if (pathname.startsWith("/kms")) return "kms";
     if (pathname.startsWith("/draft-room")) return "draftRoom";
     if (pathname.startsWith("/vaults")) return "vaults";
@@ -198,6 +200,9 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
         break;
       case "wiki":
         navigate("/wiki");
+        break;
+      case "reviewQueue":
+        navigate("/review-queue");
         break;
       case "kms":
         navigate("/kms");
@@ -477,6 +482,16 @@ function App() {
                   <ProtectedRoute testMode={TEST_MODE}>
                     <MainAppShell testMode={TEST_MODE}>
                       <WikiPage />
+                    </MainAppShell>
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/review-queue"
+                element={
+                  <ProtectedRoute testMode={TEST_MODE}>
+                    <MainAppShell testMode={TEST_MODE}>
+                      <ReviewQueuePage />
                     </MainAppShell>
                   </ProtectedRoute>
                 }

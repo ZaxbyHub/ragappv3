@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { MessageSquare, FileText, Brain, MoreHorizontal, Database, Settings, Users, User, Building2, UserCog, BookOpen, Library, LogOut, PenLine } from "lucide-react";
+import { MessageSquare, FileText, Brain, MoreHorizontal, Database, Settings, Users, User, Building2, UserCog, BookOpen, BookCheck, Library, LogOut, PenLine } from "lucide-react";
 import {
   Sheet,
   SheetContent,
@@ -33,6 +33,7 @@ const primaryNavItems = [
 const moreNavItems: { id: NavItemId; label: string; icon: React.ComponentType<{ className?: string }>; adminOnly?: boolean; capabilityGated?: boolean }[] = [
   { id: "wiki", label: "Wiki", icon: BookOpen },
   { id: "kms" as const, label: "KMS", icon: Library },
+  { id: "reviewQueue" as const, label: "Review", icon: BookCheck },
   { id: "draftRoom", label: DRAFT_ROOM_NAV_LABEL, icon: PenLine, capabilityGated: true },
   { id: "vaults", label: "Vaults", icon: Database },
   { id: "settings", label: "Settings", icon: Settings },
