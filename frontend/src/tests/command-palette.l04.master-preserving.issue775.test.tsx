@@ -5,16 +5,16 @@
 // ships a static list of six navigation commands, ignores the signed-in
 // user's role, ignores the Draft Room capability, and never queries the
 // global search API. The NavigationRail (frontend/src/components/layout/
-// NavigationRail.tsx navItems) offers TWELVE destinations — /chat
-// /documents /memory /wiki /kms /draft-room /vaults /admin/groups
-// /admin/users /admin/organizations /settings /profile — with the three
-// /admin routes admin-only and draft-room capability-gated.
+// NavigationRail.tsx navItems) offers THIRTEEN destinations — /chat
+// /documents /memory /wiki /kms /review-queue /draft-room /vaults
+// /admin/groups /admin/users /admin/organizations /settings /profile —
+// with the three /admin routes admin-only and draft-room capability-gated.
 //
 // Frozen checks:
 //   C1 / AC4: an ADMIN palette reaches every NavigationRail destination.
 //             Expected RED: "expected 6 to be 0".
 //   C2 / AC5: a MEMBER palette (Draft Room visible) offers exactly the
-//             non-admin destinations — 9 distinct paths, none under
+//             non-admin destinations — 10 distinct paths, none under
 //             /admin. Expected RED: "expected 6 to be 9".
 //   C3 / AC6: the palette lists at least five ACTIONS — commands that do
 //             not navigate. Expected RED: "expected 0 to be greater than
@@ -67,13 +67,14 @@ vi.mock("@/lib/api/search", () => ({
   unifiedSearch: vi.fn().mockResolvedValue({ results: [] }),
 }));
 
-// The 12 NavigationRail destinations, frozen.
+// The 13 NavigationRail destinations, frozen.
 const DESTINATIONS = [
   "/chat",
   "/documents",
   "/memory",
   "/wiki",
   "/kms",
+  "/review-queue",
   "/draft-room",
   "/vaults",
   "/admin/groups",
@@ -180,9 +181,9 @@ describe("L04 — command palette completeness", () => {
       await closePalette();
     }
 
-    // Exactly the non-admin destinations: 12 NavigationRail destinations
+    // Exactly the non-admin destinations: 13 NavigationRail destinations
     // minus the 3 admin-only routes.
-    expect(offered.size).toBe(9);
+    expect(offered.size).toBe(10);
     // And nothing admin-flavored may leak to a member.
     expect(Array.from(offered).filter((path) => path.startsWith("/admin"))).toHaveLength(0);
   });

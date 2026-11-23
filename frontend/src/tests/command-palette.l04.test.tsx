@@ -67,6 +67,7 @@ vi.mock("@/pages/ChangePasswordRequiredPage", () => ({ default: () => <div>Chang
 vi.mock("@/pages/NotFoundPage", () => ({ default: () => <div>Not Found Page</div> }));
 vi.mock("@/pages/WikiPage", () => ({ default: () => <div>Wiki Page</div> }));
 vi.mock("@/pages/KMSPage", () => ({ default: () => <div>KMS Page</div> }));
+vi.mock("@/pages/ReviewQueuePage", () => ({ default: () => <div>Review Page</div> }));
 vi.mock("@/pages/KMSDetailPage", () => ({ default: () => <div>KMS Detail Page</div> }));
 vi.mock("@/pages/DraftRoomPage", () => ({ default: () => <div>Draft Room Page</div> }));
 vi.mock("@/pages/DraftRoomDetailPage", () => ({ default: () => <div>Draft Room Detail Page</div> }));
@@ -109,6 +110,7 @@ describe("#775 command palette", { timeout: 15_000 }, () => {
       ["Memory", "/memory"],
       ["Wiki", "/wiki"],
       ["KMS", "/kms"],
+      ["Review", "/review-queue"],
       ["Draft Room", "/draft-room"],
       ["Vaults", "/vaults"],
       ["Groups", "/admin/groups"],
@@ -128,7 +130,7 @@ describe("#775 command palette", { timeout: 15_000 }, () => {
     }
   });
 
-  it("member commands expose exactly the nine non-admin destinations", async () => {
+  it("member commands expose exactly the ten non-admin destinations", async () => {
     paletteHarness.role = "member";
     const { default: App } = await import("../App");
     render(<App />);
@@ -141,6 +143,7 @@ describe("#775 command palette", { timeout: 15_000 }, () => {
       "Memory",
       "Wiki",
       "KMS",
+      "Review",
       "Draft Room",
       "Vaults",
       "Settings",
@@ -152,7 +155,7 @@ describe("#775 command palette", { timeout: 15_000 }, () => {
     for (const label of ["Groups", "Users", "Organizations"]) {
       expect(within(palette).queryByRole("button", { name: `Go to ${label}` })).toBeNull();
     }
-    expect(within(palette).getAllByRole("button", { name: /^Go to / })).toHaveLength(9);
+    expect(within(palette).getAllByRole("button", { name: /^Go to / })).toHaveLength(10);
   });
 
   it("capability-off members lose only Draft Room, while superadmins retain admin controls", async () => {
@@ -163,7 +166,7 @@ describe("#775 command palette", { timeout: 15_000 }, () => {
     expect(await screen.findByText("Vaults Page")).toBeInTheDocument();
     const memberPalette = await openPalette();
     expect(within(memberPalette).queryByRole("button", { name: "Go to Draft Room" })).toBeNull();
-    expect(within(memberPalette).getAllByRole("button", { name: /^Go to / })).toHaveLength(8);
+    expect(within(memberPalette).getAllByRole("button", { name: /^Go to / })).toHaveLength(9);
     cleanup();
 
     paletteHarness.role = "superadmin";
@@ -172,7 +175,7 @@ describe("#775 command palette", { timeout: 15_000 }, () => {
     render(<App />);
     expect(await screen.findByText("Vaults Page")).toBeInTheDocument();
     const superadminPalette = await openPalette();
-    expect(within(superadminPalette).getAllByRole("button", { name: /^Go to / })).toHaveLength(12);
+    expect(within(superadminPalette).getAllByRole("button", { name: /^Go to / })).toHaveLength(13);
     for (const label of ["Groups", "Users", "Organizations"]) {
       expect(within(superadminPalette).getByRole("button", { name: `Go to ${label}` })).toBeInTheDocument();
     }

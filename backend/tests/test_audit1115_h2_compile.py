@@ -14,11 +14,19 @@ stale; nothing is deleted).
 # per-file stubs are load-bearing there (testing.md §2). Locally the partial
 # install lacks unstructured.partition.text AND the real chunk_by_title
 # drops plain-string elements, so both seams are stubbed deterministically.
+# Seeding is IMPORT-GUARDED (never displaces a real full install) and the
+# seams are RE-ASSERTED per test in _H2Base.setUp: under pytest-xdist every
+# test module in a worker is imported before any test runs, so a sibling
+# file's sys.modules stubs (e.g. test_issue515_wiki_processor.py's
+# chunk_by_title -> []) win process-wide by import order — without per-test
+# patching, this file's chunk_text legs would silently run on the sibling's
+# stubs and see an empty chunk set.
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 class _FakeChunk:
@@ -32,42 +40,46 @@ class _FakeChunk:
         return self.text
 
 
-_unstructured = sys.modules.get("unstructured") or types.ModuleType("unstructured")
-_unstructured.__path__ = getattr(_unstructured, "__path__", [])
-_partition = sys.modules.get("unstructured.partition") or types.ModuleType(
-    "unstructured.partition"
-)
-_partition.__path__ = getattr(_partition, "__path__", [])
-_partition_text = types.ModuleType("unstructured.partition.text")
-
-
 def _partition_text_stub(text=None, *args, **kwargs):
     # Split on blank lines into pseudo-elements so the chunker's
     # title-chunking path still runs on our fixtures.
     return [part for part in (text or "").split("\n\n") if part.strip()]
 
 
-_partition_text.partition_text = _partition_text_stub
-_unstructured.partition = _partition
-_partition.text = _partition_text
-_chunking = sys.modules.get("unstructured.chunking") or types.ModuleType(
-    "unstructured.chunking"
-)
-_chunking.__path__ = getattr(_chunking, "__path__", [])
-_chunking_title = types.ModuleType("unstructured.chunking.title")
-_chunking_title.chunk_by_title = lambda elements, **kwargs: [
-    _FakeChunk(str(e)) for e in elements
-]
-_unstructured.chunking = _chunking
-_chunking.title = _chunking_title
-for _name, _sub in (
-    ("unstructured", _unstructured),
-    ("unstructured.partition", _partition),
-    ("unstructured.partition.text", _partition_text),
-    ("unstructured.chunking", _chunking),
-    ("unstructured.chunking.title", _chunking_title),
-):
-    sys.modules[_name] = _sub
+def _chunk_by_title_stub(elements, **kwargs):
+    return [_FakeChunk(str(e)) for e in elements]
+
+
+try:
+    from unstructured.chunking.title import chunk_by_title as _probe_cbt  # noqa: F401
+    from unstructured.partition.text import partition_text as _probe_pt  # noqa: F401
+except ImportError:
+    _unstructured = sys.modules.get("unstructured") or types.ModuleType("unstructured")
+    _unstructured.__path__ = getattr(_unstructured, "__path__", [])
+    _partition = sys.modules.get("unstructured.partition") or types.ModuleType(
+        "unstructured.partition"
+    )
+    _partition.__path__ = getattr(_partition, "__path__", [])
+    _partition_text = types.ModuleType("unstructured.partition.text")
+    _partition_text.partition_text = _partition_text_stub
+    _unstructured.partition = _partition
+    _partition.text = _partition_text
+    _chunking = sys.modules.get("unstructured.chunking") or types.ModuleType(
+        "unstructured.chunking"
+    )
+    _chunking.__path__ = getattr(_chunking, "__path__", [])
+    _chunking_title = types.ModuleType("unstructured.chunking.title")
+    _chunking_title.chunk_by_title = _chunk_by_title_stub
+    _unstructured.chunking = _chunking
+    _chunking.title = _chunking_title
+    for _name, _sub in (
+        ("unstructured", _unstructured),
+        ("unstructured.partition", _partition),
+        ("unstructured.partition.text", _partition_text),
+        ("unstructured.chunking", _chunking),
+        ("unstructured.chunking.title", _chunking_title),
+    ):
+        sys.modules[_name] = _sub
 
 from app.models.database import init_db, run_migrations
 from app.services.chunking import SemanticChunker, filter_toc_chunks
@@ -143,6 +155,17 @@ class _H2Base(unittest.TestCase):
         self.store = WikiStore(self.conn)
         self.compiler = WikiCompiler(self.conn)
         self.kms_store = KMSStore(self.conn)
+        # Re-assert the deterministic unstructured seams for THIS test only
+        # (restored on cleanup): whichever module object is live in
+        # sys.modules — real (full install) or a sibling's stub — gets this
+        # file's partition/chunk behavior for the duration of the test.
+        for target, stub in (
+            ("unstructured.partition.text.partition_text", _partition_text_stub),
+            ("unstructured.chunking.title.chunk_by_title", _chunk_by_title_stub),
+        ):
+            patcher = patch(target, stub)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _set_text(self, text: str):
         self.conn.execute(

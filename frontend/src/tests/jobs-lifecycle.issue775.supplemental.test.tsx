@@ -12,6 +12,10 @@ const api = vi.hoisted(() => ({
   cancelWikiJob: vi.fn(),
   recompileVaultWiki: vi.fn(),
   runWikiLint: vi.fn(),
+  // #1161 AC3: the panel's refresh also reads the persisted lint surface;
+  // mock it like every other panel API so the lifecycle timing under test
+  // (mutation gating and busy-state handoff) stays deterministic.
+  listWikiLintFindings: vi.fn(),
   testConnections: vi.fn(),
 }));
 
@@ -135,6 +139,7 @@ beforeEach(() => {
   api.cancelWikiJob.mockResolvedValue({});
   api.recompileVaultWiki.mockResolvedValue({ job_id: 99 });
   api.runWikiLint.mockResolvedValue({ count: 0, findings: [] });
+  api.listWikiLintFindings.mockResolvedValue({ findings: [] });
   api.testConnections.mockResolvedValue({});
 });
 

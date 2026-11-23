@@ -229,8 +229,8 @@ describe("issue #775 — palette action wiring", () => {
 
     const firstAction = labels.findIndex((l) => l.includes("Show keyboard shortcuts"));
     const lastDestination = labels.findIndex((l) => l.includes("Go to Profile"));
-    // All 12 destinations for an admin with the Draft Room capability.
-    expect(labels.filter((l) => l.startsWith("Go to ")).length).toBe(12);
+    // All 13 destinations for an admin with the Draft Room capability.
+    expect(labels.filter((l) => l.startsWith("Go to ")).length).toBe(13);
     expect(firstAction).toBeGreaterThan(-1);
     expect(lastDestination).toBeGreaterThan(-1);
     expect(lastDestination).toBeLessThan(firstAction);
