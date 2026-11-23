@@ -233,13 +233,16 @@ class TestIssue515Ac8DocumentPageRefresh(_Issue515CompilerTestBase):
         # behavior for pages that were never manually edited. If a manual-edit
         # flag is added later, extend this test so a manually-edited page is
         # NOT clobbered by a recompile.
+        # Issue #1162: fixtures carry a qualifying role claim so the
+        # recompile-refresh behavior still has a page to refresh under the
+        # approved suppression policy (plain prose alone would now suppress).
         text_x = (
             "The onboarding guide describes the ZEBRA badge protocol for "
-            "new analysts arriving on site."
+            "new analysts arriving on site. Alice Smith is the ZEBRA Chief."
         )
         text_y = (
             "The onboarding guide describes the YAK badge protocol for "
-            "remote analysts working from home."
+            "remote analysts working from home. Bob Jones is the YAK Chief."
         )
 
         r1 = self.compiler.compile_ingest_job(

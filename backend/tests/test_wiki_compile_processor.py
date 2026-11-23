@@ -271,9 +271,12 @@ class TestCompileIngestJob(unittest.TestCase):
             except OSError:
                 pass
 
-    def test_creates_page_even_when_extraction_is_empty(self):
-        # Prose with no acronyms and no ALL-CAPS-org role claims must still
-        # produce a wiki page so the wiki reflects every ingested document.
+    def test_plain_text_without_qualifying_items_is_suppressed(self):
+        # Issue #1162 (owner decision, November 18 2026): a successful
+        # compile whose extraction yields ZERO qualifying items creates no
+        # wiki page and no association. This test previously pinned the
+        # always-materialize rule (pre-ce13bde4-inverse); the approved
+        # suppression policy reverses it.
         plain_text = (
             "The product team shipped a release on Tuesday. "
             "Feedback was gathered from beta users and incorporated."
@@ -281,20 +284,25 @@ class TestCompileIngestJob(unittest.TestCase):
         result = self.compiler.compile_ingest_job(
             vault_id=1, input_json={"file_id": 1, "text": plain_text}
         )
-        self.assertFalse(
+        self.assertTrue(
             result.get("skipped"),
-            "Ingest must produce a page even when deterministic extraction is empty",
+            "zero-qualifying-items success must suppress derived records",
         )
-        self.assertIsNotNone(result.get("page"))
+        self.assertEqual(result.get("reason"), "no qualifying items")
+        self.assertIsNone(result.get("page"))
         self.assertEqual(result["claims"], [])
         self.assertEqual(result["entities"], [])
-        # The page row must actually exist in the DB.
-        row = self.conn.execute(
-            "SELECT id, page_type, status FROM wiki_pages WHERE id = ?",
-            (result["page"]["id"],),
-        ).fetchone()
-        self.assertIsNotNone(row)
-        self.assertEqual(dict(row)["status"], "needs_review")
+        self.assertEqual(result["relations_count"], 0)
+        self.assertEqual(result["claims_superseded"], 0)
+        # No page or association rows exist for the vault.
+        pages = self.conn.execute(
+            "SELECT COUNT(*) FROM wiki_pages WHERE vault_id = 1"
+        ).fetchone()[0]
+        self.assertEqual(pages, 0)
+        assoc = self.conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_files WHERE vault_id = 1"
+        ).fetchone()[0]
+        self.assertEqual(assoc, 0)
 
 
 # ---------------------------------------------------------------------------
