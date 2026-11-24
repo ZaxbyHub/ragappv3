@@ -21,26 +21,33 @@ import sqlite3
 
 logger = logging.getLogger(__name__)
 
-# SQLite thread-safety guard for parallelized vault permission queries.
-# asyncio.to_thread runs callables in separate OS threads; sharing a single
-# sqlite3.Connection across those threads is only safe when SQLite is built
-# with SERIALIZED threading (sqlite3.threadsafety == 3). Otherwise, fall back
-# to sequential to_thread calls to avoid "SQLite objects created in a thread
-# can only be used in that same thread" and subtle data corruption.
+# SQLite thread-safety diagnostic for the vault permission queries.
+# Issue #1206: the four permission closures in get_effective_vault_permissions
+# all execute on the caller's SINGLE sqlite3.Connection, and the historical
+# concurrent dispatch (asyncio.gather(asyncio.to_thread(...)) whenever
+# sqlite3.threadsafety == 3) wedged under full-suite CI load — worker threads
+# parked inside db.execute with no failing test (Backend job exit 88, watchdog
+# quiet arm; see #1206 evidence, Actions run 45263195017). The queries now run
+# strictly one at a time on that connection; this flag survives only to keep
+# the once-per-process _warn_fallback_threading() diagnostic for
+# non-SERIALIZED builds, where sharing a connection across threads is unsafe
+# even sequentially-guarded ("SQLite objects created in a thread can only be
+# used in that same thread" and subtle data corruption).
 _SQLITE_SERIALIZED = sqlite3.threadsafety == 3
 _FALLBACK_WARNED = False
 
 
 def _warn_fallback_threading() -> None:
-    """Log the sequential fallback warning once per process."""
+    """Log the sequential-dispatch warning once per process."""
     global _FALLBACK_WARNED
     if _FALLBACK_WARNED:
         return
     _FALLBACK_WARNED = True
     logger.warning(
-        "SQLite threading mode is %s; get_effective_vault_permissions will "
-        "run sequentially. For parallel execution, use a SERIALIZED build "
-        "(sqlite3.threadsafety == 3).",
+        "SQLite threading mode is %s; get_effective_vault_permissions runs "
+        "its permission queries sequentially on the caller's connection "
+        "(issue #1206: concurrent dispatch on a shared connection wedged "
+        "under load; queries stay sequential on SERIALIZED builds too).",
         sqlite3.threadsafety,
     )
 
@@ -199,19 +206,20 @@ async def get_effective_vault_permissions(
             (*normalized_ids, user_id),
         ).fetchall()
 
-    if _SQLITE_SERIALIZED:
-        members_rows, group_rows, public_rows, org_rows = await asyncio.gather(
-            asyncio.to_thread(_query_vault_members),
-            asyncio.to_thread(_query_group_access),
-            asyncio.to_thread(_query_public_vaults),
-            asyncio.to_thread(_query_org_vaults),
-        )
-    else:
+    # Issue #1206: these four closures all execute on the caller's single
+    # shared sqlite3.Connection, so they must run strictly one at a time —
+    # never again through asyncio.gather(asyncio.to_thread(...)), whose
+    # concurrent threads wedged inside db.execute under full-suite CI load
+    # (Backend exit 88, watchdog quiet arm, no failing test). Sequential
+    # asyncio.to_thread still keeps each blocking query off the event loop.
+    # The _SQLITE_SERIALIZED gate survives only to keep the non-SERIALIZED
+    # diagnostic warning (see _warn_fallback_threading above).
+    if not _SQLITE_SERIALIZED:
         _warn_fallback_threading()
-        members_rows = await asyncio.to_thread(_query_vault_members)
-        group_rows = await asyncio.to_thread(_query_group_access)
-        public_rows = await asyncio.to_thread(_query_public_vaults)
-        org_rows = await asyncio.to_thread(_query_org_vaults)
+    members_rows = await asyncio.to_thread(_query_vault_members)
+    group_rows = await asyncio.to_thread(_query_group_access)
+    public_rows = await asyncio.to_thread(_query_public_vaults)
+    org_rows = await asyncio.to_thread(_query_org_vaults)
 
     for vault_id, permission in members_rows:
         effective_levels[vault_id] = max(
