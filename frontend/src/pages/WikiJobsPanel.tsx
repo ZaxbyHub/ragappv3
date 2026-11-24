@@ -105,11 +105,15 @@ interface QueryContext { vaultId: number; statusFilter: string }
 interface ReadToken { id: number; lease: EffectLease; queryContext: QueryContext }
 interface MutationToken { id: number; lease: EffectLease }
 // #1161 AC3: the persisted lint section is supplementary to the jobs read.
-// `status` keeps a failed read from reading as "no findings recorded" (the
-// false-empty-verdict class, #775). Cross-vault staleness is not reachable:
-// WikiJobsPanel keys this state by vault, so a vault switch remounts fresh.
+// EVERY read is announced as "loading" and keeps the last successful findings
+// on screen, so an earlier empty verdict never reads as current while a later
+// read is pending (implementation review round 5), and a failed read renders
+// an error line instead of the empty verdict (the false-empty-verdict class,
+// #775). Cross-vault staleness is not reachable: WikiJobsPanel keys this state
+// by vault, so a vault switch remounts fresh.
 interface LintState {
-  status: "ready" | "error";
+  status: "loading" | "ready" | "error";
+  /** The last successful read's findings; kept while loading and after a failed read. */
   findings: WikiLintFinding[];
 }
 
@@ -164,16 +168,21 @@ function WikiJobsPanelState({
       const lease = token.lease;
       const mayApply = () => mayPublish(lease) && readTokenRef.current === token;
       if (!mayApply()) return;
+      const retain = (status: LintState["status"]) =>
+        setLintState((current) => ({ status, findings: current?.findings ?? NO_LINT_FINDINGS }));
+      // Announce the read before awaiting it: the previous verdict (including
+      // an earlier "no findings") must not read as current while it is pending.
+      retain("loading");
       try {
         const lintRes = await listWikiLintFindings({ vault_id: vault });
         if (!mayApply()) return;
-        setLintState(
-          Array.isArray(lintRes?.findings)
-            ? { status: "ready", findings: lintRes.findings }
-            : { status: "error", findings: [] },
-        );
+        if (Array.isArray(lintRes?.findings)) {
+          setLintState({ status: "ready", findings: lintRes.findings });
+        } else {
+          retain("error");
+        }
       } catch {
-        if (mayApply()) setLintState({ status: "error", findings: [] });
+        if (mayApply()) retain("error");
       }
     },
     [mayPublish],
@@ -224,9 +233,11 @@ function WikiJobsPanelState({
   }, [mayPublish, queryContext, refreshLint, statusFilter, vaultId]);
   refreshRef.current = refresh;
 
-  // Findings render only from a successful read; a pending or failed read
-  // renders its own line instead of the empty verdict.
-  const lintFindings = lintState?.status === "ready" ? lintState.findings : NO_LINT_FINDINGS;
+  // The last successful read's findings (empty until one lands). Only a
+  // "ready" state may state the empty verdict; a pending or failed read with
+  // nothing to show renders its own line instead.
+  const lintFindings = lintState?.findings ?? NO_LINT_FINDINGS;
+  const lintReady = lintState?.status === "ready";
 
   useEffect(() => {
     const lease: EffectLease = { id: ++nextLeaseIdRef.current, active: true };
@@ -389,7 +400,7 @@ function WikiJobsPanelState({
         >
           <div className="flex flex-wrap items-center gap-2 text-xs">
             <span className="font-medium text-sm">Wiki lint</span>
-            {lintState?.status === "ready" && (
+            {lintFindings.length > 0 && (
               <span className="text-muted-foreground">
                 {LINT_STATUS_ORDER.map(
                   (status) =>
@@ -399,44 +410,48 @@ function WikiJobsPanelState({
                 ).join(" · ")}
               </span>
             )}
+            {lintState?.status === "loading" && lintFindings.length > 0 && (
+              <span className="text-muted-foreground" data-testid="jobs-lint-refreshing">
+                Refreshing…
+              </span>
+            )}
           </div>
-          {lintState?.status === "error" ? (
+          {lintState?.status === "error" && (
             <p className="text-xs text-muted-foreground mt-1" data-testid="jobs-lint-error">
               Could not load lint findings for this vault.
             </p>
-          ) : lintState?.status === "ready" ? (
-            lintFindings.length === 0 ? (
-              <p className="text-xs text-muted-foreground mt-1">
-                No lint findings recorded for this vault.
-              </p>
-            ) : (
-              <ul className="mt-2 space-y-1" aria-label="Lint findings">
-                {lintFindings.slice(0, 8).map((f) => (
-                  <li
-                    key={f.id}
-                    className="text-xs flex flex-wrap items-center gap-2"
-                    data-testid={`jobs-lint-finding-${f.id}`}
-                  >
-                    <span className={"rounded-sm px-1.5 py-0.5 font-medium " + (LINT_STATUS_COLORS[f.status] ?? "")}>
-                      {f.status}
+          )}
+          {lintFindings.length > 0 ? (
+            <ul className="mt-2 space-y-1" aria-label="Lint findings">
+              {lintFindings.slice(0, 8).map((f) => (
+                <li
+                  key={f.id}
+                  className="text-xs flex flex-wrap items-center gap-2"
+                  data-testid={`jobs-lint-finding-${f.id}`}
+                >
+                  <span className={"rounded-sm px-1.5 py-0.5 font-medium " + (LINT_STATUS_COLORS[f.status] ?? "")}>
+                    {f.status}
+                  </span>
+                  <span className="truncate max-w-[60%]">{f.title}</span>
+                  {f.origin && (
+                    <span className="text-muted-foreground">{f.origin}</span>
+                  )}
+                  {f.source_filename && (
+                    <span className="text-muted-foreground">
+                      {f.source_filename}
                     </span>
-                    <span className="truncate max-w-[60%]">{f.title}</span>
-                    {f.origin && (
-                      <span className="text-muted-foreground">{f.origin}</span>
-                    )}
-                    {f.source_filename && (
-                      <span className="text-muted-foreground">
-                        {f.source_filename}
-                      </span>
-                    )}
-                    <span className="ml-auto text-muted-foreground/80">
-                      {f.updated_at ? formatDate(f.updated_at) : ""}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )
-          ) : (
+                  )}
+                  <span className="ml-auto text-muted-foreground/80">
+                    {f.updated_at ? formatDate(f.updated_at) : ""}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : lintReady ? (
+            <p className="text-xs text-muted-foreground mt-1">
+              No lint findings recorded for this vault.
+            </p>
+          ) : lintState?.status === "error" ? null : (
             <p className="text-xs text-muted-foreground mt-1" data-testid="jobs-lint-loading">
               Loading lint findings…
             </p>

@@ -12,17 +12,24 @@ stale; nothing is deleted).
 
 # The chunking seams this file exercises are optional-dependency seams.
 # backend/conftest.py installs a minimal `unstructured` stub before any test
-# module imports (its chunk_by_title and partition return []), and a handful
-# of test modules REPLACE those stub modules unconditionally at import time
-# (test_contextual_chunking, test_hybrid_logging, test_integration and
-# test_retrieval_logging — every one sorted after this file). Under
-# pytest-xdist each worker imports every module before any test runs, so the
-# module object registered LAST is the one live at test time: seeding
-# sys.modules at import time here is process-global and order-dependent, and
-# it was silently overwritten on CI (PR #1204 CI round 1 — SemanticChunker
-# saw an empty element set). The seams are therefore RE-ASSERTED per test in
-# _H2Base.setUp with mock.patch on the live module object, and the
-# import-time seeding is guarded so it never displaces a real full install.
+# module imports (its chunk_by_title and partition return []), and seven test
+# modules REPLACE those stub modules unconditionally at module level
+# (test_c16_chat_message_cap, test_c16c_message_cap_guards,
+# test_chat_history_role_validation, test_contextual_chunking,
+# test_hybrid_logging, test_integration and test_retrieval_logging — all
+# sorted after this file). Under pytest-xdist each worker imports every module
+# before any test runs, so the module object registered LAST is the one live
+# at test time. This file therefore does NO import-time seeding: both seams are
+# installed per test by _H2Base (the partition module through an exact
+# save/restore of its single sys.modules entry, chunk_by_title through
+# mock.patch on the live module object), so the deterministic behavior holds
+# regardless of who registered the stub and nothing leaks into other tests.
+# (PR #1204 CI round 1: import-time seeding was overwritten on CI and
+# SemanticChunker saw an empty element set. Round 5: a guarded seed still
+# displaced the conftest stub for every module sorted between this file and
+# the next unconditional installer, because conftest does not register
+# unstructured.partition.text and this file's own guard therefore fired.)
+import contextlib
 import sys
 import tempfile
 import types
@@ -52,36 +59,30 @@ def _chunk_by_title_stub(elements, **kwargs):
     return [_FakeChunk(str(e)) for e in elements]
 
 
-try:
-    from unstructured.chunking.title import chunk_by_title as _probe_cbt  # noqa: F401
-    from unstructured.partition.text import partition_text as _probe_pt  # noqa: F401
-except ImportError:
-    _unstructured = sys.modules.get("unstructured") or types.ModuleType("unstructured")
-    _unstructured.__path__ = getattr(_unstructured, "__path__", [])
-    _partition = sys.modules.get("unstructured.partition") or types.ModuleType(
-        "unstructured.partition"
-    )
-    _partition.__path__ = getattr(_partition, "__path__", [])
-    _partition_text = types.ModuleType("unstructured.partition.text")
-    _partition_text.partition_text = _partition_text_stub
-    _unstructured.partition = _partition
-    _partition.text = _partition_text
-    _chunking = sys.modules.get("unstructured.chunking") or types.ModuleType(
-        "unstructured.chunking"
-    )
-    _chunking.__path__ = getattr(_chunking, "__path__", [])
-    _chunking_title = types.ModuleType("unstructured.chunking.title")
-    _chunking_title.chunk_by_title = _chunk_by_title_stub
-    _unstructured.chunking = _chunking
-    _chunking.title = _chunking_title
-    for _name, _sub in (
-        ("unstructured", _unstructured),
-        ("unstructured.partition", _partition),
-        ("unstructured.partition.text", _partition_text),
-        ("unstructured.chunking", _chunking),
-        ("unstructured.chunking.title", _chunking_title),
-    ):
-        sys.modules[_name] = _sub
+_PARTITION_TEXT_MODULE = "unstructured.partition.text"
+
+
+@contextlib.contextmanager
+def _deterministic_chunking_seams():
+    """This file's partition/chunk behavior for ONE test, restored afterwards.
+
+    ``sys.modules['unstructured.partition.text']`` is swapped with an exact
+    save/restore of that single entry (conftest does not register it; a real
+    install's module is put back afterwards). ``chunk_by_title`` is patched on
+    whichever ``unstructured.chunking.title`` object is live.
+    """
+    saved = sys.modules.get(_PARTITION_TEXT_MODULE)
+    module = types.ModuleType(_PARTITION_TEXT_MODULE)
+    module.partition_text = _partition_text_stub
+    sys.modules[_PARTITION_TEXT_MODULE] = module
+    try:
+        with patch("unstructured.chunking.title.chunk_by_title", _chunk_by_title_stub):
+            yield
+    finally:
+        if saved is None:
+            sys.modules.pop(_PARTITION_TEXT_MODULE, None)
+        else:
+            sys.modules[_PARTITION_TEXT_MODULE] = saved
 
 from app.models.database import init_db, run_migrations
 from app.services.chunking import SemanticChunker, filter_toc_chunks
@@ -157,17 +158,13 @@ class _H2Base(unittest.TestCase):
         self.store = WikiStore(self.conn)
         self.compiler = WikiCompiler(self.conn)
         self.kms_store = KMSStore(self.conn)
-        # Re-assert the deterministic unstructured seams for THIS test only
-        # (restored on cleanup): whichever module object is live in
-        # sys.modules — real (full install) or a sibling's stub — gets this
-        # file's partition/chunk behavior for the duration of the test.
-        for target, stub in (
-            ("unstructured.partition.text.partition_text", _partition_text_stub),
-            ("unstructured.chunking.title.chunk_by_title", _chunk_by_title_stub),
-        ):
-            patcher = patch(target, stub)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        # This file's deterministic partition/chunk behavior for THIS test
+        # only: whichever module object is live — a real full install or a
+        # stub another module registered — is restored on cleanup, so nothing
+        # leaks to other tests.
+        seams = _deterministic_chunking_seams()
+        seams.__enter__()
+        self.addCleanup(seams.__exit__, None, None, None)
 
     def _set_text(self, text: str):
         self.conn.execute(
@@ -422,3 +419,27 @@ def test_toc_chunks_are_not_retrievable():
 
 def test_claim_gate_rejects_subjectless_claim():
     _run_case(TestClaimGate, "test_claim_gate_rejects_subjectless_claim")
+
+
+def test_seam_installation_is_leak_free():
+    """The per-test seams restore exactly what was there before.
+
+    Guards the property that replaced import-time seeding (final critic round
+    5): running this file's harness leaves the process-global stubs — or a
+    real install's modules — exactly as it found them.
+    """
+    was_registered = _PARTITION_TEXT_MODULE in sys.modules
+    partition_text_before = sys.modules.get(_PARTITION_TEXT_MODULE)
+    title_module = sys.modules["unstructured.chunking.title"]
+    chunk_by_title_before = title_module.chunk_by_title
+
+    result = unittest.TestResult()
+    unittest.TestSuite(
+        [TestTocChunkFilter("test_toc_chunks_are_not_retrievable")]
+    ).run(result)
+    assert not result.errors, result.errors
+    assert not result.failures, result.failures
+
+    assert (_PARTITION_TEXT_MODULE in sys.modules) == was_registered
+    assert sys.modules.get(_PARTITION_TEXT_MODULE) is partition_text_before
+    assert title_module.chunk_by_title is chunk_by_title_before
