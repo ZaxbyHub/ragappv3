@@ -105,12 +105,15 @@ interface QueryContext { vaultId: number; statusFilter: string }
 interface ReadToken { id: number; lease: EffectLease; queryContext: QueryContext }
 interface MutationToken { id: number; lease: EffectLease }
 // #1161 AC3: the persisted lint section is supplementary to the jobs read.
-// EVERY read is announced as "loading" and keeps the last successful findings
-// on screen, so an earlier empty verdict never reads as current while a later
-// read is pending (implementation review round 5), and a failed read renders
-// an error line instead of the empty verdict (the false-empty-verdict class,
-// #775). Cross-vault staleness is not reachable: WikiJobsPanel keys this state
-// by vault, so a vault switch remounts fresh.
+// EVERY refresh marks the snapshot "loading" the moment it starts — before the
+// jobs request, not when the lint request begins — and keeps the last
+// successful findings on screen, so an earlier lint verdict (including an
+// empty one) never reads as current while a refresh is in flight
+// (implementation review rounds 5 and 6). A failed read renders an error line
+// instead of the empty verdict (the false-empty-verdict class, #775), and only
+// a "ready" snapshot may state the empty verdict. Cross-vault staleness is not
+// reachable: WikiJobsPanel keys this state by vault, so a vault switch
+// remounts fresh.
 interface LintState {
   status: "loading" | "ready" | "error";
   /** The last successful read's findings; kept while loading and after a failed read. */
@@ -157,35 +160,40 @@ function WikiJobsPanelState({
     [owner, principalGeneration],
   );
 
+  // #1161 AC3: sets the lint snapshot's status while keeping the last
+  // successful findings on screen.
+  const markLint = useCallback(
+    (status: LintState["status"]) =>
+      setLintState((current) => ({ status, findings: current?.findings ?? NO_LINT_FINDINGS })),
+    [],
+  );
+
   // #1161 AC3: the persisted lint read travels under the SAME read token as
   // the jobs read (only the newest read may publish) but is never awaited by
   // `refresh`: the mutation handlers await refresh to release their action
   // gate, and a slow or hung supplementary request must not keep
   // Retry/Cancel/Recompile busy (implementation review round 4 — the client
-  // timeout alone would hold the gate for up to 30 s).
+  // timeout alone would hold the gate for up to 30 s). The snapshot is marked
+  // pending by `refresh` itself the moment a refresh starts, so this only
+  // publishes the outcome.
   const refreshLint = useCallback(
     async (token: ReadToken, vault: number) => {
       const lease = token.lease;
       const mayApply = () => mayPublish(lease) && readTokenRef.current === token;
       if (!mayApply()) return;
-      const retain = (status: LintState["status"]) =>
-        setLintState((current) => ({ status, findings: current?.findings ?? NO_LINT_FINDINGS }));
-      // Announce the read before awaiting it: the previous verdict (including
-      // an earlier "no findings") must not read as current while it is pending.
-      retain("loading");
       try {
         const lintRes = await listWikiLintFindings({ vault_id: vault });
         if (!mayApply()) return;
         if (Array.isArray(lintRes?.findings)) {
           setLintState({ status: "ready", findings: lintRes.findings });
         } else {
-          retain("error");
+          markLint("error");
         }
       } catch {
-        if (mayApply()) retain("error");
+        if (mayApply()) markLint("error");
       }
     },
-    [mayPublish],
+    [markLint, mayPublish],
   );
 
   const refresh = useCallback(async () => {
@@ -207,6 +215,12 @@ function WikiJobsPanelState({
     setLoading((current) => currentRead() ? true : current);
     setJobsPhase((current) => currentRead() ? "loading" : current);
     setJobsContext((current) => currentRead() ? capturedQuery : current);
+    // #1161 AC3: the lint snapshot is marked pending with the refresh ITSELF,
+    // before the jobs request is awaited — not when its own request starts.
+    // The section stays visible during a same-context refresh, so an earlier
+    // lint verdict (including "no findings") must not read as current while
+    // jobs are in flight (implementation review round 6).
+    markLint("loading");
     try {
       // #1157: the jobs route defaults omitted limits to 50; pass the route
       // maximum so the panel keeps near-parity with its previous unbounded view.
@@ -230,7 +244,7 @@ function WikiJobsPanelState({
     // refreshLint) — a lint failure never flips the jobs phase and never
     // delays the release of a job action's busy state.
     void refreshLint(token, vaultId);
-  }, [mayPublish, queryContext, refreshLint, statusFilter, vaultId]);
+  }, [markLint, mayPublish, queryContext, refreshLint, statusFilter, vaultId]);
   refreshRef.current = refresh;
 
   // The last successful read's findings (empty until one lands). Only a

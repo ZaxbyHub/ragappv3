@@ -71,6 +71,10 @@ def _deterministic_chunking_seams():
     install's module is put back afterwards). ``chunk_by_title`` is patched on
     whichever ``unstructured.chunking.title`` object is live.
     """
+    # Presence is recorded separately from the value: a None entry is Python's
+    # failed-import marker — a PRESENT entry that must be put back as None, not
+    # an absent one to remove (implementation review round 6).
+    was_present = _PARTITION_TEXT_MODULE in sys.modules
     saved = sys.modules.get(_PARTITION_TEXT_MODULE)
     module = types.ModuleType(_PARTITION_TEXT_MODULE)
     module.partition_text = _partition_text_stub
@@ -79,10 +83,10 @@ def _deterministic_chunking_seams():
         with patch("unstructured.chunking.title.chunk_by_title", _chunk_by_title_stub):
             yield
     finally:
-        if saved is None:
-            sys.modules.pop(_PARTITION_TEXT_MODULE, None)
-        else:
+        if was_present:
             sys.modules[_PARTITION_TEXT_MODULE] = saved
+        else:
+            sys.modules.pop(_PARTITION_TEXT_MODULE, None)
 
 from app.models.database import init_db, run_migrations
 from app.services.chunking import SemanticChunker, filter_toc_chunks
@@ -433,13 +437,36 @@ def test_seam_installation_is_leak_free():
     title_module = sys.modules["unstructured.chunking.title"]
     chunk_by_title_before = title_module.chunk_by_title
 
-    result = unittest.TestResult()
-    unittest.TestSuite(
-        [TestTocChunkFilter("test_toc_chunks_are_not_retrievable")]
-    ).run(result)
-    assert not result.errors, result.errors
-    assert not result.failures, result.failures
+    def run_harness() -> None:
+        result = unittest.TestResult()
+        unittest.TestSuite(
+            [TestTocChunkFilter("test_toc_chunks_are_not_retrievable")]
+        ).run(result)
+        assert not result.errors, result.errors
+        assert not result.failures, result.failures
+        assert title_module.chunk_by_title is chunk_by_title_before
 
-    assert (_PARTITION_TEXT_MODULE in sys.modules) == was_registered
-    assert sys.modules.get(_PARTITION_TEXT_MODULE) is partition_text_before
-    assert title_module.chunk_by_title is chunk_by_title_before
+    try:
+        # 1. The environment's own state of the entry (absent, or a module
+        #    another file registered) comes back exactly as it was.
+        run_harness()
+        assert (_PARTITION_TEXT_MODULE in sys.modules) == was_registered
+        assert sys.modules.get(_PARTITION_TEXT_MODULE) is partition_text_before
+
+        # 2. A None entry — Python's failed-import marker — is a PRESENT entry
+        #    and must come back as None, not be removed (implementation review
+        #    round 6).
+        sys.modules[_PARTITION_TEXT_MODULE] = None
+        run_harness()
+        assert _PARTITION_TEXT_MODULE in sys.modules
+        assert sys.modules[_PARTITION_TEXT_MODULE] is None
+
+        # 3. An absent entry stays absent.
+        sys.modules.pop(_PARTITION_TEXT_MODULE, None)
+        run_harness()
+        assert _PARTITION_TEXT_MODULE not in sys.modules
+    finally:
+        if was_registered:
+            sys.modules[_PARTITION_TEXT_MODULE] = partition_text_before
+        else:
+            sys.modules.pop(_PARTITION_TEXT_MODULE, None)

@@ -50,6 +50,15 @@ function deferredLint() {
   return { promise, resolve };
 }
 
+/** A jobs read the test settles by hand, so the refresh can be held before the lint read starts. */
+function deferredJobs() {
+  let resolve!: (value: { jobs: never[] }) => void;
+  const promise = new Promise<{ jobs: never[] }>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
 /** Settle a held read and flush the state update it triggers. */
 async function settle(work: () => void) {
   await act(async () => {
@@ -244,5 +253,56 @@ describe("WikiJobsPanel persisted lint (#1161 AC3 / C3)", () => {
     expect(await screen.findByTestId("jobs-lint-error")).toBeInTheDocument();
     // The previous vault's finding is never shown under the new vault.
     expect(screen.queryByText("Stale claim after recompile")).toBeNull();
+  });
+
+  it("marks an earlier empty lint verdict pending as soon as a refresh starts, while jobs are still loading", async () => {
+    // Implementation review round 6: a refresh is jobs request FIRST, lint
+    // request second. The parent-driven refresh right after a lint run must not
+    // leave "no findings" on screen during the jobs half either.
+    const jobsLater = deferredJobs();
+    const lintLater = deferredLint();
+    (listWikiJobs as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ jobs: [] })
+      .mockReturnValueOnce(jobsLater.promise);
+    (listWikiLintFindings as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ findings: [] })
+      .mockReturnValueOnce(lintLater.promise);
+    const { rerender } = render(<WikiJobsPanel vaultId={7} refreshSignal={0} />);
+    expect(await screen.findByText(/No lint findings recorded/i)).toBeInTheDocument();
+
+    rerender(<WikiJobsPanel vaultId={7} refreshSignal={1} />);
+    await waitFor(() => expect(listWikiJobs).toHaveBeenCalledTimes(2));
+    // Jobs are still pending, so the lint request has not even started.
+    expect(listWikiLintFindings).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/No lint findings recorded/i)).toBeNull();
+    expect(screen.getByTestId("jobs-lint-loading")).toBeInTheDocument();
+
+    await settle(() => jobsLater.resolve({ jobs: [] }));
+    await waitFor(() => expect(listWikiLintFindings).toHaveBeenCalledTimes(2));
+    await settle(() => lintLater.resolve({ findings: [finding()] }));
+    expect(await screen.findByText("Stale claim after recompile")).toBeInTheDocument();
+    expect(screen.queryByTestId("jobs-lint-loading")).toBeNull();
+  });
+
+  it("labels the last findings as refreshing as soon as a refresh starts, while jobs are still loading", async () => {
+    const jobsLater = deferredJobs();
+    (listWikiJobs as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ jobs: [] })
+      .mockReturnValueOnce(jobsLater.promise);
+    (listWikiLintFindings as ReturnType<typeof vi.fn>).mockResolvedValue({
+      findings: [finding()],
+    });
+    const { rerender } = render(<WikiJobsPanel vaultId={7} refreshSignal={0} />);
+    expect(await screen.findByText("Stale claim after recompile")).toBeInTheDocument();
+    expect(screen.queryByTestId("jobs-lint-refreshing")).toBeNull();
+
+    rerender(<WikiJobsPanel vaultId={7} refreshSignal={1} />);
+    await waitFor(() => expect(listWikiJobs).toHaveBeenCalledTimes(2));
+    expect(screen.getByTestId("jobs-lint-refreshing")).toBeInTheDocument();
+    expect(screen.getByText("Stale claim after recompile")).toBeInTheDocument();
+
+    await settle(() => jobsLater.resolve({ jobs: [] }));
+    await waitFor(() => expect(screen.queryByTestId("jobs-lint-refreshing")).toBeNull());
+    expect(screen.getByText("Stale claim after recompile")).toBeInTheDocument();
   });
 });
