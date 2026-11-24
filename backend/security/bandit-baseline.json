@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 103883,
+      "loc": 104407,
       "nosec": 0,
       "skipped_tests": 73
     },
@@ -335,7 +335,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 503,
+      "loc": 506,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -426,7 +426,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1244,
+      "loc": 1247,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -478,7 +478,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 246,
+      "loc": 248,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -673,7 +673,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 415,
+      "loc": 503,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1392,6 +1392,19 @@
       "nosec": 0,
       "skipped_tests": 0
     },
+    "backend/app/services/mcp_server.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 424,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
     "backend/app/services/memory_store.py": {
       "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
@@ -1830,7 +1843,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1411,
+      "loc": 1415,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3449,7 +3462,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "90     settings.users_enabled\n91     and settings.jwt_secret_key == \"change-me-to-a-random-64-char-string\"\n92 ):\n",
+      "code": "91     settings.users_enabled\n92     and settings.jwt_secret_key == \"change-me-to-a-random-64-char-string\"\n93 ):\n",
       "col_offset": 35,
       "end_col_offset": 73,
       "filename": "backend/app/main.py",
@@ -3460,9 +3473,9 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'change-me-to-a-random-64-char-string'",
-      "line_number": 91,
+      "line_number": 92,
       "line_range": [
-        91
+        92
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",

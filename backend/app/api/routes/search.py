@@ -16,7 +16,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
-    get_current_active_user,
     get_current_user_or_service_account,
     get_db,
     get_embedding_service,
@@ -486,14 +485,16 @@ def _tiered_score(
 @router.get("/search/unified", response_model=UnifiedSearchResponse)
 async def unified_search(
     q: str = Query(..., min_length=1, max_length=200, description="Search query"),
-    vault_id: Optional[int] = Query(None, description="Restrict to a vault"),
+    vault_id: Optional[int] = Query(
+        None, ge=1, le=2**63 - 1, description="Restrict to a vault"
+    ),
     types: Optional[str] = Query(
         None,
         description="Comma-separated subset of document,wiki,kms,chat (default: all)",
     ),
     limit: int = Query(20, ge=1, le=50, description="Maximum results per entity type"),
     db: sqlite3.Connection = Depends(get_db),
-    user: dict = Depends(get_current_active_user),
+    user: dict = Depends(get_current_user_or_service_account),
     evaluate: Callable = Depends(get_evaluate_policy),
 ):
     """Unified discovery search across documents, wiki pages, KMS entries and
@@ -632,7 +633,15 @@ async def unified_search(
             placeholders = ",".join("?" * len(scope_vaults))
             chat_sql += f" AND vault_id IN ({placeholders})"
             chat_params.extend(scope_vaults)
-        if user.get("role") not in ("admin", "superadmin"):
+        if user.get("is_service_account"):
+            # Service accounts are minted role="superadmin"
+            # (deps.py get_current_user_or_service_account), but their
+            # scope vocabulary (documents:read) never includes chat, and
+            # chat titles are the first 50 chars of a user's message
+            # (chat.py title seeding) — an unscoped read here would leak
+            # other users' message content through unified search.
+            chat_sql += " AND user_id IS NULL"
+        elif user.get("role") not in ("admin", "superadmin"):
             chat_sql += " AND (user_id = ? OR user_id IS NULL)"
             chat_params.append(user.get("id"))
         chat_sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"

@@ -161,6 +161,8 @@ _LIMITED_ENDPOINT_ROSTER = frozenset(
         "app.api.routes.quality_reports.convert_report_to_eval_case",
         "app.api.routes.quality_reports.submit_quality_report",
         "app.api.routes.search.search",
+        "app.services.mcp_server.call_mcp_tool",
+        "app.services.mcp_server.list_mcp_tools",
         "app.api.routes.settings.post_settings",
         "app.api.routes.settings.probe_model_endpoint",
         "app.api.routes.settings.put_settings",

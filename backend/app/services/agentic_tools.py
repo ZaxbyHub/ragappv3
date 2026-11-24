@@ -541,6 +541,124 @@ class SynthesisTool(AgenticTool):
 
 
 # ---------------------------------------------------------------------------
+# Wiki read tool (#804, Workstream E tail)
+# ---------------------------------------------------------------------------
+
+
+class WikiReadTool(AgenticTool):
+    """Read-only wiki page tool gated on the vault-read policy.
+
+    Resolves a single wiki page by id and returns its markdown as the
+    tool output, but only after the injected policy evaluator authorizes
+    ``("vault", page.vault_id, "read")`` for the requesting principal.
+    The page row is read first because the vault id is only known from
+    that row; no page content leaves the tool before the policy call.
+    Callers holding a thread-safe pooled connection can pass
+    ``offload_store_read=True`` so that read runs off the event loop.
+    Missing pages, policy denials, and execution failures all surface the
+    SAME public failure (empty output/sources, ``success=False``) so the
+    tool never leaks whether a page id exists in a vault the principal
+    cannot read; the distinct cause is logged server-side only.
+    """
+
+    def __init__(self, db, evaluate, user, offload_store_read: bool = False):
+        # db: sqlite3 connection; evaluate: async callable
+        # (principal, resource_type, resource_id, action) -> bool; user:
+        # the requesting principal dict. offload_store_read: run the
+        # synchronous store read in a worker thread. Only safe when the
+        # connection was opened with check_same_thread=False (the pooled
+        # connections are); the default keeps the tool usable with any
+        # sqlite3 connection, including thread-affine ones.
+        self._db = db
+        self._evaluate = evaluate
+        self._user = user
+        self._offload_store_read = offload_store_read
+        self._next_label = 1
+
+    @property
+    def name(self) -> str:
+        return "wiki_read"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Read one wiki page by id. Arguments: page_id (int, required). "
+            "Read-only: returns the page markdown and a W-labelled source "
+            "entry, and only after the vault-read policy allows the "
+            "requesting principal."
+        )
+
+    async def execute(self, page_id: int, **_: Any) -> ToolResult:
+        """Return the page content, gated on the vault-read policy."""
+        # Deferred import to avoid an import cycle with the store layer.
+        from app.services.wiki_store import WikiStore
+
+        try:
+            store = WikiStore(self._db)
+            # load_relations=False keeps the query to the page row: this tool
+            # reads only vault_id/markdown/title, and the relation loads
+            # (claims/entities/lint findings) are pure overhead here. When the
+            # caller owns a thread-safe (check_same_thread=False) pooled
+            # connection, the synchronous read runs off the event loop — the
+            # same asyncio.to_thread pattern deps.py uses for the
+            # service-account lookup.
+            if self._offload_store_read:
+                page = await asyncio.to_thread(
+                    store.get_page, page_id, load_relations=False
+                )
+            else:
+                page = store.get_page(page_id, load_relations=False)
+            if page is None:
+                logger.info("[WikiReadTool] page not found: page_id=%s", page_id)
+                return ToolResult(
+                    output="",
+                    sources=[],
+                    success=False,
+                    error="wiki page not available",
+                )
+
+            vault_id = getattr(page, "vault_id", None)
+            allowed = await self._evaluate(self._user, "vault", vault_id, "read")
+            if not allowed:
+                logger.info(
+                    "[WikiReadTool] vault read denied: page_id=%s vault_id=%s",
+                    page_id,
+                    vault_id,
+                )
+                return ToolResult(
+                    output="",
+                    sources=[],
+                    success=False,
+                    error="wiki page not available",
+                )
+
+            markdown = getattr(page, "markdown", "") or ""
+            title = getattr(page, "title", "") or ""
+            label = f"W{self._next_label}"
+            self._next_label += 1
+            return ToolResult(
+                output=markdown,
+                sources=[
+                    {
+                        "source_label": label,
+                        "page_id": page_id,
+                        "title": title,
+                        "vault_id": vault_id,
+                    }
+                ],
+                success=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[WikiReadTool] read failed: %s", exc, exc_info=True)
+            return ToolResult(
+                output="",
+                sources=[],
+                success=False,
+                error="wiki page not available",
+            )
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 

@@ -670,17 +670,22 @@ async def get_current_user_or_service_account(
     except HTTPException as exc:
         if exc.status_code != 401:
             raise  # preserve 403 must_change_password, etc.
-        pass  # fall through to SA path on 401 only
+        # Keep the human-path failure (its detail and WWW-Authenticate
+        # challenge) so a caller whose bearer is NOT a sak_ key sees the
+        # same contract the JWT-only routes gave before this combined
+        # dependency existed; the SA path re-raises a generic 401 only for
+        # sak_-shaped keys it cannot validate.
+        jwt_error = exc
 
     # Path 2: Service-account auth
     if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        raise jwt_error
     parts = authorization.split(" ", 1)
     if len(parts) < 2 or not parts[1].strip():
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        raise jwt_error
     raw_key = parts[1].strip()
     if not raw_key.startswith("sak_"):
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        raise jwt_error
 
     # Hash the raw key and look up service_accounts
     key_hash = hashlib.sha256(raw_key.encode()).hexdigest()

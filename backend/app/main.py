@@ -61,6 +61,7 @@ from app.middleware.portal_resilience import (
     ErrorCodeHeaderMiddleware,
     MethodOverrideMiddleware,
 )
+from app.services.mcp_server import register_mcp_routes
 from app.utils.paths import is_unstripped_prefix, normalize_root_path
 
 logger = logging.getLogger(__name__)
@@ -235,6 +236,7 @@ app.include_router(kms_router, prefix="/api")
 app.include_router(tags_router, prefix="/api")
 app.include_router(folders_router, prefix="/api")
 app.include_router(service_accounts_router, prefix="/api")
+register_mcp_routes(app)
 app.include_router(prompts_router, prefix="/api")
 app.include_router(quality_reports_router, prefix="/api")
 app.include_router(review_queue_router, prefix="/api")
