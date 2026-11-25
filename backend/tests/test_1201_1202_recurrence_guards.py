@@ -8,9 +8,9 @@ the defect it names and green after the fix.
    in ``OWNER_RULE_CLASS``. ``ENFORCED`` routes must call
    ``_require_session_owner_or_admin``; ``OWN_CHECK`` routes must keep their
    own owner-or-admin check; ``DECISION_RECORDED`` routes are deliberately not
-   enforced until the named maintainer decision is answered - the entry states
+   enforced because the named maintainer decision is recorded - the entry states
    what ships, never that it is right. A route that is missing from the table,
-   a table entry whose route is gone, and a pending route that starts calling
+   a table entry whose route is gone, and a decided route that starts calling
    the helper all fail. Before the fix the item routes selected
    ``id, title, vault_id`` and authorised against the vault only, so any vault
    writer could rewrite or delete another member's session.
@@ -58,7 +58,7 @@ OWNER_RULE_CLASS = {
     ("app.api.routes.canvas", "create_session_artifact"): DECISION_RECORDED,
 }
 
-# Every DECISION_RECORDED route names the recorded decision it waits for.
+# Every DECISION_RECORDED route names the maintainer decision that keeps it out of scope.
 DECISION_RECORDED_BECAUSE = {
     ("app.api.routes.chat", "fork_session"): "#1201 ASK-2 (fork scope)",
     ("app.api.routes.canvas", "create_session_artifact"): "#1201 ASK-5 (canvas matrix)",
@@ -301,14 +301,14 @@ class SessionMutationOwnerRuleTest(unittest.TestCase):
             )
             self.assertIn("superadmin", text, f"{name} no longer exempts admin roles")
 
-    def test_pending_routes_name_their_decision(self):
+    def test_decided_routes_name_their_decision(self):
         for (module, name), kind in OWNER_RULE_CLASS.items():
             if kind != DECISION_RECORDED:
                 continue
             self.assertIn(
                 (module, name),
                 DECISION_RECORDED_BECAUSE,
-                f"{name} is DECISION_RECORDED without naming the open decision",
+                f"{name} is DECISION_RECORDED without naming the recorded decision",
             )
             func = _module_function(module, name)
             self.assertFalse(

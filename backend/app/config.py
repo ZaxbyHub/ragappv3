@@ -634,10 +634,10 @@ class Settings(BaseSettings):
     setting (legitimate assistant answers can be long)."""
 
     assistant_message_max_chars: int = 131072
-    """Maximum characters of an assistant-role item accepted by the two chat
-    write routes. Derived from `thinking_max_tokens` (32768) at 4 characters/token
-    (131072), so a legitimate long answer still saves; this is a
-    backstop against unbounded bodies, not the LIVE-user cap (#922/#1202)."""
+    """Floor for the assistant-role body backstop on the two chat write routes.
+    The effective cap is this value or `thinking_max_tokens * 8`, whichever is
+    larger, so it follows the live thinking-mode budget and a legitimate long
+    answer still saves; it is not the LIVE-user cap (#922/#1202)."""
 
     active_user_cache_ttl_seconds: int = 30
     """Time-to-live in seconds for cached active-user lookups in get_current_active_user.

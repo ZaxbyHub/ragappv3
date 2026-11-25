@@ -160,9 +160,23 @@ def _reject_over_cap_user_content(content: str) -> None:
         )
 
 
+ASSISTANT_CHARS_PER_TOKEN = 8
+"""Characters-per-token allowance used to scale the assistant backstop with the
+live thinking-mode budget. Eight is deliberately above average tokenizer density
+so a legitimate answer at the configured token ceiling still saves (#1202 AC22)."""
+
+
+def _effective_assistant_cap() -> int:
+    """The assistant backstop follows the live thinking-mode token budget."""
+    return max(
+        settings.assistant_message_max_chars,
+        settings.thinking_max_tokens * ASSISTANT_CHARS_PER_TOKEN,
+    )
+
+
 def _reject_over_cap_assistant_content(content: str) -> None:
     """Bound assistant-role bodies on the durable write routes (#1202/#922)."""
-    cap = settings.assistant_message_max_chars
+    cap = _effective_assistant_cap()
     if len(content) > cap:
         raise HTTPException(
             status_code=422,
@@ -3550,16 +3564,28 @@ async def add_messages_batch(
     if not await evaluate(user, "vault", session_row[2], "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
     _require_session_owner_or_admin(session_row[3], user)
-    for item in body.messages:
-        if item.role == "user":
-            _reject_over_cap_user_content(item.content)
-        elif item.role == "assistant":
-            _reject_over_cap_assistant_content(item.content)
-
     # Validate and prepare every row BEFORE touching the database so a bad row
-    # cannot leave a partially applied turn behind.
+    # cannot leave a partially applied turn behind. The durable-row lookup is
+    # hoisted here from the write loop so an #553 reconcile of an answer the
+    # server already persisted is exempt from the assistant backstop: the live
+    # user cap and a genuinely new assistant row are still bounded.
     prepared = []
     for item in body.messages:
+        existing_id: Optional[int] = None
+        if item.turn_id:
+            existing_result = await asyncio.to_thread(
+                conn.execute,
+                "SELECT id FROM chat_messages "
+                "WHERE session_id = ? AND turn_id = ? AND role = ?",
+                (session_id, item.turn_id, item.role),
+            )
+            existing_row = await asyncio.to_thread(existing_result.fetchone)
+            if existing_row is not None:
+                existing_id = existing_row[0]
+        if item.role == "user":
+            _reject_over_cap_user_content(item.content)
+        elif item.role == "assistant" and existing_id is None:
+            _reject_over_cap_assistant_content(item.content)
         if not item.content:
             raise HTTPException(status_code=422, detail="Message content must not be empty")
         persisted_content = (
@@ -3582,6 +3608,7 @@ async def add_messages_batch(
                 "claims_json": json.dumps(item.unverifiable_claims) if item.unverifiable_claims else None,
                 "currency_json": json.dumps(item.currency_warnings) if item.currency_warnings else None,
                 "enforcement_json": json.dumps(item.citation_enforcement) if item.citation_enforcement else None,
+                "existing_id": existing_id,
             }
         )
 
@@ -3598,17 +3625,7 @@ async def add_messages_batch(
         # turn_id (pre-#507 clients) keep the legacy insert path verbatim.
         saved_ids: List[int] = []
         for row in prepared:
-            existing_id: Optional[int] = None
-            if row["turn_id"]:
-                existing_result = await asyncio.to_thread(
-                    conn.execute,
-                    "SELECT id FROM chat_messages "
-                    "WHERE session_id = ? AND turn_id = ? AND role = ?",
-                    (session_id, row["turn_id"], row["role"]),
-                )
-                existing_row = await asyncio.to_thread(existing_result.fetchone)
-                if existing_row is not None:
-                    existing_id = existing_row[0]
+            existing_id = row["existing_id"]
             if existing_id is not None:
                 # Issue #1153 AC9 completion fence (F7c): a row the server
                 # already finalized as 'complete' is never downgraded by a

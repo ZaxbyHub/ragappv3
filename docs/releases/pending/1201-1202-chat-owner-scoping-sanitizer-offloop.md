@@ -20,8 +20,9 @@
   `db_pool.close_all()` so queued interrupted rows commit.
 - **`chat_message_max_chars` is enforced on the two write routes for user-role items** (#1202 AC2)
   with the stream route's 422 shape, after auth, vault and owner checks; an over-cap batch writes
-  nothing. Assistant-role items are bounded separately by `assistant_message_max_chars` (131072);
-  assistant answers below that ceiling remain unbounded by the live-user cap, per the #922 contract.
+  nothing. Assistant-role items are bounded separately by the larger of
+  `assistant_message_max_chars` (131072) and eight times the live `thinking_max_tokens`; a #553
+  reconcile of an answer the stream already persisted is exempt, per the #922 contract.
 - **Fence tracking is container-aware** (#1202 AC3, AC4). Literal `<answer>` markup inside a
   block-quoted or list-item fence survives, including wrapper tags before the container markers on
   the opener line; a second pass is a fixed point. Plain top-level fences behave as before.
@@ -50,8 +51,9 @@ user content; and the fence scanner deleted literal markup inside quoted fences.
   differing re-submitted note is appended with the second submitter id, and repeat submissions of the
   same note are idempotent. The one-row-per-identity retry contract is unchanged.
 - GET and fork remain vault-readable by the maintainer's recorded decision (2026-11-25): denying them would retract #573's share link.
-- Assistant-role content on the write routes is capped by `assistant_message_max_chars` (131072,
-  derived from `thinking_max_tokens`); legitimate long answers remain well above the live-user cap.
+- Assistant-role content on the write routes is capped by `max(assistant_message_max_chars,
+  thinking_max_tokens * 8)` at check time, so raising the live thinking budget keeps legitimate
+  long answers saveable; a #553 reconcile of an already-persisted answer is exempt.
 - Canvas routes keep their pinned vault-only authorization matrix (#509); the maintainer recorded
   that decision on 2026-11-25, so no owner rule was added to them.
 - `llm_client.py:569` still sanitizes synchronously inside async completion methods; it is in a

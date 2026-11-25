@@ -373,8 +373,9 @@ class AssistantCapTest(_Base):
         assistant-role items on both write routes; exact-cap content passes
         and the user cap is unchanged.
         """
-        ceiling = getattr(
-            settings, "assistant_message_max_chars", settings.thinking_max_tokens
+        ceiling = max(
+            settings.assistant_message_max_chars,
+            settings.thinking_max_tokens * 8,
         )
         self.assertGreater(ceiling, settings.chat_message_max_chars)
         sid, _mid = self._session()
@@ -416,3 +417,49 @@ class AssistantCapTest(_Base):
             },
         )
         self.assertEqual(user_item.status_code, 422, user_item.text)
+
+    def test_assistant_cap_tracks_live_thinking_budget_and_reconcile_is_exempt(self):
+        """The backstop follows a raised thinking budget at check time, and a
+        #553 reconcile of a row the server already persisted is never rejected
+        by the backstop after the budget is lowered again.
+        """
+        original = settings.thinking_max_tokens
+        self.addCleanup(setattr, settings, "thinking_max_tokens", original)
+        settings.thinking_max_tokens = 65536
+        sid, _mid = self._session()
+        long_answer = "a" * (settings.assistant_message_max_chars + 1)
+        turn_id = "round-trip-live-budget"
+        payload = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": long_answer,
+                    "turn_id": turn_id,
+                }
+            ]
+        }
+        first = self.client.post(
+            f"/api/chat/sessions/{sid}/messages/batch", json=payload
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+
+        # A fresh row of the same size would now exceed the floor backstop.
+        settings.thinking_max_tokens = 1
+        fresh = self.client.post(
+            f"/api/chat/sessions/{sid}/messages/batch",
+            json={"messages": [{"role": "assistant", "content": long_answer}]},
+        )
+        self.assertEqual(fresh.status_code, 422, fresh.text)
+
+        # The durable row reconciles even under the lowered budget, in place.
+        retry = self.client.post(
+            f"/api/chat/sessions/{sid}/messages/batch", json=payload
+        )
+        self.assertEqual(retry.status_code, 200, retry.text)
+        rows = self.conn.execute(
+            "SELECT id, content FROM chat_messages "
+            "WHERE session_id = ? AND turn_id = ? AND role = 'assistant'",
+            (sid, turn_id),
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(rows[0][1]), len(long_answer))
