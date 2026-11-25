@@ -365,7 +365,10 @@ test.describe("k06 documents layout (issue #769)", () => {
 
     // Card branch (below md): open the first card's Actions menu and
     // measure its Delete item; table branch (>= md): the direct button.
-    const directDelete = page.getByRole("button", { name: "Delete document" }).first();
+    // The TABLE delete only: getByRole name matching is substring-based, so
+    // the card's "Delete Document (<file>)" would also match a role-name
+    // probe — branch on the exact attribute instead.
+    const directDelete = page.locator('button[aria-label="Delete document"]').first();
     const inCardBranch = !(await directDelete.isVisible().catch(() => false));
     if (inCardBranch) {
       const firstCard = page.locator('[aria-label^="Document: "]').first();
