@@ -453,6 +453,22 @@ class ContainerFenceSanitizerTest(unittest.TestCase):
     def test_container_fence_nested_quotes_unchanged(self):
         self._assert_unchanged(">> ```\n<answer>keep me</answer>\n>> ```")
 
+    def test_container_fence_wrapper_whitespace_before_marker(self):
+        # A wrapper tag may be separated from the fence/container marker by
+        # spaces; the bounded prefix loop must consume them so the fenced
+        # literal survives pass 1 and pass 2 is a fixed point.
+        for raw, expected in (
+            (
+                "<answer> ```xml\n<answer>keep me</answer>\n```\n</answer>",
+                "```xml\n<answer>keep me</answer>\n```",
+            ),
+            (
+                "> <answer> ```\n<answer>keep me</answer>\n> ```",
+                ">  ```\n<answer>keep me</answer>\n> ```",
+            ),
+        ):
+            self._assert_becomes(raw, expected)
+
     def test_container_fence_plain_fence_ignores_quoted_closer(self):
         # A quoted marker inside a PLAIN fence is fenced content: it must not
         # close the fence and expose the following literal <answer> markup.

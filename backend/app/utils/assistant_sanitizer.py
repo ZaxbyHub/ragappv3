@@ -81,7 +81,9 @@ def _container_line(core: str):
     while True:
         match = _WRAPPER_PREFIX_RE.match(stripped)
         if match:
-            stripped = stripped[match.end() :]
+            # A wrapper tag may be separated from the container/fence marker
+            # by spaces or tabs (e.g. `<answer> ``` `); consume them too.
+            stripped = stripped[match.end() :].lstrip(" \t")
             marked = True
             continue
         match = _QUOTE_PREFIX_RE.match(stripped)
