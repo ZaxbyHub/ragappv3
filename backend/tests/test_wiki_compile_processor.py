@@ -304,6 +304,61 @@ class TestCompileIngestJob(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(assoc, 0)
 
+    def test_failed_curator_suppression_has_distinct_reason(self):
+        # Owner decision 2026-11-25 (ASK-001, critic's option c): an enabled
+        # curator failure plus empty deterministic extraction still creates
+        # nothing, but must never be reported as a successful empty result.
+        failed_summary = {
+            "accepted": 0,
+            "rejected": 0,
+            "lint": 0,
+            "errors": ["orchestration_error: RuntimeError"],
+            "calls": 0,
+            "input_chars": 0,
+        }
+        with patch.object(
+            self.compiler, "_maybe_run_curator", return_value=failed_summary
+        ):
+            result = self.compiler.compile_ingest_job(
+                vault_id=1,
+                input_json={
+                    "file_id": 1,
+                    "text": (
+                        "The product team shipped a release on Tuesday. "
+                        "Feedback was gathered from beta users."
+                    ),
+                },
+            )
+        self.assertTrue(result.get("skipped"))
+        self.assertEqual(result.get("reason"), "curator unavailable")
+        self.assertIsNone(result.get("page"))
+        self.assertEqual(result["claims"], [])
+        errors = (result.get("curator") or {}).get("errors") or []
+        self.assertTrue(
+            any("orchestration_error" in error for error in errors),
+            f"the curator failure must stay visible in result_json: {errors!r}",
+        )
+        pages = self.conn.execute(
+            "SELECT COUNT(*) FROM wiki_pages WHERE vault_id = 1"
+        ).fetchone()[0]
+        self.assertEqual(pages, 0)
+        assoc = self.conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_files WHERE vault_id = 1"
+        ).fetchone()[0]
+        self.assertEqual(assoc, 0)
+        entries = self.conn.execute(
+            "SELECT COUNT(*) FROM kms_entries WHERE vault_id = 1"
+        ).fetchone()[0]
+        self.assertEqual(entries, 0)
+
+    def test_curator_failure_detection_handles_both_result_shapes(self):
+        self.assertFalse(self.compiler._curator_failed(None))
+        self.assertFalse(self.compiler._curator_failed({"errors": []}))
+        self.assertTrue(self.compiler._curator_failed({"errors": ["boom"]}))
+        self.assertTrue(
+            self.compiler._curator_failed(SimpleNamespace(errors=["boom"]))
+        )
+
 
 # ---------------------------------------------------------------------------
 # WikiStore concurrent claim safety

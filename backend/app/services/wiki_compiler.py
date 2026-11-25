@@ -1097,7 +1097,16 @@ class WikiCompiler:
                 self._persist_curator_result(
                     cur_out, vault_id=vault_id, page_id=None, lint_only=True
                 )
-            result = _suppressed_compile_result("no qualifying items")
+            # Owner decision 2026-11-25 (ASK-001, critic's option c): a failed
+            # enabled-curator qualification stays suppressed, but is never
+            # reported as a successful empty extraction. The distinct reason
+            # keeps the AC1 distinction between success and failure intact.
+            reason = (
+                "curator unavailable"
+                if self._curator_failed(cur_out)
+                else "no qualifying items"
+            )
+            result = _suppressed_compile_result(reason)
             if claims_rejected_subjectless:
                 result["claims_rejected_subjectless"] = claims_rejected_subjectless
             existing_pages = self._store.list_pages_by_file(
@@ -1732,6 +1741,23 @@ class WikiCompiler:
             except (TypeError, ValueError):
                 return 0
         return len(getattr(cur_out, "accepted", None) or [])
+
+    @staticmethod
+    def _curator_failed(cur_out) -> bool:
+        """Whether the enabled curator reported an error (owner decision 2026-11-25).
+
+        A failed qualification must never be reported as a successful empty
+        extraction. The ingest path uses this to give suppression the distinct
+        ``curator unavailable`` reason while still creating nothing.
+        """
+        if cur_out is None:
+            return False
+        errors = (
+            cur_out.get("errors")
+            if isinstance(cur_out, dict)
+            else getattr(cur_out, "errors", None)
+        )
+        return bool(errors)
 
     @staticmethod
     def _curator_summary(cur_out):
