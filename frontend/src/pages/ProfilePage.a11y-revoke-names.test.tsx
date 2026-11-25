@@ -126,10 +126,10 @@ describe("ProfilePage a11y revoke names (#1159 AC3)", () => {
     expect(api.revokeSession).toHaveBeenCalledTimes(1);
   });
 
-  it("the current session keeps its explanatory label", async () => {
+  it("the current session keeps its explanatory label (visible text contained)", async () => {
     render(<ProfilePage />);
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Current session cannot be revoked here" })).toBeInTheDocument()
+      expect(screen.getByRole("button", { name: "Revoke — current session cannot be revoked here" })).toBeInTheDocument()
     );
   });
 });

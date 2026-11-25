@@ -495,7 +495,7 @@ function ProfilePageContent() {
                       disabled={session.is_current || revokingSessionIds.has(session.id)}
                       aria-label={
                         session.is_current
-                          ? "Current session cannot be revoked here"
+                          ? "Revoke — current session cannot be revoked here"
                           : `Revoke session ${session.id}: ${session.user_agent || "Unknown device"} (${session.ip_address || "unknown IP"})`
                       }
                     >

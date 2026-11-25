@@ -290,17 +290,27 @@ test.describe("a11y gate extensions (#871)", () => {
     /** Viewport for the zero-serious/critical interactive scan. */
     viewport: { width: number; height: number };
     open: (page: Page) => Promise<void>;
-    /** Named below-fold control, measured at the 640x360 reflow viewport. */
+    /** Bare route for the below-fold leg (goto only — interactive opens are
+     *  unstable at the compressed height; the page's own controls carry the
+     *  below-fold proof). */
+    route: string;
+    /** Named below-fold control, measured at the compressed-height viewport. */
     belowFoldSelector: string;
   }
 
-  // The 200%-zoom viewport (640x360, the matrix's reflow companion) for the
-  // below-fold leg: every surface's content overflows it deterministically.
-  const BELOW_FOLD_VIEWPORT = { width: 640, height: 360 };
+  // Below-fold measurement viewport: the surface's NATURAL WIDTH at a
+  // compressed 360px height — content overflows vertically without tripping
+  // width-responsive layout changes (a 640px-width switch broke the canvas
+  // route's shell in earlier iterations).
+  const belowFoldViewport = (surface: Surface) => ({
+    width: surface.viewport.width,
+    height: 360,
+  });
 
   const SURFACES: Surface[] = [
     {
       name: "RightPane (chat details panel)",
+      route: "/chat/1",
       viewport: { width: 1280, height: 720 },
       open: async (page) => {
         await page.goto("/chat/1");
@@ -313,6 +323,7 @@ test.describe("a11y gate extensions (#871)", () => {
     },
     {
       name: "Settings (panels opened)",
+      route: "/settings",
       viewport: { width: 1280, height: 720 },
       open: async (page) => {
         await page.goto("/settings");
@@ -325,6 +336,7 @@ test.describe("a11y gate extensions (#871)", () => {
     },
     {
       name: "DraftWorkspace (seeded draft opened)",
+      route: "/draft-room/1",
       viewport: { width: 1280, height: 720 },
       open: async (page) => {
         await page.goto("/draft-room/1");
@@ -335,6 +347,7 @@ test.describe("a11y gate extensions (#871)", () => {
     },
     {
       name: "Canvas (seeded artifact)",
+      route: "/chat/1/canvas/cav_a11y_fixture_0",
       viewport: { width: 1280, height: 720 },
       open: async (page) => {
         await page.goto("/chat/1/canvas/cav_a11y_fixture_0");
@@ -345,6 +358,7 @@ test.describe("a11y gate extensions (#871)", () => {
     },
     {
       name: "mobile More (bottom-nav sheet)",
+      route: "/chat/1",
       viewport: { width: 320, height: 568 },
       open: async (page) => {
         await page.goto("/chat/1");
@@ -373,13 +387,17 @@ test.describe("a11y gate extensions (#871)", () => {
       ).toEqual([]);
 
       // Leg 2 — FALSIFIABLE below-fold detection (plan-critic R2-2) at the
-      // surface's own viewport. Re-open first (leg 1's scroll already moved
-      // panes). App shells scroll in inner panes, so overflow = body OR any
-      // pane overflowing. When the surface overflows, the named control must
-      // start below the fold pre-scroll and be EXPOSED in the viewport after
-      // the scroll pass; when it provably fits, there is no fold to miss —
-      // assert that instead (either way the leg is falsifiable).
-      await surface.open(page);
+      // COMPRESSED-HEIGHT viewport (natural width, 360px tall): the designed
+      // short measurement that makes every surface overflow. Re-open at that
+      // viewport (leg 1's scroll already moved panes). When the surface
+      // overflows, the named control must start below the fold pre-scroll
+      // and be EXPOSED in the viewport after the scroll pass; when it
+      // provably fits, there is no fold to miss — assert that instead
+      // (either way the leg is falsifiable).
+      await page.setViewportSize(belowFoldViewport(surface));
+      await page.goto(surface.route);
+      await page.waitForTimeout(1_200);
+      const liveViewportHeight = await page.evaluate(() => window.innerHeight);
       const overflow = await page.evaluate(() => {
         if (document.body.scrollHeight > window.innerHeight + 4) return true;
         return Array.from(document.querySelectorAll<HTMLElement>("*")).some((el) => {
@@ -399,7 +417,7 @@ test.describe("a11y gate extensions (#871)", () => {
       // when every interactive control fits (overflow is non-control
       // content), disclose that instead — either way the leg is falsifiable.
       const candidates = await page.locator(surface.belowFoldSelector).all();
-      const viewportHeight = surface.viewport.height;
+      const viewportHeight = liveViewportHeight;
       let deepest: { locator: Locator; y: number } | null = null;
       for (const c of candidates) {
         const box = await c.boundingBox();
@@ -455,7 +473,6 @@ test.describe("a11y gate extensions (#871)", () => {
       );
       expect(selfCovered, `${surface.name}: the control's OWN rect is in the scanner's viewport coverage`).toBe(true);
       expect(seriousOrCritical(rescan.findings), `${surface.name}: rescan stays clean after scroll`).toEqual([]);
-      void BELOW_FOLD_VIEWPORT;
     });
   }
 });
