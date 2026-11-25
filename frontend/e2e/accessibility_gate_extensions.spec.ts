@@ -394,9 +394,10 @@ test.describe("a11y gate extensions (#871)", () => {
         ).toBe(false);
         return;
       }
-      // Pick the deepest control that actually starts below the fold; when
-      // every interactive control fits (overflow is non-control content),
-      // disclose that instead — either way the leg is falsifiable.
+      // Pick the deepest control that starts BELOW THE VIEWPORT (not merely
+      // below the midline — a control at 60% height is already visible);
+      // when every interactive control fits (overflow is non-control
+      // content), disclose that instead — either way the leg is falsifiable.
       const candidates = await page.locator(surface.belowFoldSelector).all();
       const viewportHeight = surface.viewport.height;
       let deepest: { locator: Locator; y: number } | null = null;
@@ -406,20 +407,27 @@ test.describe("a11y gate extensions (#871)", () => {
           deepest = { locator: c, y: box.y };
         }
       }
-      if (!deepest || deepest.y <= viewportHeight * 0.5) {
+      if (!deepest || deepest.y < viewportHeight) {
         expect(
           deepest !== null,
           `${surface.name}: interactive controls exist`,
         ).toBe(true);
         expect(
           deepest!.y,
-          `${surface.name}: every interactive control fits the viewport (deepest control y=${deepest!.y} vs ${viewportHeight}); the overflow is non-control content — no below-fold CONTROL exists to miss`,
-        ).toBeLessThanOrEqual(viewportHeight * 0.5);
+          `${surface.name}: every interactive control fits the viewport (deepest control top y=${deepest!.y} vs viewport bottom ${viewportHeight}); the overflow is non-control content — no below-fold CONTROL exists to miss`,
+        ).toBeLessThan(viewportHeight);
         return;
       }
       const control: Locator = deepest.locator;
       const preScroll = await control.boundingBox();
       expect(preScroll, `${surface.name}: below-fold control present`).toBeTruthy();
+      // Pre-scroll, the control must be OUT of the viewport entirely (its top
+      // at or beyond the viewport bottom) — the falsifiable "was below the
+      // fold" fact.
+      expect(
+        preScroll!.y,
+        `${surface.name}: the named control starts BELOW the viewport pre-scroll (y=${preScroll!.y} vs ${viewportHeight})`,
+      ).toBeGreaterThanOrEqual(viewportHeight);
 
       // The interaction pass reaches the below-fold control the way a user
       // does: scroll through, then bring the control into view.
@@ -428,18 +436,24 @@ test.describe("a11y gate extensions (#871)", () => {
       const rescan = await scanViolations(page, surface.name);
       const post = await control.boundingBox();
       expect(post, `${surface.name}: control still present post-scroll`).toBeTruthy();
+      // Control-specific exposure oracle: pre-scroll it was NOT visible;
+      // after the scroll pass it IS.
       expect(
         post!.y < viewportHeight && post!.y + post!.height > 0,
-        `${surface.name}: the scroll pass EXPOSED the below-fold control in the viewport (post y=${post!.y})`,
+        `${surface.name}: the scroll pass EXPOSED the previously out-of-viewport control (post y=${post!.y})`,
       ).toBe(true);
-      const covered = rescan.coverage.some(
+      // Control-specific coverage oracle: the control's OWN element rect is
+      // among the scanner's viewport-intersecting coverage rects (matched by
+      // rect equality against the control's post-scroll box, not "any
+      // overlapping element").
+      const selfCovered = rescan.coverage.some(
         (r) =>
-          post!.x < r.x + r.width &&
-          post!.x + post!.width > r.x &&
-          post!.y < r.y + r.height &&
-          post!.y + post!.height > r.y,
+          Math.abs(r.x - post!.x) <= 2 &&
+          Math.abs(r.y - post!.y) <= 2 &&
+          Math.abs(r.width - post!.width) <= 2 &&
+          Math.abs(r.height - post!.height) <= 2,
       );
-      expect(covered, `${surface.name}: the rescan coverage includes the below-fold control's viewport rect`).toBe(true);
+      expect(selfCovered, `${surface.name}: the control's OWN rect is in the scanner's viewport coverage`).toBe(true);
       expect(seriousOrCritical(rescan.findings), `${surface.name}: rescan stays clean after scroll`).toEqual([]);
       void BELOW_FOLD_VIEWPORT;
     });
