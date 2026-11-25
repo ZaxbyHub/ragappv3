@@ -263,6 +263,9 @@ describe("WikiJobsPanel persisted lint (#1161 AC3 / C3)", () => {
     render(<WikiJobsPanel vaultId={7} />);
     expect(await screen.findByTestId("jobs-lint-error")).toBeInTheDocument();
     expect(screen.queryByText(/No lint findings recorded/i)).toBeNull();
+    // Final critic round 8: a failed read must never keep showing the loading
+    // line (the error branch must suppress it).
+    expect(screen.queryByTestId("jobs-lint-loading")).toBeNull();
   });
 
   it("keeps the last findings on screen when a later read's payload is malformed", async () => {
