@@ -166,14 +166,21 @@ def _merge_report_note_cas(conn, row_id: int, incoming: str, user_id: int) -> st
         row = result.fetchone()
         if row is None:
             raise LookupError(f"quality report {row_id} vanished during merge")
-        old = row[0] or ""
+        old_value = row[0]  # keep SQL NULL intact for the comparison
+        old = old_value or ""
         merged = _merge_report_note(old, incoming, user_id)
-        if merged == old:
+        if merged == old and (old_value is not None or not incoming):
             return old
-        update = conn.execute(
-            "UPDATE quality_reports SET note = ? WHERE id = ? AND note = ?",
-            (merged, row_id, old),
-        )
+        if old_value is None:
+            update = conn.execute(
+                "UPDATE quality_reports SET note = ? WHERE id = ? AND note IS NULL",
+                (merged, row_id),
+            )
+        else:
+            update = conn.execute(
+                "UPDATE quality_reports SET note = ? WHERE id = ? AND note = ?",
+                (merged, row_id, old_value),
+            )
         if update.rowcount:
             conn.commit()
             return merged

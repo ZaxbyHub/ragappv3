@@ -244,8 +244,11 @@ class NoteMergeCasTest(unittest.TestCase):
                 if sql.startswith("SELECT note"):
                     return _Cursor((self.note,))
                 if sql.startswith("UPDATE quality_reports"):
-                    if not self.lost_once:  # first CAS loses to a concurrent writer
+                    if (
+                        not self.lost_once
+                    ):  # a competing writer lands between read and CAS
                         self.lost_once = True
+                        self.note = "competing note"
                         return _Update(0)
                     self.note = params[0]
                     return _Update(1)
@@ -256,9 +259,56 @@ class NoteMergeCasTest(unittest.TestCase):
 
         conn = _FakeConn()
         merge(conn, 1, "racing second note", SECOND_ADMIN["id"])
-        self.assertIn("first note", conn.note)
+        self.assertIn("competing note", conn.note)
         self.assertIn("racing second note", conn.note)
         self.assertIn(str(SECOND_ADMIN["id"]), conn.note)
+
+    def test_submitter_note_merge_handles_stored_null(self):
+        # A first submission may legitimately omit the note (SQL NULL); a
+        # later differing note must still merge instead of hitting the CAS
+        # retry limit because NULL != ''.
+        merge = getattr(qr, "_merge_report_note_cas", None)
+        assert callable(merge), "note merge has no compare-and-swap helper"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "r.db")
+            init_db(path)
+            run_migrations(path)
+            conn = sqlite3.connect(path)
+            try:
+                self._seed_null_note(conn)
+                merge(conn, 1, "later note", SECOND_ADMIN["id"])
+                note = conn.execute(
+                    "SELECT note FROM quality_reports WHERE id = 1"
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertIn("later note", note)
+            self.assertIn(str(SECOND_ADMIN["id"]), note)
+
+    def _seed_null_note(self, conn):
+        conn.execute(
+            "INSERT INTO users (id, username, hashed_password, role, is_active)"
+            " VALUES (?, 'a', 'x', 'admin', 1)",
+            (ADMIN["id"],),
+        )
+        conn.execute(
+            "INSERT INTO vaults (id, name, description) VALUES (?, 'v', 'v')", (VAULT,)
+        )
+        sid = conn.execute(
+            "INSERT INTO chat_sessions (vault_id, user_id, title) VALUES (?, ?, 'S')",
+            (VAULT, ADMIN["id"]),
+        ).lastrowid
+        mid = conn.execute(
+            "INSERT INTO chat_messages (session_id, role, content) VALUES (?, 'user', 'q')",
+            (sid,),
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO quality_reports (id, session_id, message_id, category, note,"
+            " config_ref, source_file_hashes) VALUES (1, ?, ?, 'incorrect_answer', NULL, 'x', '[]')",
+            (sid, mid),
+        )
+        conn.commit()
+        return sid, mid
 
 
 class ShareLinkPinTest(_Base):
