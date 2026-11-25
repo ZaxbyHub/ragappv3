@@ -261,7 +261,7 @@ function AdminGroupsPageContent({ outerQueryClient, authOwner, principalGenerati
         title="Groups"
         description="Manage user groups and their vault access permissions"
         actions={
-          <Button onClick={handleCreateClick} aria-label="Create new group">
+          <Button onClick={handleCreateClick}>
             <Plus className="mr-2 h-4 w-4" aria-hidden="true" />
             Create Group
           </Button>

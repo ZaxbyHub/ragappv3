@@ -296,6 +296,15 @@ test.describe("a11y gate extensions (#871)", () => {
     route: string;
     /** Named below-fold control, measured at the compressed-height viewport. */
     belowFoldSelector: string;
+    /**
+     * Whether this surface MUST produce a below-fold interactive control at
+     * the compressed-height viewport. Expected-true surfaces FAIL if they
+     * take the controls-fit path (layout regressions cannot silently
+     * vacate the below-fold proof); expected-false surfaces (whose
+     * interactive controls genuinely fit while non-control content
+     * overflows) take the fits path by DESIGN, and the test title says so.
+     */
+    expectBelowFold: boolean;
   }
 
   // Below-fold measurement viewport: the surface's NATURAL WIDTH at a
@@ -310,6 +319,7 @@ test.describe("a11y gate extensions (#871)", () => {
   const SURFACES: Surface[] = [
     {
       name: "RightPane (chat details panel)",
+      expectBelowFold: false,
       route: "/chat/1",
       viewport: { width: 1280, height: 720 },
       open: async (page) => {
@@ -323,6 +333,7 @@ test.describe("a11y gate extensions (#871)", () => {
     },
     {
       name: "Settings (panels opened)",
+      expectBelowFold: false,
       route: "/settings",
       viewport: { width: 1280, height: 720 },
       open: async (page) => {
@@ -336,6 +347,7 @@ test.describe("a11y gate extensions (#871)", () => {
     },
     {
       name: "DraftWorkspace (seeded draft opened)",
+      expectBelowFold: true,
       route: "/draft-room/1",
       viewport: { width: 1280, height: 720 },
       open: async (page) => {
@@ -347,6 +359,7 @@ test.describe("a11y gate extensions (#871)", () => {
     },
     {
       name: "Canvas (seeded artifact)",
+      expectBelowFold: true,
       route: "/chat/1/canvas/cav_a11y_fixture_0",
       viewport: { width: 1280, height: 720 },
       open: async (page) => {
@@ -358,6 +371,7 @@ test.describe("a11y gate extensions (#871)", () => {
     },
     {
       name: "mobile More (bottom-nav sheet)",
+      expectBelowFold: false,
       route: "/chat/1",
       viewport: { width: 320, height: 568 },
       open: async (page) => {
@@ -372,7 +386,7 @@ test.describe("a11y gate extensions (#871)", () => {
   ];
 
   for (const surface of SURFACES) {
-    test(`interactive surfaces: zero serious/critical on ${surface.name} + below-fold control detected`, async ({ page }) => {
+    test(`interactive surfaces: zero serious/critical on ${surface.name} + below-fold ${surface.expectBelowFold ? "control detected" : "path: controls fit by design (non-control overflow)"}`, async ({ page }) => {
       // Login + seed once; each surface then navigates to its own route.
       await preparePage(page, "/chat");
       // Leg 1 — interactive scan at the surface's natural viewport.
@@ -406,9 +420,25 @@ test.describe("a11y gate extensions (#871)", () => {
         });
       });
       if (!overflow) {
+        // Falsifiable fits-branch: at least one ELEMENT must extend past the
+        // live viewport bottom while no interactive control does (computed
+        // independently of this branch's condition), or the surface fully
+        // fits (also asserted against an independent max-bottom walk).
+        const maxBottom = await page.evaluate(() => {
+          let max = 0;
+          for (const el of Array.from(document.querySelectorAll<HTMLElement>("body *"))) {
+            const r = el.getBoundingClientRect();
+            if (r.height > 0) max = Math.max(max, r.bottom);
+          }
+          return max;
+        });
         expect(
-          overflow,
-          `${surface.name}: surface fits its viewport (no body or pane overflow) — no below-fold content exists to miss`,
+          maxBottom,
+          `${surface.name}: nothing overflows the live viewport (max element bottom ${maxBottom} <= ${liveViewportHeight}) — no below-fold content of ANY kind exists to miss`,
+        ).toBeLessThanOrEqual(liveViewportHeight + 4);
+        expect(
+          surface.expectBelowFold,
+          `${surface.name}: controls-fit path taken for a surface NOT expecting a below-fold control`,
         ).toBe(false);
         return;
       }
@@ -430,10 +460,12 @@ test.describe("a11y gate extensions (#871)", () => {
           deepest !== null,
           `${surface.name}: interactive controls exist`,
         ).toBe(true);
+        // Falsifiable: an expected-below-fold surface FAILS here — a layout
+        // regression cannot silently vacate the below-fold proof.
         expect(
-          deepest!.y,
-          `${surface.name}: every interactive control fits the viewport (deepest control top y=${deepest!.y} vs viewport bottom ${viewportHeight}); the overflow is non-control content — no below-fold CONTROL exists to miss`,
-        ).toBeLessThan(viewportHeight);
+          surface.expectBelowFold,
+          `${surface.name}: EXPECTED a below-fold control but the deepest control top is y=${deepest!.y} < viewport bottom ${viewportHeight} (layout regression or selector drift)`,
+        ).toBe(false);
         return;
       }
       const control: Locator = deepest.locator;

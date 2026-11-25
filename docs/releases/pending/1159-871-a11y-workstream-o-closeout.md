@@ -29,13 +29,18 @@ authorization.
 - **axe 4.14 fallout fixed as code (no rule waivers — l07 forbids them)**:
   - `label-content-name-mismatch` (the 4.14-changed rule): command-palette
     trigger, vault switcher (name now composes from visible content + sr-only
-    descriptor — Label-in-Name by construction), canvas save button, canvas
-    version-rail buttons.
+    descriptor — Label-in-Name by construction), canvas save button (and its
+    Saving transient), canvas version-rail buttons, the profile current-session
+    revoke label, the DocumentCard delete button, and the admin-groups create
+    button (redundant label dropped).
   - `color-contrast`: source chips in RightPane/SourceCards went solid
     (`bg-primary` + `text-primary-foreground`) — the `/10` tint compounded
     with the selected-card tint dropped `text-primary` below AA in light.
   - `aria-dialog-name`: the mobile More sheet's `aria-labelledby` now
     references the title's custom id explicitly.
+- Full matrix at head with NO retries: 150 passed / 1 failed — the single
+  failure is the disclosed local-only [/wiki][320x568][light] platform cell
+  (CI ubuntu is the arbiter).
 - **New gate extensions (#871 AC6/AC7/AC8)** in
   `frontend/e2e/accessibility_gate_extensions.spec.ts`: a seeded
   post-render violation must be reported with exact rule + element + route
@@ -52,9 +57,10 @@ authorization.
   options/waiver/bypass shape (identifiers, arbitrary calls, parenthesized
   objects, second arguments) stays rejected;
   `backend/tests/test_l07_gate_wiring.py` pins both sides (18 tests).
-- **CI budget (#871 AC8)**: the combined a11y step runs under
-  `timeout --kill-after=5s 492s` = 110% of the recorded 447s base baseline
-  (job 139309699740).
+- **CI budget (#871 AC8)**: the `Playwright a11y matrix` JOB's run step is
+  wrapped in `timeout --kill-after=5s 492s` = 110% of the recorded 447s base
+  baseline (job 139309699740); the two new specs run in their OWN
+  `a11y-gate-extensions` CI job bounded at 120s.
 
 ## Why
 
