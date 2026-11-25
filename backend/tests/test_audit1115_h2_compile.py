@@ -262,10 +262,8 @@ class TestBoilerplateSummary(_H2Base):
 
 class TestTocChunkFilter(_H2Base):
     def test_toc_chunks_are_not_retrievable(self):
-        """AC8 / C7: TOC blocks are excluded from the emitted chunk set of
-        BOTH selectable chunkers, with dense renumbering."""
-        from app.services.chunking import EmbeddingSemanticChunker  # noqa: F401
-
+        """AC8 / C7: the shared final-output filter drops pure-TOC chunks and
+        renumbers the emitted set with dense indexes."""
         # The deterministic (non-embedding) chunker exercises the shared
         # final-output filter directly.
         chunker = SemanticChunker()
@@ -278,6 +276,37 @@ class TestTocChunkFilter(_H2Base):
         self.assertEqual(indexes, list(range(len(chunks))), "indexes stay dense")
         if chunks:
             self.assertEqual(chunks[0].metadata["total_chunks"], len(chunks))
+
+    def test_embedding_assembly_path_drops_toc(self):
+        """AC8 / C7: the embedding chunker's final-output assembly seam also
+        drops a pure-TOC chunk before the chunks become retrievable."""
+        import asyncio
+
+        from app.services.chunking import EmbeddingSemanticChunker, ThresholdType
+
+        class _FixedEmbeddings:
+            async def embed_batch(self, windows):
+                return [[1.0, 0.0] for _ in windows]
+
+        # GRADIENT with a negative threshold breaks between every pair of
+        # sentences, so the TOC and the role claim become separate chunks and
+        # the embedding assembly path must apply the filter itself.
+        chunker = EmbeddingSemanticChunker(
+            embedding_service=_FixedEmbeddings(),
+            threshold_type=ThresholdType.GRADIENT,
+            threshold_value=-1.0,
+            min_chunk_size=1,
+            max_chunk_size=2000,
+        )
+        sentences = [TOC_TEXT.strip(), ROLE_CLAIM_TEXT]
+        with patch.object(chunker, "_split_into_sentences", return_value=sentences):
+            chunks = asyncio.run(chunker.chunk_text(TOC_TEXT + "\n\n" + ROLE_CLAIM_TEXT))
+        joined = "\n".join(c.text for c in chunks)
+        self.assertNotIn("Introduction ........ 1", joined)
+        self.assertIn("AFOMIS Director", joined)
+        self.assertEqual([c.chunk_index for c in chunks], list(range(len(chunks))))
+        for chunk in chunks:
+            self.assertEqual(chunk.metadata["total_chunks"], len(chunks))
 
     def test_filter_helper_drops_pure_toc_and_renumbers(self):
         """Additional in-scope: the filter alone drops pure-TOC chunks and
