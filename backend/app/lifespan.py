@@ -1289,6 +1289,11 @@ async def lifespan(app: FastAPI):
             "Upload commit drain failed during shutdown: %s", type(exc).__name__
         )
     try:
+        # Issue #1202: cancellation finalizes run on a worker; drain them before
+        # the pool becomes unusable, or an interrupted turn can be lost.
+        from app.api.routes.chat import _drain_turn_finalize_executor
+
+        _drain_turn_finalize_executor()
         app.state.db_pool.close_all()
     except Exception:
         pass

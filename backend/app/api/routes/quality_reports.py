@@ -32,6 +32,7 @@ from app.config import settings
 from app.limiter import limiter
 from app.security import csrf_protect
 from app.services.eval_metrics import citation_validity, fact_coverage
+from app.utils.sqlite_errors import is_unique_violation
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -251,10 +252,28 @@ async def submit_quality_report(
             ),
         )
         await asyncio.to_thread(conn.commit)
-    except sqlite3.IntegrityError:
+    except sqlite3.IntegrityError as exc:
+        await asyncio.to_thread(conn.rollback)
+        if not is_unique_violation(exc):
+            session_result = await asyncio.to_thread(
+                conn.execute,
+                "SELECT 1 FROM chat_sessions WHERE id = ?", (body.session_id,)
+            )
+            if await asyncio.to_thread(session_result.fetchone) is None:
+                raise HTTPException(status_code=404, detail="Session not found")
+            msg_result = await asyncio.to_thread(
+                conn.execute,
+                "SELECT 1 FROM chat_messages WHERE id = ? AND session_id = ?",
+                (body.message_id, body.session_id),
+            )
+            if await asyncio.to_thread(msg_result.fetchone) is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Message not found in this session",
+                )
+            raise
         # A concurrent submission of the same identity won the race (unique
         # index). Roll the failed statement back and return the winner.
-        await asyncio.to_thread(conn.rollback)
         winner_result = await asyncio.to_thread(
             conn.execute,
             "SELECT * FROM quality_reports "
@@ -418,10 +437,18 @@ async def convert_report_to_eval_case(
             ),
         )
         await asyncio.to_thread(conn.commit)
-    except sqlite3.IntegrityError:
+    except sqlite3.IntegrityError as exc:
+        await asyncio.to_thread(conn.rollback)
+        if not is_unique_violation(exc):
+            report_result = await asyncio.to_thread(
+                conn.execute,
+                "SELECT 1 FROM quality_reports WHERE id = ?", (report_id,)
+            )
+            if await asyncio.to_thread(report_result.fetchone) is None:
+                raise HTTPException(status_code=404, detail="Quality report not found")
+            raise
         # A concurrent convert of the same report won the race (unique
         # index). Roll back and return the winner's case.
-        await asyncio.to_thread(conn.rollback)
         winner_case_result = await asyncio.to_thread(
             conn.execute,
             "SELECT id, report_id, query, expected_outcome, provenance "
