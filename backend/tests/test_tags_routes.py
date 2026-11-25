@@ -257,6 +257,100 @@ class TestTagAssignment(TagsTestBase):
         )
         self.assertEqual(second.json()["assigned"], 0)
 
+    def _seed_files_bulk(self, vault_id, count):
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.executemany(
+                "INSERT INTO files (vault_id, file_path, file_name, file_size, status)"
+                " VALUES (?,?,?,?,?)",
+                [
+                    (vault_id, f"/uploads/bulk-{i}.txt", f"bulk-{i}.txt", 10, "indexed")
+                    for i in range(count)
+                ],
+            )
+            conn.commit()
+            rows = conn.execute(
+                "SELECT id FROM files WHERE vault_id = ?", (vault_id,)
+            ).fetchall()
+            return [r[0] for r in rows]
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def _document_tag_pairs(self):
+        conn = self._connection_pool.get_connection()
+        try:
+            return {
+                (r[0], r[1])
+                for r in conn.execute(
+                    "SELECT file_id, tag_id FROM document_tags"
+                ).fetchall()
+            }
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def test_assign_rejects_oversized_batch_without_partial_changes(self):
+        # Issue #1187 / #800 AC6: a 40,000-id batch must be rejected at the
+        # request boundary (422) and leave no partial assignments behind.
+        f1 = self._seed_file(2, "a.txt")
+        t1 = self._make_tag("alpha")
+        resp = self.client.post(
+            "/api/tags/assign",
+            json={"vault_id": 2, "file_ids": list(range(1, 40001)), "tag_ids": [t1]},
+            headers=self._headers(),
+        )
+        self.assertEqual(resp.status_code, 422, resp.text)
+        resp = self.client.post(
+            "/api/tags/assign",
+            json={"vault_id": 2, "file_ids": [f1], "tag_ids": list(range(1, 40001))},
+            headers=self._headers(),
+        )
+        self.assertEqual(resp.status_code, 422, resp.text)
+        self.assertEqual(self._document_tag_pairs(), set())
+
+    def test_assign_at_file_batch_limit_exact_pairs_and_retry(self):
+        # At the file batch limit (1000) the real route must assign exactly
+        # the requested file-tag pairs, and a retry must be idempotent:
+        # identical persisted counts and an unchanged pair set.
+        file_ids = self._seed_files_bulk(2, 1000)
+        t1 = self._make_tag("alpha")
+        first = self.client.post(
+            "/api/tags/assign",
+            json={"vault_id": 2, "file_ids": file_ids, "tag_ids": [t1]},
+            headers=self._headers(),
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()["assigned"], 1000)
+        expected = {(fid, t1) for fid in file_ids}
+        self.assertEqual(self._document_tag_pairs(), expected)
+
+        second = self.client.post(
+            "/api/tags/assign",
+            json={"vault_id": 2, "file_ids": file_ids, "tag_ids": [t1]},
+            headers=self._headers(),
+        )
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(second.json()["assigned"], 0)
+        self.assertEqual(self._document_tag_pairs(), expected)
+        self.assertEqual(len(self._document_tag_pairs()), 1000)
+
+    def test_assign_dedupes_duplicate_ids_within_request(self):
+        # Duplicate ids in one request must collapse to a single persisted
+        # (file, tag) pair, never duplicate rows.
+        f1 = self._seed_file(2, "a.txt")
+        t1 = self._make_tag("alpha")
+        resp = self.client.post(
+            "/api/tags/assign",
+            json={
+                "vault_id": 2,
+                "file_ids": [f1, f1, f1],
+                "tag_ids": [t1, t1],
+            },
+            headers=self._headers(),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["assigned"], 1)
+        self.assertEqual(self._document_tag_pairs(), {(f1, t1)})
+
     def test_cannot_tag_file_in_other_vault(self):
         # File in vault 9 (no access), tag in vault 2.
         other_file = self._seed_file(9, "secret.txt")

@@ -55,8 +55,10 @@ except ImportError:
     sys.modules["pyarrow"] = types.ModuleType("pyarrow")
 
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from app.api.deps import get_current_active_user, get_db, get_evaluate_policy
+from app.api.routes.tags import TagAssignRequest
 from app.main import app
 from app.models.database import init_db, run_migrations
 from app.security import csrf_protect
@@ -525,6 +527,44 @@ class SubmitRouteConfigRefOffloadTest(unittest.TestCase):
             "submit_quality_report calls _config_ref inline (not offloaded"
             " through asyncio.to_thread) %d time(s)" % len(inline),
         )
+
+
+class TagAssignRequestBoundTest(unittest.TestCase):
+    """AC1 for issue #1187 (#800 AC6): an oversized tag-assignment batch
+    must be rejected at the request-model boundary, before it can reach
+    TagStore.assign_tags (whose vault-filtering IN-scan would otherwise
+    exceed SQLite's 32766 host-parameter limit on a 40,000-id batch).
+    """
+
+    def _accepted(self, **kwargs):
+        """Construct TagAssignRequest; return True iff NO ValidationError."""
+        try:
+            TagAssignRequest(**kwargs)
+        except ValidationError:
+            return False
+        return True
+
+    def test_oversized_file_ids_batch_rejected(self):
+        accepted = self._accepted(
+            vault_id=1, file_ids=list(range(1, 40001)), tag_ids=[1]
+        )
+        self.assertIs(accepted, False)
+
+    def test_oversized_tag_ids_batch_rejected(self):
+        accepted = self._accepted(
+            vault_id=1, file_ids=[1], tag_ids=list(range(1, 40001))
+        )
+        self.assertIs(accepted, False)
+
+    def test_at_limit_batches_accepted(self):
+        # The bound must not reject legitimate batches: exactly at each
+        # ceiling (and empty lists stay rejected by min_length=1).
+        accepted = self._accepted(
+            vault_id=1, file_ids=list(range(1, 1001)), tag_ids=list(range(1, 101))
+        )
+        self.assertIs(accepted, True)
+        self.assertIs(self._accepted(vault_id=1, file_ids=[], tag_ids=[1]), False)
+        self.assertIs(self._accepted(vault_id=1, file_ids=[1], tag_ids=[]), False)
 
 
 if __name__ == "__main__":
