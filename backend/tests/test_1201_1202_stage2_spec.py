@@ -311,6 +311,50 @@ class NoteMergeCasTest(unittest.TestCase):
         return sid, mid
 
 
+class MergeVanishedReportTest(_Base):
+    def test_submitter_merge_vanished_report_returns_404(self):
+        class _VanishingProxy:
+            def __init__(self, conn):
+                self.conn = conn
+                self.fired = False
+
+            def execute(self, sql, params=()):
+                if (
+                    sql.startswith("SELECT note FROM quality_reports")
+                    and not self.fired
+                ):
+                    self.fired = True
+                    self.conn.execute("DELETE FROM quality_reports")
+                    self.conn.commit()
+                return self.conn.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self.conn, name)
+
+        sid, mid = self._session()
+        body = {
+            "session_id": sid,
+            "message_id": mid,
+            "category": "incorrect_answer",
+            "note": "first note",
+        }
+        self.assertEqual(
+            self.client.post("/api/quality/reports", json=body).status_code, 200
+        )
+        self.current = SECOND_ADMIN
+        proxy = _VanishingProxy(self.conn)
+        app.dependency_overrides[get_db] = lambda: proxy
+        try:
+            raced = self.client.post(
+                "/api/quality/reports", json={**body, "note": "second note"}
+            )
+        finally:
+            app.dependency_overrides[get_db] = lambda: None
+        self.assertTrue(proxy.fired)
+        self.assertEqual(raced.status_code, 404, raced.text)
+        self.assertIn("Quality report not found", raced.text)
+
+
 class ShareLinkPinTest(_Base):
     def test_share_link_pin_cross_user_get_stays_allowed(self):
         """#573's share link stays functional: a member with vault read can
@@ -334,6 +378,18 @@ class AssistantCapTest(_Base):
         )
         self.assertGreater(ceiling, settings.chat_message_max_chars)
         sid, _mid = self._session()
+        # A legitimate thinking-mode answer can be many characters per token.
+        legitimate = "a" * 40000
+        long_answer = self.client.post(
+            f"/api/chat/sessions/{sid}/messages/batch",
+            json={
+                "messages": [
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "content": legitimate},
+                ]
+            },
+        )
+        self.assertEqual(long_answer.status_code, 200, long_answer.text)
         exact = "a" * ceiling
         r = self.client.post(
             f"/api/chat/sessions/{sid}/messages",

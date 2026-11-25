@@ -633,7 +633,7 @@ class Settings(BaseSettings):
     and prompt cost. Prior-turn history is intentionally NOT bounded by this
     setting (legitimate assistant answers can be long)."""
 
-    assistant_message_max_chars: int = 32768
+    assistant_message_max_chars: int = 131072
     """Maximum characters of an assistant-role item accepted by the two chat
     write routes. Derived from `thinking_max_tokens` (32768) at a generous
     1 character/token, so a legitimate long answer still saves; this is a

@@ -7,7 +7,7 @@ the defect it names and green after the fix.
    that mutates a session under ``/chat/sessions/{session_id}`` is classified
    in ``OWNER_RULE_CLASS``. ``ENFORCED`` routes must call
    ``_require_session_owner_or_admin``; ``OWN_CHECK`` routes must keep their
-   own owner-or-admin check; ``PENDING_DECISION`` routes are deliberately not
+   own owner-or-admin check; ``DECISION_RECORDED`` routes are deliberately not
    enforced until the named maintainer decision is answered - the entry states
    what ships, never that it is right. A route that is missing from the table,
    a table entry whose route is gone, and a pending route that starts calling
@@ -44,7 +44,7 @@ _MUTATING_VERBS = frozenset({"post", "put", "patch", "delete"})
 
 ENFORCED = "ENFORCED"
 OWN_CHECK = "OWN_CHECK"
-PENDING_DECISION = "PENDING_DECISION"
+DECISION_RECORDED = "DECISION_RECORDED"
 
 # (dotted module, handler) -> its relation to the owner rule.
 OWNER_RULE_CLASS = {
@@ -54,12 +54,12 @@ OWNER_RULE_CLASS = {
     ("app.api.routes.chat", "update_session"): ENFORCED,
     ("app.api.routes.chat", "delete_session"): ENFORCED,
     ("app.api.routes.chat", "set_message_feedback"): OWN_CHECK,
-    ("app.api.routes.chat", "fork_session"): PENDING_DECISION,
-    ("app.api.routes.canvas", "create_session_artifact"): PENDING_DECISION,
+    ("app.api.routes.chat", "fork_session"): DECISION_RECORDED,
+    ("app.api.routes.canvas", "create_session_artifact"): DECISION_RECORDED,
 }
 
-# Every PENDING_DECISION route names the open decision it waits for.
-PENDING_DECISION_BECAUSE = {
+# Every DECISION_RECORDED route names the recorded decision it waits for.
+DECISION_RECORDED_BECAUSE = {
     ("app.api.routes.chat", "fork_session"): "#1201 ASK-2 (fork scope)",
     ("app.api.routes.canvas", "create_session_artifact"): "#1201 ASK-5 (canvas matrix)",
 }
@@ -303,12 +303,12 @@ class SessionMutationOwnerRuleTest(unittest.TestCase):
 
     def test_pending_routes_name_their_decision(self):
         for (module, name), kind in OWNER_RULE_CLASS.items():
-            if kind != PENDING_DECISION:
+            if kind != DECISION_RECORDED:
                 continue
             self.assertIn(
                 (module, name),
-                PENDING_DECISION_BECAUSE,
-                f"{name} is PENDING_DECISION without naming the open decision",
+                DECISION_RECORDED_BECAUSE,
+                f"{name} is DECISION_RECORDED without naming the open decision",
             )
             func = _module_function(module, name)
             self.assertFalse(

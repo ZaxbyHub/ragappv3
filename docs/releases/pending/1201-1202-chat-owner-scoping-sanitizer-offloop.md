@@ -20,7 +20,7 @@
   `db_pool.close_all()` so queued interrupted rows commit.
 - **`chat_message_max_chars` is enforced on the two write routes for user-role items** (#1202 AC2)
   with the stream route's 422 shape, after auth, vault and owner checks; an over-cap batch writes
-  nothing. Assistant-role items are bounded separately by `assistant_message_max_chars` (32768);
+  nothing. Assistant-role items are bounded separately by `assistant_message_max_chars` (131072);
   assistant answers below that ceiling remain unbounded by the live-user cap, per the #922 contract.
 - **Fence tracking is container-aware** (#1202 AC3, AC4). Literal `<answer>` markup inside a
   block-quoted or list-item fence survives, including wrapper tags before the container markers on
@@ -49,12 +49,12 @@ user content; and the fence scanner deleted literal markup inside quoted fences.
 - Quality-report submitter attribution (#1201 AC3) uses the existing ` || ` note convention: a
   differing re-submitted note is appended with the second submitter id, and repeat submissions of the
   same note are idempotent. The one-row-per-identity retry contract is unchanged.
-- GET and fork remain vault-readable; denying them would retract #573's share link and is pending.
-- Assistant-role content on the write routes is capped by `assistant_message_max_chars` (32768,
+- GET and fork remain vault-readable by the maintainer's recorded decision (2026-11-25): denying them would retract #573's share link.
+- Assistant-role content on the write routes is capped by `assistant_message_max_chars` (131072,
   derived from `thinking_max_tokens`); legitimate long answers remain well above the live-user cap.
 - Canvas routes keep their pinned vault-only authorization matrix (#509); whether they should
   follow the new owner rule is an open product question.
 - `llm_client.py:569` still sanitizes synchronously inside async completion methods; it is in a
-  file #1202 marks out of scope and is tracked in a separate issue.
+  file #1202 marks out of scope and is tracked in separate issue #1209.
 - Remaining fence limitation: nested list containers with lazy continuation lines, and a wrapper
   tag sitting on the closing fence line.
