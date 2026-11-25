@@ -245,7 +245,7 @@ describe("#775 chat palette actions", () => {
             // The vault switcher's accessible name now composes from its
             // visible content plus an sr-only descriptor (#871 Label-in-Name).
             expect(
-              screen.getByRole("button", { name: /Research — active vault/i })
+              screen.getByRole("button", { name: /Research.*active vault/is })
             ).toBeInTheDocument();
           });
           break;
