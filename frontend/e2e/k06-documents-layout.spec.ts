@@ -51,10 +51,10 @@ async function seed(page: Page) {
 // delete actions are vault-gated (a fresh context defaults to "All vaults",
 // which selects no concrete vault and hides every Delete affordance).
 async function selectE2eVault(page: Page) {
-  await page.getByRole("button", { name: /all vaults \(\d+ files total\)/i }).click();
+  await page.getByRole("button", { name: /all vaults.*all vaults selected/is }).click();
   await page.getByRole("menuitem", { name: /e2e vault/i }).click();
   await expect(
-    page.getByRole("button", { name: /active vault: e2e vault/i })
+    page.getByRole("button", { name: /e2e vault.*active vault/is })
   ).toBeVisible({ timeout: 10_000 });
 }
 

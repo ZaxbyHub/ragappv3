@@ -131,7 +131,7 @@ async function pickVault(page: Page, vaultName: RegExp | string): Promise<boolea
   if (!(await visibleWithin(item, 10_000))) return false;
   await doClick(item);
   const active = await visibleWithin(
-    page.getByRole("button", { name: /active vault:/i }).first(),
+    page.getByRole("button", { name: /active vault/is }).first(),
     10_000
   );
   return active;
@@ -455,10 +455,10 @@ test.describe("first-run baseline (trace 781-vaultgate-first-run-baseline / C1)"
     // "All Vaults" for this leg. If a successful create auto-selected the new
     // vault, explicitly switch back to All Vaults via the header selector.
     const allVaultsTrigger = page
-      .getByRole("button", { name: /all vaults \(\d+ files total\)/i })
+      .getByRole("button", { name: /all vaults.*all vaults selected/is })
       .first();
     const activeVaultTrigger = page
-      .getByRole("button", { name: /active vault:/i })
+      .getByRole("button", { name: /active vault/is })
       .first();
     let composerAllVaults = await visibleWithin(allVaultsTrigger, 10_000);
     if (!composerAllVaults && (await visibleWithin(activeVaultTrigger, 5_000))) {

@@ -47,10 +47,10 @@ async function loginAndSelectVault(page: Page) {
   await expect(page.getByLabel("Message input")).toBeVisible({ timeout: 20_000 });
   // The composer refuses to send without an active vault; a fresh context
   // defaults to "All vaults" — select the stub's concrete vault.
-  await page.getByRole("button", { name: /all vaults \(\d+ files total\)/i }).click();
+  await page.getByRole("button", { name: /all vaults.*all vaults selected/is }).click();
   await page.getByRole("menuitem", { name: /e2e vault/i }).click();
   await expect(
-    page.getByRole("button", { name: /active vault: e2e vault/i })
+    page.getByRole("button", { name: /e2e vault.*active vault/is })
   ).toBeVisible({ timeout: 10_000 });
 }
 
