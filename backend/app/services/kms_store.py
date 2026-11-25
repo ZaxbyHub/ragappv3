@@ -325,7 +325,9 @@ class KMSStore:
             params.append(tag)
         return int(self._db.execute(sql, params).fetchone()[0])
 
-    def update_entry(self, entry_id: int, vault_id: int, **kwargs: Any) -> Optional[KMSEntry]:
+    def update_entry(
+        self, entry_id: int, vault_id: int, commit: bool = True, **kwargs: Any
+    ) -> Optional[KMSEntry]:
         allowed = {"title", "body", "summary", "tags", "slug", "status", "last_compiled_at"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
@@ -360,7 +362,11 @@ class KMSStore:
             from app.services.draft_evidence_freshness import on_kms_entry_changed
 
             on_kms_entry_changed(self._db, entry_id=entry_id, new_body=updates["body"])
-        self._db.commit()
+        if commit:
+            # Issue #1163: commit=False lets the review-queue batch route run
+            # every item's update inside ONE transaction_context (all-or-none),
+            # mirroring wiki_store's bulk pattern.
+            self._db.commit()
         return self.get_entry(entry_id)
 
     def delete_entry(self, entry_id: int, vault_id: int) -> bool:

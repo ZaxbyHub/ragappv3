@@ -311,7 +311,11 @@ class TestIssue515Ac30ZeroClaimsCuratorDisabled(
         result = json.loads(dict(row)["result_json"])
         self.assertIsInstance(result, dict)
         self.assertEqual([], result.get("claims"))
-        self.assertFalse(result.get("skipped"))
+        # #1162 AC4 (trace 1161-1162-1163): plain prose with no acronyms,
+        # role claims, or procedures does not qualify for derived records,
+        # so the completed result carries the skip marker (lint-only
+        # persistence) instead of an empty derived page/entry pair.
+        self.assertTrue(result.get("skipped"))
 
 
 if __name__ == "__main__":

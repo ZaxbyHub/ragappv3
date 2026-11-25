@@ -1,4 +1,5 @@
 import {
+  BookCheck,
   ChevronLeft,
   ChevronRight,
   Library,
@@ -53,6 +54,7 @@ export const navItems: NavConfigItem[] = [
   { id: "memory", label: "Memory", icon: AiBrain01Icon, to: "/memory", section: "workspace" },
   { id: "wiki", label: "Wiki", icon: BookOpenTextIcon, to: "/wiki", section: "workspace" },
   { id: "kms", label: "KMS", icon: Library, to: "/kms", section: "workspace" },
+  { id: "reviewQueue", label: "Review", icon: BookCheck, to: "/review-queue", section: "workspace" },
   { id: "draftRoom", label: DRAFT_ROOM_NAV_LABEL, icon: PencilEdit01Icon, to: "/draft-room", section: "workspace", capabilityGated: true },
   { id: "vaults", label: "Vaults", icon: Database02Icon, to: "/vaults", section: "workspace" },
   { id: "groups", label: "Groups", icon: UserGroupIcon, to: "/admin/groups", section: "admin", adminOnly: true },

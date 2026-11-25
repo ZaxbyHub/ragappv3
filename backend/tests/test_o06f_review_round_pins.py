@@ -336,6 +336,7 @@ class TestPromotionNumericIdentityGate(unittest.TestCase):
         payload = json.dumps({"claims": [{
             "claim_text": claim_text,
             "claim_type": "fact",
+            "subject": "Alpha",
             "source_quote": claim_text,
             "chunk_id": "1_0",
             "confidence": 0.9,

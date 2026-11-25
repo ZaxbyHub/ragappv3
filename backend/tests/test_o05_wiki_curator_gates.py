@@ -179,6 +179,7 @@ def test_active_if_verified_unverified_quote_is_needs_review():
                 {
                     "claim_text": "Alpha is verified",
                     "claim_type": "fact",
+                    "subject": "Alpha",
                     "source_quote": (
                         "Sentence that appears nowhere in the chunk."
                     ),

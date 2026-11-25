@@ -49,8 +49,10 @@ class TestO03KmsCompileVaultStatus(unittest.TestCase):
             "INSERT INTO files (id, vault_id, file_path, file_name, file_size,"
             " status, parsed_text) VALUES (?, 1, ?, ?, 1, ?, ?)",
             [
-                (1, "docs/one.txt", "one.txt", "indexed", "body one"),
-                (2, "docs/two.txt", "two.txt", "partial", "body two"),
+                # Issue #1162: non-empty fixtures carry a qualifying role claim so the
+                # entry-creation accounting still exercises the compiled path.
+                (1, "docs/one.txt", "one.txt", "indexed", "Alice Smith is the AFOMIS Director."),
+                (2, "docs/two.txt", "two.txt", "partial", "Bob Jones is the ZEBRA Chief."),
                 (3, "docs/three.txt", "three.txt", "error", "body three"),
             ],
         )

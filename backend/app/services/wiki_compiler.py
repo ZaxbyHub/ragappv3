@@ -17,11 +17,18 @@ import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from app.config import settings as _app_settings
+from app.services.content_classifiers import (
+    Procedure,
+    content_text,
+    entry_summary,
+    extract_procedures,
+)
 from app.services.wiki_curator import (
     CuratorChunk,
+    CuratorResult,
     WikiCurator,
     deterministic_dedupe_key,
 )
@@ -35,6 +42,64 @@ from app.services.wiki_store import (
 # Approximate bytes per text chunk for deterministic chunk-uid generation.
 # Matches the 2 000-character window used by SemanticChunker.
 _COMPILE_CHUNK_SIZE = 2000
+
+
+def _suppressed_compile_result(reason: str) -> dict:
+    """Shape-complete result for a suppressed compile (issue #1162).
+
+    Every key a caller reads on the materializing path is present so the
+    o04c supersede-count pins and the WIKI-011 document-status route keep
+    working unchanged; `skipped` + `reason` feed the route's "skipped"
+    vocabulary.
+    """
+    return {
+        "page": None,
+        "claims": [],
+        "entities": [],
+        "relations": [],
+        "relations_count": 0,
+        "claims_superseded": 0,
+        "claims_weak_provenance": 0,
+        "skipped": True,
+        "reason": reason,
+    }
+
+
+# Extensions whose content the wiki compile fallback will even attempt to
+# parse (final-critic round 1: the decision lives HERE, not in the shared
+# DocumentParser). Covers the text formats the .txt fallback reaches AND
+# the binary document formats unstructured.auto handles (PDF/DOCX/PPTX
+# are ZIP/binary containers that always carry NULs — refusing them by
+# sniff alone would suppress SUPPORTED types). Anything else combined
+# with a binary head is a typed content-type refusal; a parse crash on
+# one of THESE stays a failure.
+_WIKI_PARSEABLE_SUFFIXES = frozenset({
+    ".txt", ".md", ".markdown", ".rst", ".text", ".log", ".csv", ".tsv",
+    ".json", ".jsonl", ".yaml", ".yml", ".xml", ".html", ".htm",
+    ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx",
+    ".odt", ".odp", ".ods", ".epub", ".eml", ".msg", ".rtf",
+})
+
+
+def _wiki_refuses_content_type(file_path: str) -> bool:
+    """True when the wiki compile fallback refuses the file's content type.
+
+    An extension NOT in the wiki-parseable allowlist whose first kilobyte
+    contains a NUL byte (the Git binary heuristic — ZIP containers like
+    DOCX/PPTX and most raw binaries always carry NULs) is refused BEFORE
+    the parser runs. Text formats never emit NULs in their leading bytes,
+    and the allowlisted extensions go to the parser regardless, so a
+    parser crash on a SUPPORTED type remains an extractor failure.
+    """
+    suffix = Path(file_path).suffix.lower()
+    if suffix in _WIKI_PARSEABLE_SUFFIXES:
+        return False
+    try:
+        with open(file_path, "rb") as fh:
+            head = fh.read(1024)
+    except OSError:
+        return False
+    return b"\x00" in head
 
 # Matches [S#], [M#], [W#] citation markers produced by the chat engine.
 _CITE_STRIP_RE = re.compile(r"\[(?:S|M|W)\d+\]")
@@ -892,16 +957,52 @@ class WikiCompiler:
 
         file_data = dict(file_row)
         # Priority: explicit text in job → durable parsed_text → re-parse from file_path.
-        text: str = input_json.get("text") or file_data.get("parsed_text") or ""
+        # Issue #1162 taxonomy: an explicitly empty/whitespace text is a
+        # successful-empty document — skip BEFORE any parse attempt (no
+        # provider calls, no claim mutation), preserving the o04b no-wipe
+        # contract.
+        explicit_text = input_json.get("text")
+        if explicit_text is not None and not str(explicit_text).strip():
+            return _suppressed_compile_result("empty text")
+        text: str = explicit_text or file_data.get("parsed_text") or ""
 
         if not text:
             _file_path = file_data.get("file_path") or ""
+            _parse_failure: Optional[Exception] = None
             if _file_path:
+                from app.services.document_processor import (
+                    DocumentParseError as _DPE,
+                )
+                from app.services.document_processor import (
+                    DocumentParser,
+                    UnsupportedContentTypeError,
+                )
+                # Issue #1162 typed refusal (final-critic rounds 1-2): decide
+                # unsupported content types HERE, in the wiki compile
+                # fallback only, by an explicit extension allowlist plus a
+                # binary sniff — NEVER inside the shared DocumentParser,
+                # whose supported set includes NUL-leading binary formats
+                # (PDF/DOCX/PPTX) that main ingestion must keep parsing.
+                # The typed error is raised and caught right here so the
+                # signal stays real (one raise site, one handler).
+                try:
+                    if _wiki_refuses_content_type(_file_path):
+                        raise UnsupportedContentTypeError(
+                            f"Binary or unsupported content type for wiki "
+                            f"compile (path_len={len(_file_path)})"
+                        )
+                except UnsupportedContentTypeError:
+                    return _suppressed_compile_result("unparseable content type")
                 # Attempt 1: full parser stack (requires unstructured.io).
                 try:
-                    from app.services.document_processor import DocumentParser
                     _elements = DocumentParser().parse(_file_path)
                     text = "\n".join(str(e) for e in _elements if str(e).strip())
+                except _DPE as _exc:
+                    logger.debug(
+                        "compile_ingest_job: DocumentParser failed for file_id=%d: %s",
+                        file_id, _exc,
+                    )
+                    _parse_failure = _exc
                 except Exception as _exc:
                     logger.debug(
                         "compile_ingest_job: DocumentParser failed for file_id=%d: %s",
@@ -925,6 +1026,10 @@ class WikiCompiler:
                             "compile_ingest_job: plain-text fallback failed for file_id=%d: %s",
                             file_id, _exc,
                         )
+                if not text and _parse_failure is not None:
+                    # Extractor failure on an accepted type with an unusable
+                    # fallback remains a failure (owner decision, Nov 18 2026).
+                    raise _parse_failure
                 if text:
                     # Cache for future compiles so re-parse is a one-time cost.
                     self._db.execute(
@@ -938,15 +1043,101 @@ class WikiCompiler:
                 "(input_json['text'], files.parsed_text, and file re-parse all empty)",
                 file_id,
             )
-            return {"page": None, "claims": [], "entities": [], "relations_count": 0, "skipped": True}
+            return _suppressed_compile_result("no text available")
+        if not str(text).strip():
+            # Whitespace-only content after acquisition: a successful-empty
+            # document (same taxonomy as explicit empty text).
+            return _suppressed_compile_result("empty text")
 
-        extraction = extract_entities_from_text(text)
-        # Always materialize a page for the document so the wiki reflects every
-        # ingested file. Deterministic claim/entity/relation passes below are
-        # no-ops when extraction is empty; the optional LLM curator can still
-        # populate claims later. Prior behavior short-circuited here and left
-        # the wiki blank for any document whose prose did not match the narrow
-        # acronym / ALL-CAPS-org role patterns.
+        # Issue #1162 (owner decision, November 18 2026): classify the
+        # document's blocks once; only CONTENT blocks can qualify it. TOC /
+        # boilerplate / code never yield qualifying items, procedures, or
+        # claims.
+        prose = content_text(text)
+        extraction = extract_entities_from_text(prose)
+        procedures = extract_procedures(text)
+        # AC9 gate (#1162): subjectless deterministic candidates are rejected
+        # BEFORE qualification — they can neither create claims/relations nor
+        # materialize records. The filtered list feeds the persistence loop,
+        # the curator dedupe seed, and the deterministic summary.
+        valid_role_claims = [
+            rc for rc in extraction.role_claims
+            if (rc.get("subject") or "").strip()
+        ]
+        claims_rejected_subjectless = len(extraction.role_claims) - len(valid_role_claims)
+        extraction.role_claims = valid_role_claims
+
+        # Curator ANALYSIS with deferred persistence (issue #1162): the run
+        # happens before the materialization decision so substantive curator
+        # output can qualify the document; accepted claims persist exactly
+        # once, after the page exists. The patch seam (`_maybe_run_curator`)
+        # keeps its name and default legacy contract for the other callers.
+        cur_out = self._maybe_run_curator(
+            vault_id=vault_id,
+            file_id=file_id,
+            text=text,
+            trigger="ingest",
+            deterministic_extraction=extraction,
+            page_id=None,
+            existing_entities=[],
+            defer_persist=True,
+        )
+        qualifying = (
+            bool(extraction.acronyms)
+            or bool(valid_role_claims)
+            or bool(procedures)
+            or self._curator_accepted_count(cur_out) > 0
+        )
+
+        if not qualifying:
+            # Suppression gates CREATION only (issue #1162): a first-seen
+            # unqualifying document creates nothing; existing derived records
+            # keep their non-destructive recompile lifecycle.
+            if cur_out is not None:
+                self._persist_curator_result(
+                    cur_out, vault_id=vault_id, page_id=None, lint_only=True
+                )
+            # Owner decision 2026-11-25 (ASK-001, critic's option c): a failed
+            # enabled-curator qualification stays suppressed, but is never
+            # reported as a successful empty extraction. The distinct reason
+            # keeps the AC1 distinction between success and failure intact.
+            reason = (
+                "curator unavailable"
+                if self._curator_failed(cur_out)
+                else "no qualifying items"
+            )
+            result = _suppressed_compile_result(reason)
+            if claims_rejected_subjectless:
+                result["claims_rejected_subjectless"] = claims_rejected_subjectless
+            existing_pages = self._store.list_pages_by_file(
+                vault_id=vault_id, file_id=file_id
+            )
+            if existing_pages:
+                # Refresh every file-associated page (entity AND procedure
+                # pages) and retire claims whose quotes vanished in this
+                # revision; nothing is deleted (cleanup stays planning-only).
+                supersede_counts = self._store.supersede_unrederived_file_claims(
+                    file_id=file_id,
+                    vault_id=vault_id,
+                    page_id=existing_pages[0].id,
+                    keep_claim_ids=set(),
+                    current_text=text,
+                )
+                self._db.commit()
+                for page in existing_pages:
+                    self._store.update_page(
+                        page_id=page.id,
+                        vault_id=vault_id,
+                        markdown=text[:2000],
+                        summary="",
+                        last_compiled_at=datetime.utcnow().isoformat(),
+                        status="stale",
+                    )
+                result["claims_superseded"] = supersede_counts["superseded"]
+                result["claims_weak_provenance"] = supersede_counts["weak_provenance"]
+            if cur_out is not None:
+                result["curator"] = self._curator_summary(cur_out)
+            return result
 
         file_name = file_data.get("file_name") or f"file:{file_id}"
         title = file_name
@@ -1113,19 +1304,33 @@ class WikiCompiler:
         )
         self._db.commit()
 
-        # ----------- Optional LLM Wiki Curator (PR C) -----------
-        # Gated by settings.wiki_llm_curator_enabled AND the per-trigger
-        # flag. Curator output never replaces deterministic output; it
-        # can only add candidates that pass quote+chunk verification.
-        # Errors are recorded into the result, never raised.
-        curator_summary = self._maybe_run_curator(
-            vault_id=vault_id,
-            file_id=file_id,
-            text=text,
-            trigger="ingest",
-            deterministic_extraction=extraction,
-            page_id=page_id,
-            existing_entities=entities_created,
+        # Procedure pages (issue #1162 AC3): every detected procedure gets a
+        # page whose steps keep their numbers and order, attached to the
+        # source file so the recompute lifecycle covers them.
+        self._upsert_procedure_pages(
+            vault_id=vault_id, file_id=file_id, file_name=file_name,
+            procedures=procedures,
+        )
+
+        # Curator PERSISTENCE (deferred from the pre-materialization
+        # analysis): accepted claims + sources land exactly once, with the
+        # real page id; lint findings persist on both branches (the
+        # suppressed branch called this helper with lint_only=True).
+        # Errors were already recorded in the analysis summary, never raised.
+        curator_summary = None
+        if cur_out is not None:
+            curator_summary = self._persist_curator_result(
+                cur_out, vault_id=vault_id, page_id=page_id
+            )
+
+        # Gated KMS document entry (issue #1162): the wiki ingest worker is
+        # the single qualification owner, so a qualifying document always
+        # carries BOTH derived records regardless of queue order — but the
+        # independent KMS subsystem flags stay authoritative: when KMS is
+        # disabled or not compiled on ingest, this wiki-side write is a
+        # no-op and the KMS job (its own gate) owns the entry.
+        self._upsert_kms_document_entry(
+            vault_id=vault_id, file_id=file_id, file_name=file_name, body=text
         )
 
         page = self._store.get_page(page_id)
@@ -1137,6 +1342,8 @@ class WikiCompiler:
             "claims_superseded": supersede_counts["superseded"],
             "claims_weak_provenance": supersede_counts["weak_provenance"],
         }
+        if claims_rejected_subjectless:
+            result_dict["claims_rejected_subjectless"] = claims_rejected_subjectless
         if curator_summary is not None:
             result_dict["curator"] = curator_summary
         return result_dict
@@ -1155,6 +1362,7 @@ class WikiCompiler:
         deterministic_extraction,
         page_id: Optional[int],
         existing_entities: list,
+        defer_persist: bool = False,
     ) -> Optional[dict]:
         """Run the curator if enabled for this trigger; return summary
         dict for ``result_json.curator`` or None when curator is off.
@@ -1278,6 +1486,38 @@ class WikiCompiler:
                 "calls": 0,
                 "input_chars": 0,
             }
+
+        if defer_persist:
+            # Analysis-only handoff (issue #1162): the ingest path decides
+            # materialization first and persists via _persist_curator_result
+            # once the page exists (or lint-only when suppressed).
+            return cur_result
+        return self._persist_curator_result(cur_result, vault_id=vault_id, page_id=page_id)
+
+    def _persist_curator_result(
+        self,
+        cur_result,
+        *,
+        vault_id: int,
+        page_id: Optional[int],
+        lint_only: bool = False,
+    ) -> Optional[dict]:
+        """Persist curator output (accepted claims + sources, lint findings).
+
+        Issue #1162 split: analysis lives in ``_maybe_run_curator``; this
+        helper owns persistence. The DEFAULT mode is the exact legacy
+        contract — accepted claims and sources persist WITH the caller's
+        page_id (including a legitimately-None query/direct page_id), and
+        attach_source failures surface as persist errors in the summary.
+        ``lint_only=True`` (suppressed ingest only) persists findings and
+        nothing else — a nullable page_id alone never disables claim
+        persistence. A non-CuratorResult value (dict double or legacy
+        summary) passes through untouched: it carries no claim objects.
+        """
+        if not isinstance(cur_result, CuratorResult):
+            return cur_result
+        if lint_only:
+            cur_result.accepted = []
 
         # Persist accepted candidates as wiki_claims with provenance.
         # WIKI-010 (#515): the claim row AND its source row commit as one
@@ -1484,6 +1724,126 @@ class WikiCompiler:
                     )
 
         return cur_result.to_summary()
+
+    @staticmethod
+    def _curator_accepted_count(cur_out) -> int:
+        """Accepted-curator count from a CuratorResult OR a legacy dict double.
+
+        Issue #1162 compatibility adapter: the deferred-analysis seam may
+        hand back either the real CuratorResult or a summary-shaped dict
+        (the frozen C4 double replaces the whole seam method).
+        """
+        if cur_out is None:
+            return 0
+        if isinstance(cur_out, dict):
+            try:
+                return int(cur_out.get("accepted") or 0)
+            except (TypeError, ValueError):
+                return 0
+        return len(getattr(cur_out, "accepted", None) or [])
+
+    @staticmethod
+    def _curator_failed(cur_out) -> bool:
+        """Whether the enabled curator reported an error (owner decision 2026-11-25).
+
+        A failed qualification must never be reported as a successful empty
+        extraction. The ingest path uses this to give suppression the distinct
+        ``curator unavailable`` reason while still creating nothing.
+        """
+        if cur_out is None:
+            return False
+        errors = (
+            cur_out.get("errors")
+            if isinstance(cur_out, dict)
+            else getattr(cur_out, "errors", None)
+        )
+        return bool(errors)
+
+    @staticmethod
+    def _curator_summary(cur_out):
+        """JSON-safe summary for ``result_json.curator`` from either shape."""
+        if cur_out is None:
+            return None
+        if isinstance(cur_out, dict):
+            return cur_out
+        return cur_out.to_summary()
+
+    def _upsert_procedure_pages(
+        self,
+        *,
+        vault_id: int,
+        file_id: int,
+        file_name: str,
+        procedures: List[Procedure],
+    ) -> None:
+        """Create or refresh one procedure page per detected procedure.
+
+        Issue #1162 AC3: steps keep their numbers and order verbatim; the
+        markdown follows the frontend template shape (WikiEditDialog). Pages
+        are attached to the source file so the unqualifying-recompute
+        lifecycle (list_pages_by_file) covers them.
+        """
+        for index, procedure in enumerate(procedures, start=1):
+            slug = normalize_slug(f"procedure/{file_name[:40]}-{file_id}-{index}")
+            markdown = (
+                f"# {procedure.title}\n\n## Purpose\n\n\n\n## Steps\n\n"
+                + "\n".join(procedure.steps)
+                + "\n\n## Notes\n\n"
+            )
+            existing = self._db.execute(
+                "SELECT id FROM wiki_pages WHERE vault_id = ? AND slug = ?",
+                (vault_id, slug),
+            ).fetchone()
+            if existing is not None:
+                self._store.update_page(
+                    page_id=existing[0],
+                    vault_id=vault_id,
+                    markdown=markdown,
+                    last_compiled_at=datetime.utcnow().isoformat(),
+                )
+                continue
+            page = self._store.create_page(
+                vault_id=vault_id,
+                title=procedure.title[:200] or slug,
+                page_type="procedure",
+                slug=slug,
+                markdown=markdown,
+                status="needs_review",
+            )
+            self._store.attach_file(page.id, file_id, vault_id)
+
+    def _upsert_kms_document_entry(
+        self,
+        *,
+        vault_id: int,
+        file_id: int,
+        file_name: str,
+        body: str,
+    ) -> None:
+        """Wiki-owned KMS document entry (issue #1162), gated on KMS flags.
+
+        The wiki ingest worker is the single qualification owner, so a
+        qualifying document carries BOTH derived records regardless of the
+        two queues' ordering — but the independent KMS subsystem flags stay
+        authoritative (kms_enabled AND kms_compile_on_ingest, the same pair
+        that gates the KMS enqueue); when KMS is off this is a no-op. The
+        upsert is idempotent per (vault, file, source_type=document), so it
+        converges with the KMS job's own write instead of duplicating.
+        """
+        if not (
+            getattr(_app_settings, "kms_enabled", False)
+            and getattr(_app_settings, "kms_compile_on_ingest", False)
+        ):
+            return
+        from app.services.kms_store import KMSStore
+
+        KMSStore(self._db).upsert_document_entry(
+            vault_id=vault_id,
+            file_id=file_id,
+            title=file_name or f"Document {file_id}",
+            body=body,
+            summary=entry_summary(body),
+        )
 
     # Vocabularies enforced by the wiki_lint_findings CHECK constraints
     # (backend/app/models/database.py). A curator spec outside them would

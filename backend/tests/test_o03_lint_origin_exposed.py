@@ -120,7 +120,11 @@ class TestLintOriginExposed(WikiRouteTestBase):
     # AC4 (field-set preservation) -------------------------------------------
 
     def test_existing_lint_finding_fields_unchanged(self):
-        """The additive field must not disturb the pre-#949 response shape."""
+        """The additive fields must not disturb the pre-#949 response shape.
+
+        #1161 AC2 added the read-only ``source_filename`` enrichment to the
+        GET /wiki/lint finding payload; the rest of the shape is unchanged.
+        """
         finding_id = self._seed_curator_finding()
         finding = [
             f
@@ -144,6 +148,7 @@ class TestLintOriginExposed(WikiRouteTestBase):
                 "created_at",
                 "updated_at",
                 "origin",
+                "source_filename",
             },
         )
 

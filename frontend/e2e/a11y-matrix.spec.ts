@@ -271,6 +271,14 @@ const ROUTES: RouteRow[] = [
     sentinel: { selector: "text=Coolant Maintenance Wiki" },
   },
   {
+    path: "/review-queue",
+    auth: "login",
+    kind: "shell",
+    // Queue item title from the stub's /api/review/queue seed —
+    // ReviewQueuePage renders it beside its source quote.
+    sentinel: { selector: "text=Coolant Maintenance Wiki" },
+  },
+  {
     path: "/kms",
     auth: "login",
     kind: "shell",

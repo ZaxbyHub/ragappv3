@@ -12,6 +12,10 @@ const api = vi.hoisted(() => ({
   cancelWikiJob: vi.fn(),
   recompileVaultWiki: vi.fn(),
   runWikiLint: vi.fn(),
+  // #1161 AC3: the panel's refresh also reads the persisted lint surface;
+  // mock it like every other panel API so the lifecycle timing under test
+  // (mutation gating and busy-state handoff) stays deterministic.
+  listWikiLintFindings: vi.fn(),
   testConnections: vi.fn(),
 }));
 
@@ -135,6 +139,7 @@ beforeEach(() => {
   api.cancelWikiJob.mockResolvedValue({});
   api.recompileVaultWiki.mockResolvedValue({ job_id: 99 });
   api.runWikiLint.mockResolvedValue({ count: 0, findings: [] });
+  api.listWikiLintFindings.mockResolvedValue({ findings: [] });
   api.testConnections.mockResolvedValue({});
 });
 
@@ -188,6 +193,32 @@ describe("WikiJobsPanel issue #775 lifecycle", () => {
 
     await resolveDeferred(heldRetry, { job_id: 8 });
     await waitFor(() => expect(retry).toBeEnabled());
+  });
+
+  it("does not let a pending supplementary lint read hold the retry gate", async () => {
+    // #1161 AC3 / implementation review round 4: the persisted lint read is
+    // supplementary. A slow or hung lint request must not keep the job
+    // action busy once the mutation and the jobs re-read have settled.
+    const user = userEvent.setup();
+    const heldRetry = deferred<{ job_id: number }>();
+    const heldLint = deferred<{ findings: unknown[] }>();
+    api.retryWikiJob.mockReturnValue(heldRetry.promise);
+    api.listWikiLintFindings.mockReturnValue(heldLint.promise);
+    render(<WikiJobsPanel vaultId={42} />);
+    await screen.findByText("#7");
+    const retry = screen.getByRole("button", { name: "Retry" });
+
+    await user.click(retry);
+    expect(api.retryWikiJob).toHaveBeenCalledTimes(1);
+    expect(retry).toBeDisabled();
+
+    // The mutation settles and the jobs list is re-read; the lint read is
+    // STILL pending (heldLint is never resolved inside this test).
+    await resolveDeferred(heldRetry, { job_id: 8 });
+    await waitFor(() => expect(api.listWikiJobs.mock.calls.length).toBeGreaterThanOrEqual(2));
+    await waitFor(() => expect(retry).toBeEnabled());
+    expect(api.listWikiLintFindings.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByTestId("jobs-lint-loading")).toBeInTheDocument();
   });
 
   it("ignores an old filter read in A/B/A order and publishes only the current response", async () => {

@@ -97,7 +97,7 @@ class CuratorAcceptedClaim:
 @dataclass
 class CuratorRejection:
     claim_text: str
-    reason: str  # one of: "missing_quote" | "missing_chunk_id" | "quote_mismatch" | "schema"
+    reason: str  # one of: "missing_quote" | "missing_chunk_id" | "quote_mismatch" | "schema" | "missing_subject"
 
 
 @dataclass
@@ -651,6 +651,15 @@ class WikiCurator:
             subject = (raw.get("subject") or "") if isinstance(raw.get("subject"), str) else ""
             predicate = (raw.get("predicate") or "") if isinstance(raw.get("predicate"), str) else ""
             obj = (raw.get("object") or "") if isinstance(raw.get("object"), str) else ""
+            # Issue #1162 AC9: a candidate claim with no subject entity is
+            # rejected before dedupe/acceptance — it can never become a
+            # wiki_claims row, and (post-gate) it does not count as
+            # qualifying curator output.
+            if not subject.strip():
+                result.rejected.append(
+                    CuratorRejection(claim_text=claim_text, reason="missing_subject")
+                )
+                continue
             key = _dedupe_key(
                 subject, predicate, obj,
                 _normalize(source_quote), _normalize(claim_text),

@@ -43,8 +43,10 @@ class TestO03bNegativeStatusPins(unittest.TestCase):
         # enter the vault recompile's selection.
         conn, store, processor = self._make_fixture(
             [
-                (1, "docs/one.txt", "one.txt", "indexed", "body one"),
-                (2, "docs/two.txt", "two.txt", "partial", "body two"),
+                # Issue #1162: non-empty fixtures carry a qualifying role claim so the
+                # status-exclusion accounting still exercises the compiled path.
+                (1, "docs/one.txt", "one.txt", "indexed", "Alice Smith is the AFOMIS Director."),
+                (2, "docs/two.txt", "two.txt", "partial", "Bob Jones is the ZEBRA Chief."),
                 (3, "docs/three.txt", "three.txt", "error", "body three"),
                 (4, "docs/four.txt", "four.txt", "cancelled", "stale body"),
                 (5, "docs/five.txt", "five.txt", "pending", "pending body"),
@@ -62,7 +64,7 @@ class TestO03bNegativeStatusPins(unittest.TestCase):
         # entry, is counted in `skipped`, and still counts in `total`.
         conn, store, processor = self._make_fixture(
             [
-                (1, "docs/one.txt", "one.txt", "indexed", "body one"),
+                (1, "docs/one.txt", "one.txt", "indexed", "Alice Smith is the AFOMIS Director."),
                 (2, "docs/two.txt", "two.txt", "partial", ""),
                 (3, "docs/three.txt", "three.txt", "partial", "   "),
             ]
