@@ -192,7 +192,7 @@ describe("ProfilePage supplemental ownership contracts (issue #775)", () => {
     try {
       render(<ProfilePage />);
       await waitFor(() => expect(screen.getByText("A browser")).toBeInTheDocument());
-      const rows = screen.getAllByRole("button", { name: "Revoke session" });
+      const rows = screen.getAllByRole("button", { name: /^Revoke session \d+: / });
       fireEvent.click(rows[0]);
       fireEvent.click(rows[1]);
       await waitFor(() => expect(api.revokeSession).toHaveBeenCalledTimes(2));
@@ -285,7 +285,7 @@ describe("ProfilePage supplemental ownership contracts (issue #775)", () => {
     try {
       render(<ProfilePage />);
       await waitFor(() => expect(screen.getByText("A browser")).toBeInTheDocument());
-      const rows = screen.getAllByRole("button", { name: "Revoke session" });
+      const rows = screen.getAllByRole("button", { name: /^Revoke session \d+: / });
       fireEvent.click(rows[0]);
       await waitFor(() => expect(api.listSessions).toHaveBeenCalledTimes(2));
       fireEvent.click(rows[1]);
