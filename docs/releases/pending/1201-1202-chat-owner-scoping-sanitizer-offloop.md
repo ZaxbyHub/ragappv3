@@ -2,11 +2,11 @@
 
 ## What changed
 
-- **Chat sessions are owner-or-admin on every mutating surface** (#1201 AC1). Six HTTP mutation
-  surfaces and the durable-stream boundary now answer `403 Cannot modify another user's session`
+- **Chat sessions are owner-or-admin on every mutating surface** (#1201 AC1). Five HTTP mutation
+  surfaces plus the durable-stream boundary now answer `403 Cannot modify another user's session`
   for a non-owner, non-admin member of a shared vault. Legacy `user_id IS NULL` sessions stay
-  shared-vault-accessible and admins/superadmins keep access. GET and fork are unchanged by the maintainer's recorded 2026-11-25 decision, which keeps #573's share
-  link working.
+  shared-vault-accessible and admins/superadmins keep access. GET and fork are unchanged by the
+  maintainer's recorded 2026-11-25 decision, which keeps #573's share link working.
 - **Integrity failures are discriminated** (#1201 AC4). The two quality-report handlers and the two
   durable-turn helpers bind `IntegrityError` and take the idempotency recovery only for the
   `UNIQUE constraint failed` class. A non-unique failure answers the route's 404 only when a
@@ -52,8 +52,8 @@ user content; and the fence scanner deleted literal markup inside quoted fences.
 - GET and fork remain vault-readable by the maintainer's recorded decision (2026-11-25): denying them would retract #573's share link.
 - Assistant-role content on the write routes is capped by `assistant_message_max_chars` (131072,
   derived from `thinking_max_tokens`); legitimate long answers remain well above the live-user cap.
-- Canvas routes keep their pinned vault-only authorization matrix (#509); whether they should
-  follow the new owner rule is an open product question.
+- Canvas routes keep their pinned vault-only authorization matrix (#509); the maintainer recorded
+  that decision on 2026-11-25, so no owner rule was added to them.
 - `llm_client.py:569` still sanitizes synchronously inside async completion methods; it is in a
   file #1202 marks out of scope and is tracked in separate issue #1209.
 - Remaining fence limitation: nested list containers with lazy continuation lines, and a wrapper
