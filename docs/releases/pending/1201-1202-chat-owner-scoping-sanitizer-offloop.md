@@ -45,13 +45,15 @@ user content; and the fence scanner deleted literal markup inside quoted fences.
 
 ## Caveats and open decisions
 
-- Quality-report submitter attribution (#1201 AC3) is **not implemented**: where to store it is an
-  explicit maintainer decision. The one-row-per-identity retry contract is unchanged.
+- Quality-report submitter attribution (#1201 AC3) uses the existing ` || ` note convention: a
+  differing re-submitted note is appended with the second submitter id, and repeat submissions of the
+  same note are idempotent. The one-row-per-identity retry contract is unchanged.
 - GET and fork remain vault-readable; denying them would retract #573's share link and is pending.
-- Assistant-role content on the write routes is not capped at the app layer (open decision).
+- Assistant-role content on the write routes is capped by `assistant_message_max_chars` (32768,
+  derived from `thinking_max_tokens`); legitimate long answers remain well above the live-user cap.
 - Canvas routes keep their pinned vault-only authorization matrix (#509); whether they should
   follow the new owner rule is an open product question.
 - `llm_client.py:569` still sanitizes synchronously inside async completion methods; it is in a
-  file #1202 marks out of scope and is tracked separately.
+  file #1202 marks out of scope and is tracked in a separate issue.
 - Remaining fence limitation: nested list containers with lazy continuation lines, and a wrapper
   tag sitting on the closing fence line.

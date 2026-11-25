@@ -130,6 +130,21 @@ _REPORT_COLS = (
 )
 
 
+def _merge_report_note(existing: str, incoming: str, submitter_id: int) -> str:
+    """Fold a differing re-submitted note into the canonical note (#1201 AC3).
+
+    Uses the repo's existing ` || ` note-convention and attributes only the
+    newly submitted note; repeat submissions of the same note are no-ops.
+    """
+    if not incoming or incoming == existing:
+        return existing
+    parts = [part for part in (existing or "").split(" || ") if part.strip()]
+    attributed = f"{incoming} (submitted by user {submitter_id})"
+    if attributed not in parts:
+        parts.append(attributed)
+    return " || ".join(parts)
+
+
 def _row_get(row: Any, col: str) -> Any:
     """Positional column access that works for both sqlite3.Row and tuple."""
     return row[_REPORT_COLS.index(col)] if col in _REPORT_COLS else row[col]
@@ -234,6 +249,21 @@ async def submit_quality_report(
     )
     existing_row = await asyncio.to_thread(existing_result.fetchone)
     if existing_row is not None:
+        existing_note = _row_get(existing_row, "note") or ""
+        merged_note = _merge_report_note(existing_note, body.note or "", user["id"])
+        if merged_note != existing_note:
+            await asyncio.to_thread(
+                conn.execute,
+                "UPDATE quality_reports SET note = ? WHERE id = ?",
+                (merged_note, _row_get(existing_row, "id")),
+            )
+            await asyncio.to_thread(conn.commit)
+            updated_result = await asyncio.to_thread(
+                conn.execute,
+                "SELECT * FROM quality_reports WHERE id = ?",
+                (_row_get(existing_row, "id"),),
+            )
+            existing_row = await asyncio.to_thread(updated_result.fetchone)
         return _report_row_to_dict(existing_row)
     try:
         cursor = await asyncio.to_thread(

@@ -159,6 +159,16 @@ def _reject_over_cap_user_content(content: str) -> None:
             detail=f"the message exceeds chat_message_max_chars ({cap} characters)",
         )
 
+
+def _reject_over_cap_assistant_content(content: str) -> None:
+    """Bound assistant-role bodies on the durable write routes (#1202/#922)."""
+    cap = settings.assistant_message_max_chars
+    if len(content) > cap:
+        raise HTTPException(
+            status_code=422,
+            detail=f"the message exceeds assistant_message_max_chars ({cap} characters)",
+        )
+
 # Inline generation-control modes (issue #510). Hoisted to module-level
 # aliases (PRR-022) so the request models and the stream/non-stream helper
 # signatures share one source of truth — the helpers accept exactly the
@@ -3269,6 +3279,8 @@ async def add_message(
     _require_session_owner_or_admin(session_row[3], user)
     if body.role == "user":
         _reject_over_cap_user_content(body.content)
+    elif body.role == "assistant":
+        _reject_over_cap_assistant_content(body.content)
 
     # Check if this is the first message
     count_query = "SELECT COUNT(*) FROM chat_messages WHERE session_id = ?"
@@ -3541,6 +3553,8 @@ async def add_messages_batch(
     for item in body.messages:
         if item.role == "user":
             _reject_over_cap_user_content(item.content)
+        elif item.role == "assistant":
+            _reject_over_cap_assistant_content(item.content)
 
     # Validate and prepare every row BEFORE touching the database so a bad row
     # cannot leave a partially applied turn behind.
