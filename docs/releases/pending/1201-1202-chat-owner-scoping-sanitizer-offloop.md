@@ -20,7 +20,8 @@
   `db_pool.close_all()` so queued interrupted rows commit.
 - **`chat_message_max_chars` is enforced on the two write routes for user-role items** (#1202 AC2)
   with the stream route's 422 shape, after auth, vault and owner checks; an over-cap batch writes
-  nothing. Assistant answers are not capped at the app layer (open decision: the #922 contract).
+  nothing. Assistant-role items are bounded separately by `assistant_message_max_chars` (32768);
+  assistant answers below that ceiling remain unbounded by the live-user cap, per the #922 contract.
 - **Fence tracking is container-aware** (#1202 AC3, AC4). Literal `<answer>` markup inside a
   block-quoted or list-item fence survives, including wrapper tags before the container markers on
   the opener line; a second pass is a fixed point. Plain top-level fences behave as before.

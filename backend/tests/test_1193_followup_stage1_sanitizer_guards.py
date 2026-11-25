@@ -453,6 +453,12 @@ class ContainerFenceSanitizerTest(unittest.TestCase):
     def test_container_fence_nested_quotes_unchanged(self):
         self._assert_unchanged(">> ```\n<answer>keep me</answer>\n>> ```")
 
+    def test_container_fence_plain_fence_ignores_quoted_closer(self):
+        # A quoted marker inside a PLAIN fence is fenced content: it must not
+        # close the fence and expose the following literal <answer> markup.
+        raw = "```\ncode\n> ```\n<answer>keep me</answer>"
+        self._assert_unchanged(raw)
+
     def test_container_fence_quote_mismatch_not_closed_by_bare_fence(self):
         # A quoted opener is NOT closed by a later unquoted bare fence line,
         # so protected content is never released early.

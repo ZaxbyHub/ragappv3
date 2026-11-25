@@ -160,6 +160,63 @@ class SubmitterAttributionTest(_Base):
             self.conn.execute("SELECT COUNT(*) FROM quality_reports").fetchone()[0], 1
         )
 
+    def test_submitter_unique_race_loser_note_is_folded(self):
+        # Two submissions can both miss the pre-SELECT; the loser of the
+        # unique-index race must still fold its note and submitter into the
+        # canonical winner, not silently disappear.
+        class _NoRows:
+            def fetchone(self):
+                return None
+
+        class _UniqueRaceProxy:
+            def __init__(self, conn):
+                self.conn = conn
+                self.fired = False
+                self.selects = 0
+
+            def execute(self, sql, params=()):
+                if "SELECT * FROM quality_reports" in sql and "message_id = ?" in sql:
+                    self.selects += 1
+                    if self.selects == 1:  # this racer misses the pre-SELECT
+                        return _NoRows()
+                if "INSERT INTO quality_reports" in sql and not self.fired:
+                    self.fired = True
+                    raise sqlite3.IntegrityError(
+                        "UNIQUE constraint failed: quality_reports.message_id, quality_reports.category"
+                    )
+                return self.conn.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self.conn, name)
+
+        sid, mid = self._session()
+        body = {
+            "session_id": sid,
+            "message_id": mid,
+            "category": "incorrect_answer",
+            "note": "first note",
+        }
+        first = self.client.post("/api/quality/reports", json=body)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.current = SECOND_ADMIN
+        proxy = _UniqueRaceProxy(self.conn)
+        app.dependency_overrides[get_db] = lambda: proxy
+        try:
+            raced = self.client.post(
+                "/api/quality/reports", json={**body, "note": "racing second note"}
+            )
+        finally:
+            app.dependency_overrides[get_db] = lambda: None
+        self.assertTrue(proxy.fired, "the racing INSERT never ran")
+        self.assertEqual(raced.status_code, 200, raced.text)
+        note = raced.json()["note"]
+        self.assertIn("first note", note)
+        self.assertIn("racing second note", note)
+        self.assertIn(str(SECOND_ADMIN["id"]), note)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM quality_reports").fetchone()[0], 1
+        )
+
 
 class ShareLinkPinTest(_Base):
     def test_share_link_pin_cross_user_get_stays_allowed(self):

@@ -125,8 +125,16 @@ class EvalCaseCompareRequest(BaseModel):
 
 
 _REPORT_COLS = (
-    "id", "session_id", "message_id", "category", "note", "turn_id", "seq",
-    "config_ref", "source_file_hashes", "created_at",
+    "id",
+    "session_id",
+    "message_id",
+    "category",
+    "note",
+    "turn_id",
+    "seq",
+    "config_ref",
+    "source_file_hashes",
+    "created_at",
 )
 
 
@@ -161,7 +169,9 @@ def _report_row_to_dict(row: Any) -> Dict[str, Any]:
         "seq": _row_get(row, "seq"),
         "provenance": {
             "config_ref": _row_get(row, "config_ref"),
-            "source_file_hashes": json.loads(_row_get(row, "source_file_hashes") or "[]"),
+            "source_file_hashes": json.loads(
+                _row_get(row, "source_file_hashes") or "[]"
+            ),
         },
         "created_at": _row_get(row, "created_at"),
     }
@@ -227,9 +237,7 @@ async def submit_quality_report(
     )
     msg_row = await asyncio.to_thread(msg_result.fetchone)
     if msg_row is None:
-        raise HTTPException(
-            status_code=404, detail="Message not found in this session"
-        )
+        raise HTTPException(status_code=404, detail="Message not found in this session")
 
     config_ref = await asyncio.to_thread(_config_ref)
     # msg_row columns (positional): 0=id, 1=turn_id, 2=seq, 3=sources
@@ -287,7 +295,8 @@ async def submit_quality_report(
         if not is_unique_violation(exc):
             session_result = await asyncio.to_thread(
                 conn.execute,
-                "SELECT 1 FROM chat_sessions WHERE id = ?", (body.session_id,)
+                "SELECT 1 FROM chat_sessions WHERE id = ?",
+                (body.session_id,),
             )
             if await asyncio.to_thread(session_result.fetchone) is None:
                 raise HTTPException(status_code=404, detail="Session not found")
@@ -313,6 +322,21 @@ async def submit_quality_report(
         winner_row = await asyncio.to_thread(winner_result.fetchone)
         if winner_row is None:
             raise
+        winner_note = _row_get(winner_row, "note") or ""
+        merged_note = _merge_report_note(winner_note, body.note or "", user["id"])
+        if merged_note != winner_note:
+            await asyncio.to_thread(
+                conn.execute,
+                "UPDATE quality_reports SET note = ? WHERE id = ?",
+                (merged_note, _row_get(winner_row, "id")),
+            )
+            await asyncio.to_thread(conn.commit)
+            updated_result = await asyncio.to_thread(
+                conn.execute,
+                "SELECT * FROM quality_reports WHERE id = ?",
+                (_row_get(winner_row, "id"),),
+            )
+            winner_row = await asyncio.to_thread(updated_result.fetchone)
         row = winner_row
     else:
         row_result = await asyncio.to_thread(
@@ -323,7 +347,10 @@ async def submit_quality_report(
         row = await asyncio.to_thread(row_result.fetchone)
     logger.info(
         "Quality report %s submitted (category=%s, session=%s, message=%s)",
-        row[0], body.category, body.session_id, body.message_id,
+        row[0],
+        body.category,
+        body.session_id,
+        body.message_id,
     )
     return _report_row_to_dict(row)
 
@@ -471,8 +498,7 @@ async def convert_report_to_eval_case(
         await asyncio.to_thread(conn.rollback)
         if not is_unique_violation(exc):
             report_result = await asyncio.to_thread(
-                conn.execute,
-                "SELECT 1 FROM quality_reports WHERE id = ?", (report_id,)
+                conn.execute, "SELECT 1 FROM quality_reports WHERE id = ?", (report_id,)
             )
             if await asyncio.to_thread(report_result.fetchone) is None:
                 raise HTTPException(status_code=404, detail="Quality report not found")
@@ -503,9 +529,7 @@ async def convert_report_to_eval_case(
         (cursor.lastrowid,),
     )
     case = await asyncio.to_thread(case_result.fetchone)
-    logger.info(
-        "Quality report %s converted to eval case %s", report_id, case[0]
-    )
+    logger.info("Quality report %s converted to eval case %s", report_id, case[0])
     return {
         "id": case[0],
         "report_id": case[1],

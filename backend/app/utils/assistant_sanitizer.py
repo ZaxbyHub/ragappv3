@@ -30,16 +30,16 @@ from typing import Iterable, List, Tuple
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.DOTALL | re.IGNORECASE)
 _LHS_RHS_RE = re.compile(r"_lhs.*?_rhs", re.DOTALL)
 # Match unterminated <think> from a stripped close tag (e.g. partial chunk leak)
-_UNTERMINATED_THINK_TAIL_RE = re.compile(r"<think\b[^>]*>.*\Z", re.DOTALL | re.IGNORECASE)
+_UNTERMINATED_THINK_TAIL_RE = re.compile(
+    r"<think\b[^>]*>.*\Z", re.DOTALL | re.IGNORECASE
+)
 # Thinking Process: ... </think>  (qwen3.5-122b style)
 _THINKING_PROCESS_BLOCK_RE = re.compile(
     r"Thinking Process:.*?</think>\s*", re.DOTALL | re.IGNORECASE
 )
 # Defensive: orphan "Thinking Process:" prefix at start with no close tag —
 # strip the leading line up to a blank line if present.
-_THINKING_PROCESS_PREFIX_RE = re.compile(
-    r"^Thinking Process:[^\n]*\n", re.IGNORECASE
-)
+_THINKING_PROCESS_PREFIX_RE = re.compile(r"^Thinking Process:[^\n]*\n", re.IGNORECASE)
 # Answer wrapper TAGS (issue #1153 AC1): some models wrap the final answer in
 # ``<answer>...</answer>`` elements. Unlike thinking blocks (removed with their
 # content), only the TAGS are stripped — the inner text IS the answer. Matches
@@ -57,9 +57,7 @@ def _strip_answer_tags(text: str) -> str:
     Applied to the WHOLE run (not line-by-line) so a wrapper tag that spans
     lines is still removed.
     """
-    return _ANSWER_WRAPPER_CLOSE_RE.sub(
-        "", _ANSWER_WRAPPER_OPEN_RE.sub("", text)
-    )
+    return _ANSWER_WRAPPER_CLOSE_RE.sub("", _ANSWER_WRAPPER_OPEN_RE.sub("", text))
 
 
 _QUOTE_PREFIX_RE = re.compile(r">(?:[ \t]?>[ \t]?)*[ \t]?")
@@ -83,17 +81,17 @@ def _container_line(core: str):
     while True:
         match = _WRAPPER_PREFIX_RE.match(stripped)
         if match:
-            stripped = stripped[match.end():]
+            stripped = stripped[match.end() :]
             marked = True
             continue
         match = _QUOTE_PREFIX_RE.match(stripped)
         if match:
-            stripped = stripped[match.end():].lstrip(" \t")
+            stripped = stripped[match.end() :].lstrip(" \t")
             quoted = marked = True
             continue
         match = _LIST_PREFIX_RE.match(stripped)
         if match:
-            stripped = stripped[match.end():].lstrip(" \t")
+            stripped = stripped[match.end() :].lstrip(" \t")
             listed = marked = True
             continue
         break
@@ -136,7 +134,7 @@ def _find_code_fence_spans(text: str) -> List[Tuple[int, int]]:
             open_match = _OPEN_FENCE_RE.match(rest)
             if open_match:
                 marker = open_match.group(1)
-                info = rest[len(marker):]
+                info = rest[len(marker) :]
                 if marker[0] == "`" and "`" in info:
                     pass  # invalid backtick opener — not a fence
                 else:
@@ -147,15 +145,21 @@ def _find_code_fence_spans(text: str) -> List[Tuple[int, int]]:
                     fence_quoted = quoted
                     fence_listed = listed
         else:
-            closer = bool(rest) and re.fullmatch(
-                rf"{re.escape(fence_char)}{{{fence_len},}}[ \t]*", rest
-            ) is not None
+            closer = (
+                bool(rest)
+                and re.fullmatch(
+                    rf"{re.escape(fence_char)}{{{fence_len},}}[ \t]*", rest
+                )
+                is not None
+            )
             if fence_quoted:
                 context_ok = quoted
             elif fence_listed:
                 context_ok = listed or bare_indent > 0
             else:
-                context_ok = bare_indent <= 3
+                # A plain fence closes only on a genuinely plain closer: a `>`
+                # or list marker on the line is fenced content, not a closer.
+                context_ok = bare_indent <= 3 and not marked
             if closer and context_ok:
                 spans.append((fence_start, line_start + len(core)))
                 in_fence = False
