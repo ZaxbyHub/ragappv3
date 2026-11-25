@@ -25,6 +25,7 @@ from app.api.deps import (  # noqa: E402
     get_evaluate_policy,
     get_rag_engine,
 )
+from app.api.routes import quality_reports as qr  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models.database import init_db, run_migrations  # noqa: E402
@@ -216,6 +217,48 @@ class SubmitterAttributionTest(_Base):
         self.assertEqual(
             self.conn.execute("SELECT COUNT(*) FROM quality_reports").fetchone()[0], 1
         )
+
+
+class NoteMergeCasTest(unittest.TestCase):
+    def test_submitter_note_merge_is_compare_and_swap(self):
+        merge = getattr(qr, "_merge_report_note_cas", None)
+        assert callable(merge), "note merge has no compare-and-swap helper"
+
+        class _Cursor:
+            def __init__(self, row):
+                self.row = row
+
+            def fetchone(self):
+                return self.row
+
+        class _Update:
+            def __init__(self, rowcount):
+                self.rowcount = rowcount
+
+        class _FakeConn:
+            def __init__(self):
+                self.note = "first note"
+                self.lost_once = False
+
+            def execute(self, sql, params=()):
+                if sql.startswith("SELECT note"):
+                    return _Cursor((self.note,))
+                if sql.startswith("UPDATE quality_reports"):
+                    if not self.lost_once:  # first CAS loses to a concurrent writer
+                        self.lost_once = True
+                        return _Update(0)
+                    self.note = params[0]
+                    return _Update(1)
+                raise AssertionError(sql)
+
+            def commit(self):
+                return None
+
+        conn = _FakeConn()
+        merge(conn, 1, "racing second note", SECOND_ADMIN["id"])
+        self.assertIn("first note", conn.note)
+        self.assertIn("racing second note", conn.note)
+        self.assertIn(str(SECOND_ADMIN["id"]), conn.note)
 
 
 class ShareLinkPinTest(_Base):

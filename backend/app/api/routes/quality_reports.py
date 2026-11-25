@@ -153,6 +153,33 @@ def _merge_report_note(existing: str, incoming: str, submitter_id: int) -> str:
     return " || ".join(parts)
 
 
+def _merge_report_note_cas(conn, row_id: int, incoming: str, user_id: int) -> str:
+    """Fold a note into a canonical row with compare-and-swap retries.
+
+    A stale reader cannot overwrite a concurrent merge: the UPDATE carries the
+    note value that was read, and a failed CAS re-reads before retrying.
+    """
+    for _ in range(8):
+        result = conn.execute(
+            "SELECT note FROM quality_reports WHERE id = ?", (row_id,)
+        )
+        row = result.fetchone()
+        if row is None:
+            raise LookupError(f"quality report {row_id} vanished during merge")
+        old = row[0] or ""
+        merged = _merge_report_note(old, incoming, user_id)
+        if merged == old:
+            return old
+        update = conn.execute(
+            "UPDATE quality_reports SET note = ? WHERE id = ? AND note = ?",
+            (merged, row_id, old),
+        )
+        if update.rowcount:
+            conn.commit()
+            return merged
+    raise RuntimeError("quality report note merge lost too many races")
+
+
 def _row_get(row: Any, col: str) -> Any:
     """Positional column access that works for both sqlite3.Row and tuple."""
     return row[_REPORT_COLS.index(col)] if col in _REPORT_COLS else row[col]
@@ -257,21 +284,19 @@ async def submit_quality_report(
     )
     existing_row = await asyncio.to_thread(existing_result.fetchone)
     if existing_row is not None:
-        existing_note = _row_get(existing_row, "note") or ""
-        merged_note = _merge_report_note(existing_note, body.note or "", user["id"])
-        if merged_note != existing_note:
-            await asyncio.to_thread(
-                conn.execute,
-                "UPDATE quality_reports SET note = ? WHERE id = ?",
-                (merged_note, _row_get(existing_row, "id")),
-            )
-            await asyncio.to_thread(conn.commit)
-            updated_result = await asyncio.to_thread(
-                conn.execute,
-                "SELECT * FROM quality_reports WHERE id = ?",
-                (_row_get(existing_row, "id"),),
-            )
-            existing_row = await asyncio.to_thread(updated_result.fetchone)
+        await asyncio.to_thread(
+            _merge_report_note_cas,
+            conn,
+            _row_get(existing_row, "id"),
+            body.note or "",
+            user["id"],
+        )
+        updated_result = await asyncio.to_thread(
+            conn.execute,
+            "SELECT * FROM quality_reports WHERE id = ?",
+            (_row_get(existing_row, "id"),),
+        )
+        existing_row = await asyncio.to_thread(updated_result.fetchone)
         return _report_row_to_dict(existing_row)
     try:
         cursor = await asyncio.to_thread(
@@ -322,21 +347,19 @@ async def submit_quality_report(
         winner_row = await asyncio.to_thread(winner_result.fetchone)
         if winner_row is None:
             raise
-        winner_note = _row_get(winner_row, "note") or ""
-        merged_note = _merge_report_note(winner_note, body.note or "", user["id"])
-        if merged_note != winner_note:
-            await asyncio.to_thread(
-                conn.execute,
-                "UPDATE quality_reports SET note = ? WHERE id = ?",
-                (merged_note, _row_get(winner_row, "id")),
-            )
-            await asyncio.to_thread(conn.commit)
-            updated_result = await asyncio.to_thread(
-                conn.execute,
-                "SELECT * FROM quality_reports WHERE id = ?",
-                (_row_get(winner_row, "id"),),
-            )
-            winner_row = await asyncio.to_thread(updated_result.fetchone)
+        await asyncio.to_thread(
+            _merge_report_note_cas,
+            conn,
+            _row_get(winner_row, "id"),
+            body.note or "",
+            user["id"],
+        )
+        updated_result = await asyncio.to_thread(
+            conn.execute,
+            "SELECT * FROM quality_reports WHERE id = ?",
+            (_row_get(winner_row, "id"),),
+        )
+        winner_row = await asyncio.to_thread(updated_result.fetchone)
         row = winner_row
     else:
         row_result = await asyncio.to_thread(
