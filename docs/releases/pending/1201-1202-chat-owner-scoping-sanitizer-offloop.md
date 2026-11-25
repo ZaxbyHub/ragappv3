@@ -5,8 +5,8 @@
 - **Chat sessions are owner-or-admin on every mutating surface** (#1201 AC1). Six HTTP mutation
   surfaces and the durable-stream boundary now answer `403 Cannot modify another user's session`
   for a non-owner, non-admin member of a shared vault. Legacy `user_id IS NULL` sessions stay
-  shared-vault-accessible and admins/superadmins keep access. GET and fork are unchanged; whether
-  they should also follow the owner rule is an open maintainer decision (#573's share link).
+  shared-vault-accessible and admins/superadmins keep access. GET and fork are unchanged by the maintainer's recorded 2026-11-25 decision, which keeps #573's share
+  link working.
 - **Integrity failures are discriminated** (#1201 AC4). The two quality-report handlers and the two
   durable-turn helpers bind `IntegrityError` and take the idempotency recovery only for the
   `UNIQUE constraint failed` class. A non-unique failure answers the route's 404 only when a

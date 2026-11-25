@@ -635,8 +635,8 @@ class Settings(BaseSettings):
 
     assistant_message_max_chars: int = 131072
     """Maximum characters of an assistant-role item accepted by the two chat
-    write routes. Derived from `thinking_max_tokens` (32768) at a generous
-    1 character/token, so a legitimate long answer still saves; this is a
+    write routes. Derived from `thinking_max_tokens` (32768) at 4 characters/token
+    (131072), so a legitimate long answer still saves; this is a
     backstop against unbounded bodies, not the LIVE-user cap (#922/#1202)."""
 
     active_user_cache_ttl_seconds: int = 30
