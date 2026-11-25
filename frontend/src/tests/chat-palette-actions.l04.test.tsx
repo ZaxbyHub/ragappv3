@@ -242,8 +242,10 @@ describe("#775 chat palette actions", () => {
           fireEvent.click(screen.getByRole("menuitem", { name: /Research/ }));
           await vi.waitFor(() => {
             expect(useVaultStore.getState().activeVaultId).toBe(7);
+            // The vault switcher's accessible name now composes from its
+            // visible content plus an sr-only descriptor (#871 Label-in-Name).
             expect(
-              screen.getByRole("button", { name: /Active vault: Research/i })
+              screen.getByRole("button", { name: /Research — active vault/i })
             ).toBeInTheDocument();
           });
           break;

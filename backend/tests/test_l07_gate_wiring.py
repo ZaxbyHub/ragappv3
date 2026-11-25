@@ -236,7 +236,7 @@ def test_axe_run_options_rejected(tmp_path: Path) -> None:
         _plant_full(tmp_path, spec_text=seeded)
         result = _run_guard(tmp_path)
         assert result.returncode == 1, spelling
-        assert "axe.run with options" in result.stdout, spelling
+        assert "non-allowlisted argument" in result.stdout, spelling
 
 
 def test_axe_run_comment_not_counted(tmp_path: Path) -> None:
@@ -248,7 +248,7 @@ def test_axe_run_comment_not_counted(tmp_path: Path) -> None:
     )
     _plant_full(tmp_path, spec_text=commented)
     result = _run_guard(tmp_path)
-    assert "axe.run with options" not in result.stdout, result.stdout
+    assert "non-allowlisted argument" not in result.stdout, result.stdout
 
 
 def test_census_unnamed_spec_rejected(tmp_path: Path) -> None:
@@ -282,3 +282,53 @@ def test_guard_fails_closed_without_workflow(tmp_path: Path) -> None:
 
     result = _run_guard(tmp_path)
     assert result.returncode == 2
+
+
+# ---- issue #871 AC7 context carve: the matcher admits EXACTLY the
+# allowlisted DOM-context shapes and rejects every bypass family
+# (plan-critic rounds 2-4: R2-1/R3-1). Allowed: empty, inline
+# document.getElementById/querySelector/querySelectorAll with a string
+# literal, and simple selector string literals. Rejected: bare identifiers
+# (options smuggled via a variable), arbitrary calls (getOptions()),
+# parenthesized object literals, and any second (top-level-comma) argument.
+
+
+def test_axe_run_context_carve_allowed_shapes(tmp_path: Path) -> None:
+    for spelling in (
+        "axe.run();",
+        'axe.run(document.getElementById("synthetic-root"));',
+        'axe.run(document.querySelector("#synthetic-root"));',
+        'axe.run(document.querySelectorAll(".probe-root"));',
+        'axe.run("#synthetic-root");',
+    ):
+        seeded = FULL_SPEC.replace("axe.run();", spelling)
+        _plant_full(tmp_path, spec_text=seeded)
+        result = _run_guard(tmp_path)
+        assert result.returncode == 0, (spelling, result.stdout)
+
+
+def test_axe_run_context_carve_rejects_bypass_shapes(tmp_path: Path) -> None:
+    for spelling in (
+        "axe.run(options);",
+        "axe.run(getOptions());",
+        "axe.run(({ rules: [] }));",
+        "axe.run({});",
+        'axe.run(document.getElementById("a"), {});',
+        "axe.run(win.axeOpts);",
+    ):
+        seeded = FULL_SPEC.replace("axe.run();", spelling)
+        _plant_full(tmp_path, spec_text=seeded)
+        result = _run_guard(tmp_path)
+        assert result.returncode == 1, spelling
+        assert "non-allowlisted argument" in result.stdout, spelling
+
+
+def test_axe_run_context_carve_multiline_argument(tmp_path: Path) -> None:
+    # The balanced-paren scan must see through line breaks inside the call.
+    seeded = FULL_SPEC.replace(
+        "axe.run();",
+        "axe.run(\n  document.getElementById(\"synthetic-root\")\n);",
+    )
+    _plant_full(tmp_path, spec_text=seeded)
+    result = _run_guard(tmp_path)
+    assert result.returncode == 0, result.stdout

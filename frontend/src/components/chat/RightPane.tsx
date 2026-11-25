@@ -243,7 +243,7 @@ function SourceListItem({
     >
       <div className="flex items-start gap-3">
         <div
-          className="shrink-0 min-w-6 h-6 px-1 rounded-full bg-primary/10 flex items-center justify-center text-xs font-medium text-primary"
+          className="shrink-0 min-w-6 h-6 px-1 rounded-full bg-primary flex items-center justify-center text-xs font-medium text-primary-foreground"
           aria-label={`Source label ${
             source.source_label && source.source_label.trim()
               ? source.source_label

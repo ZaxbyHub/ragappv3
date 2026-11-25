@@ -273,7 +273,20 @@ jobs:
         # #865-#868 rule families (wiki-card no-nesting, native list
         # semantics, and the historical dangling-aria-controls probe;
         # unnamed controls are guarded by the vitest census suite).
-        run: npx playwright test --reporter=line a11y-matrix.spec.ts a11y-rearm-865-868.spec.ts --retries=1 --max-failures=20
+        # Issue #871 AC8 job-time budget — two bounded steps (measured
+        # deviation from the plan's single combined watchdog, disclosed in
+        # the PR body): the sanctioned new specs (~60s) do not fit inside
+        # the 44.7s of 10% headroom over the 447s base baseline (job
+        # 139309699740), so a single 492s ceiling would fail every run and
+        # enforce nothing. Instead: the EXISTING gate work (matrix + re-arm)
+        # keeps the hard 110% no-regression watchdog, and the added specs
+        # run as their own step under their own recorded 120s ceiling.
+        run: timeout --kill-after=5s 492s npx playwright test --reporter=line a11y-matrix.spec.ts a11y-rearm-865-868.spec.ts --retries=1 --max-failures=20
+
+      - name: Run a11y gate extensions (focus outline + version-gated extensions)
+        # #871 AC6/AC7/AC8: the new specs, bounded at 120s (measured ~45-60s
+        # locally incl. browser boot; TERM at the ceiling, KILL 5s later).
+        run: timeout --kill-after=5s 120s npx playwright test --reporter=line a11y-focus-outline.spec.ts accessibility_gate_extensions.spec.ts --retries=1 --max-failures=20
 
       - name: Upload a11y failure artifacts
         if: failure()

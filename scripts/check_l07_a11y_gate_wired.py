@@ -55,6 +55,48 @@ MIN_ROUTES = 20
 # name, colon, end of line (optional trailing comment).
 JOB_HEADER_RE = re.compile(r"^  ([A-Za-z0-9_.-]+):\s*(?:#.*)?$")
 
+# Issue #871 AC7 context carve: the ONLY argument shapes an axe.run( call may
+# carry. Anchored full-match against the extracted argument text, so bare
+# identifiers, arbitrary calls, parenthesized/object literals, and any second
+# (top-level-comma) argument all fail.
+_AXE_CONTEXT_ALLOWLIST = re.compile(
+    r"""^(?:|
+        document\.(?:getElementById|querySelector|querySelectorAll)\s*\(\s*(['"])[^'"]*\1\s*\)
+        |
+        (['"])[#][A-Za-z0-9_-]+(?:[ >.][A-Za-z0-9_.#-]+)*\2
+        |
+        (['"])\.[A-Za-z0-9_-]+(?:[ >.][A-Za-z0-9_.#-]+)*\3
+    )$""",
+    re.X,
+)
+
+
+def _extract_call_argument(code: str, open_paren_end: int) -> str | None:
+    """Return the full argument text of the call whose '(' just ended at
+    ``open_paren_end`` (index just past it), via a quote-aware balanced-paren
+    scan. ``None`` when the parens never balance."""
+    depth = 1
+    i = open_paren_end
+    quote: str | None = None
+    while i < len(code):
+        ch = code[i]
+        if quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'`":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return code[open_paren_end:i].strip()
+        i += 1
+    return None
+
 
 def resolve_repo_root() -> Path:
     """Repo root for path resolution: walk up from cwd to the git root; fall
@@ -199,12 +241,20 @@ def main() -> int:
                 f"{MIN_ROUTES} (>= 20 gated routes)"
             )
 
-        # 4. Re-arm invariant (issues #865-#868 closed): the gate runs axe
-        #    with its FULL default rule set -- every axe.run( call in every
-        #    a11y-gate spec must be argument-less. This subsumes every
-        #    waiver spelling (rules/enabled:false in any quoting or line
-        #    split, runOnly, exclude): any option object restricts what the
-        #    gate measures.
+        # 4. Re-arm invariant (issues #865-#868 closed; #871 context carve):
+        #    the gate runs axe with its FULL default rule set. Every
+        #    axe.run( call in every a11y-gate spec must be argument-less OR
+        #    carry EXACTLY ONE allowlisted DOM-context argument:
+        #      - document.getElementById|querySelector|querySelectorAll(<string literal>)
+        #      - a simple selector string literal ("#id" / ".class" shapes)
+        #    A context element restricts WHICH tree is measured, never WHICH
+        #    rules run, so it cannot hide a waiver. Everything else stays
+        #    rejected: option objects in any spelling (leading `{`,
+        #    parenthesized `({...})`), bare identifiers (axe.run(options)),
+        #    arbitrary calls (axe.run(getOptions())), and any second
+        #    (top-level-comma) argument. The argument text is extracted with
+        #    a quote-aware balanced-paren scan, so no bypass can smuggle an
+        #    options object through the tail.
         for spec_path in sorted((root / E2E_DIR_REL).glob("*.spec.ts")):
             try:
                 spec_code = spec_path.read_text(encoding="utf-8")
@@ -214,14 +264,22 @@ def main() -> int:
             code = re.sub(r"/\*.*?\*/", " ", spec_code, flags=re.S)
             code = re.sub(r"^\s*//.*$", " ", code, flags=re.M)
             for m in re.finditer(r"axe\.run\s*\(", code):
-                tail = code[m.end():].lstrip()
-                if not tail.startswith(")"):
-                    rel = spec_path.relative_to(root).as_posix()
-                    line_no = code[: m.start()].count("\n") + 1
+                rel = spec_path.relative_to(root).as_posix()
+                line_no = code[: m.start()].count("\n") + 1
+                arg = _extract_call_argument(code, m.end())
+                if arg is None:
                     misses.append(
-                        f"{rel}:{line_no} calls axe.run with options; the "
-                        "re-armed gate runs the full default rule set "
-                        "(axe.run() takes no arguments)"
+                        f"{rel}:{line_no} axe.run argument could not be parsed "
+                        "(unbalanced parens); the gate must stay inspectable"
+                    )
+                    continue
+                if not _AXE_CONTEXT_ALLOWLIST.match(arg):
+                    misses.append(
+                        f"{rel}:{line_no} calls axe.run with a non-allowlisted "
+                        "argument; the re-armed gate runs the full default rule "
+                        "set (only a DOM context — document.getElementById/"
+                        "querySelector/querySelectorAll(<literal>) or a simple "
+                        "selector string literal — may be passed)"
                     )
 
     # 5. Run-line hygiene across ALL jobs (issue #778 review PRR-016):
