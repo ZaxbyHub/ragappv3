@@ -44,10 +44,12 @@ type LintPayload = { findings: ReturnType<typeof finding>[] };
 /** A lint read the test settles by hand, so "pending" is a real state. */
 function deferredLint() {
   let resolve!: (value: LintPayload) => void;
-  const promise = new Promise<LintPayload>((res) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<LintPayload>((res, rej) => {
     resolve = res;
+    reject = rej;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 /** A jobs read the test settles by hand, so the refresh can be held before the lint read starts. */
@@ -232,10 +234,49 @@ describe("WikiJobsPanel persisted lint (#1161 AC3 / C3)", () => {
     expect(screen.getByText("Newer read finding")).toBeInTheDocument();
   });
 
+  it("ignores an older lint REJECTION that lands after a newer success", async () => {
+    // Final critic round 7, mutant K: the catch arm must respect the same
+    // read-token guard as the success arm — a superseded read's failure must
+    // not flip the newer snapshot to the error state.
+    const older = deferredLint();
+    const newer = deferredLint();
+    (listWikiLintFindings as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise);
+    const { rerender } = render(<WikiJobsPanel vaultId={7} refreshSignal={0} />);
+    await waitFor(() => expect(listWikiLintFindings).toHaveBeenCalledTimes(1));
+    rerender(<WikiJobsPanel vaultId={7} refreshSignal={1} />);
+    await waitFor(() => expect(listWikiLintFindings).toHaveBeenCalledTimes(2));
+
+    await settle(() =>
+      newer.resolve({ findings: [finding({ id: 51, title: "Newer read finding" })] }),
+    );
+    expect(await screen.findByText("Newer read finding")).toBeInTheDocument();
+
+    await settle(() => older.reject(new Error("older read failed")));
+    expect(screen.getByText("Newer read finding")).toBeInTheDocument();
+    expect(screen.queryByTestId("jobs-lint-error")).toBeNull();
+  });
+
   it("treats a malformed lint payload as a failed read, not as 'no findings'", async () => {
     (listWikiLintFindings as ReturnType<typeof vi.fn>).mockResolvedValue({} as never);
     render(<WikiJobsPanel vaultId={7} />);
     expect(await screen.findByTestId("jobs-lint-error")).toBeInTheDocument();
+    expect(screen.queryByText(/No lint findings recorded/i)).toBeNull();
+  });
+
+  it("keeps the last findings on screen when a later read's payload is malformed", async () => {
+    // Final critic round 7, mutant H: the malformed arm must keep the last
+    // successful findings, exactly like the rejection arm — not reset them.
+    (listWikiLintFindings as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ findings: [finding()] })
+      .mockResolvedValueOnce({} as never);
+    const { rerender } = render(<WikiJobsPanel vaultId={7} refreshSignal={0} />);
+    expect(await screen.findByText("Stale claim after recompile")).toBeInTheDocument();
+
+    rerender(<WikiJobsPanel vaultId={7} refreshSignal={1} />);
+    expect(await screen.findByTestId("jobs-lint-error")).toBeInTheDocument();
+    expect(screen.getByText("Stale claim after recompile")).toBeInTheDocument();
     expect(screen.queryByText(/No lint findings recorded/i)).toBeNull();
   });
 
