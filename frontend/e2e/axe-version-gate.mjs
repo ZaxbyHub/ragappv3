@@ -16,10 +16,11 @@ import fs from "node:fs";
 import path from "node:path";
 
 export class AxeVersionError extends Error {
-  constructor(installed, minimum, axePath) {
+  constructor(installed, minimum, axePath, detail) {
     super(
       `axe-core ${installed} at ${axePath} is below the a11y gate minimum ${minimum}; ` +
-        "the installed version IS the checker — bump frontend's axe-core devDependency",
+        "the installed version IS the checker — bump frontend's axe-core devDependency" +
+        (detail ? ` (${detail})` : ""),
     );
     this.name = "AxeVersionError";
     this.installed = installed;
@@ -27,13 +28,47 @@ export class AxeVersionError extends Error {
   }
 }
 
-/** Semver-ish compare: returns negative when a < b (pre-release segments unsupported — axe stable only). */
+/**
+ * Semver compare: returns negative when a < b. Pre-release precedence per
+ * semver §11: a version WITH a pre-release sorts BELOW the same numeric
+ * release; pre-release identifiers compare per-identifier (numeric
+ * identifiers compare numerically and sort below alphanumeric ones; a
+ * larger identifier set sorts above its own prefix).
+ */
 export function compareVersions(a, b) {
-  const pa = String(a).split(".").map((n) => Number.parseInt(n, 10) || 0);
-  const pb = String(b).split(".").map((n) => Number.parseInt(n, 10) || 0);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+  const split = (v) => {
+    const [core, pre = ""] = String(v).split("-", 2);
+    return { nums: core.split(".").map((n) => Number.parseInt(n, 10) || 0), pre };
+  };
+  const pa = split(a);
+  const pb = split(b);
+  for (let i = 0; i < Math.max(pa.nums.length, pb.nums.length); i++) {
+    const d = (pa.nums[i] ?? 0) - (pb.nums[i] ?? 0);
     if (d !== 0) return d;
+  }
+  return comparePrerelease(pa.pre, pb.pre);
+}
+
+/** semver §11 pre-release identifier precedence (feedback round F-009). */
+export function comparePrerelease(a, b) {
+  if (a === b) return 0;
+  if (a && !b) return -1;
+  if (!a && b) return 1;
+  const idsA = a.split(".");
+  const idsB = b.split(".");
+  for (let i = 0; i < Math.max(idsA.length, idsB.length); i++) {
+    const x = idsA[i];
+    const y = idsB[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    const aNum = /^[0-9]+$/.test(x);
+    const bNum = /^[0-9]+$/.test(y);
+    if (aNum && bNum) {
+      const d = Number.parseInt(x, 10) - Number.parseInt(y, 10);
+      if (d !== 0) return d;
+    } else if (aNum) return -1;
+    else if (bNum) return 1;
+    else if (x !== y) return x < y ? -1 : 1;
   }
   return 0;
 }
@@ -41,17 +76,29 @@ export function compareVersions(a, b) {
 /**
  * Read the installed axe-core version beside the injected axe.min.js and
  * assert it is >= minimum. `axePath` is the same path the caller injects.
+ * The manifest must also carry name "axe-core" — the gate reads the package
+ * metadata that ships beside the injected bundle, and a foreign or
+ * mis-planted manifest must fail closed rather than lend its version field
+ * to the check (feedback round F-009/SEC-004).
  */
 export function assertAxeVersion({ axePath, minimum }) {
   const manifestPath = path.join(path.dirname(axePath), "package.json");
-  let version;
+  let manifest;
   try {
-    version = JSON.parse(fs.readFileSync(manifestPath, "utf-8")).version;
+    manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
   } catch (err) {
-    throw new AxeVersionError("unreadable", minimum, manifestPath);
+    throw new AxeVersionError("unreadable", minimum, manifestPath, err instanceof Error ? err.message : String(err));
   }
-  if (compareVersions(version, minimum) < 0) {
-    throw new AxeVersionError(version, minimum, axePath);
+  if (manifest.name !== "axe-core") {
+    throw new AxeVersionError(
+      String(manifest.version ?? "unknown"),
+      minimum,
+      manifestPath,
+      `manifest beside the injected bundle is name "${manifest.name ?? "unknown"}", not "axe-core"`,
+    );
   }
-  return version;
+  if (compareVersions(manifest.version, minimum) < 0) {
+    throw new AxeVersionError(manifest.version, minimum, axePath);
+  }
+  return manifest.version;
 }

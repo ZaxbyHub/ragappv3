@@ -11,8 +11,8 @@
 //       target selector, AND the route, within a bounded 30s detection
 //       budget measured from injection.
 //
-//   "synthetic tree"    (C7/AC7): a fixture document is written via
-//       testInfo.outputPath() (frontend/e2e/test-results/ — in-repo,
+//   "synthetic tree"    (C7/AC7): a fixture document is written under
+//       __dirname/test-results/ (frontend/e2e/test-results/ — in-repo,
 //       gitignored, per-run: the "in-repository temporary directory") and
 //       loaded with page.goto(file://...). It contains #synthetic-root with
 //       a REAL seeded violation INSIDE it and a second REAL violation
@@ -85,8 +85,13 @@ interface ScanResult {
  * node target + html + route on every violation, and returns the coverage
  * rectangles of the scroll-and-rescan pass.
  */
-async function scanViolations(page: Page, route: string): Promise<ScanResult> {
+async function scanViolations(page: Page, route?: string): Promise<ScanResult> {
   await page.addScriptTag({ content: AXE_SOURCE });
+  // The route is OBSERVED from the live page (feedback round F-006: the
+  // seeded-detection assertion must not merely echo its own input; when no
+  // label is passed, the reported route is the live pathname).
+  const observedRoute = new URL(page.url()).pathname || page.url();
+  const reportedRoute = route ?? observedRoute;
   const raw = await page.evaluate(async () => {
     const results = await (window as unknown as { axe: { run: () => Promise<{ violations: Array<Record<string, unknown>> }> } }).axe.run();
     return results.violations.map((v) => ({
@@ -106,7 +111,7 @@ async function scanViolations(page: Page, route: string): Promise<ScanResult> {
         impact: v.impact,
         target: (node.target ?? []).map((t) => (Array.isArray(t) ? t.join(" ") : String(t))),
         html: node.html,
-        route,
+        route: reportedRoute,
       });
     }
   }
@@ -195,7 +200,16 @@ test.describe("a11y gate extensions (#871)", () => {
     });
     await expect(page.locator("#a11y-seeded-violation")).toBeVisible();
 
-    const scan = await scanViolations(page, "/chat");
+    // The budget BOUNDS the scan (feedback round F-006: a post-hoc
+    // wall-time check cannot fail fast on a hang) — the race rejects the
+    // leg when the scan outlives the budget; the wall-time assert below
+    // additionally pins the measured detection latency.
+    const scan = await Promise.race([
+      scanViolations(page),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`seeded-detection scan exceeded the ${DETECTION_BUDGET_MS}ms budget`)), DETECTION_BUDGET_MS),
+      ),
+    ]);
     const detected = scan.findings.find(
       (f) => f.rule === "label-content-name-mismatch" && f.target.some((t) => t.includes("#a11y-seeded-violation")),
     );
@@ -204,6 +218,8 @@ test.describe("a11y gate extensions (#871)", () => {
       `exact rule + element reported; got rules: ${scan.findings.map((f) => f.rule).join(", ")}`,
     ).toBeTruthy();
     expect(detected!.target.join(" ")).toContain("#a11y-seeded-violation");
+    // OBSERVED route: the scanner reads the live pathname — this assertion
+    // no longer echoes the literal the test passed in (feedback round F-006).
     expect(detected!.route).toBe("/chat");
     expect(Date.now() - injectedAt, "detection within the 30s budget").toBeLessThanOrEqual(DETECTION_BUDGET_MS);
   });
@@ -339,8 +355,14 @@ test.describe("a11y gate extensions (#871)", () => {
       open: async (page) => {
         await page.goto("/settings");
         await page.waitForTimeout(1_200);
-        const firstDetails = page.locator("details, [role=button]").first();
-        if (await firstDetails.count()) await firstDetails.click().catch(() => undefined);
+        // The intended interactive state (Stage-B review on F-006): switch
+        // to the Models tab — the tab is REQUIRED (visible + clickable) and
+        // asserted selected, so the scan cannot quietly measure only the
+        // Overview shell.
+        const modelsTab = page.getByRole("tab", { name: /models/i }).first();
+        await expect(modelsTab, "the settings Models tab").toBeVisible({ timeout: 10_000 });
+        await modelsTab.click();
+        await expect(modelsTab).toHaveAttribute("aria-selected", "true", { timeout: 5_000 });
         await page.waitForTimeout(400);
       },
       belowFoldSelector: "main button, form button",

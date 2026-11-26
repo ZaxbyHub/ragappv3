@@ -1379,6 +1379,25 @@ const server = http.createServer(async (req, res) => {
     if (method === "GET" && path === "/api/organizations") {
       return sendJson(req, res, 200, a11yOrgs);
     }
+    if (method === "GET" && /^\/api\/organizations\/(\d+)\/members$/.test(path)) {
+      // Seed-gated org-member rows (a11y focus-outline feedback round): the
+      // org detail's native "Change role for <username>" selects render one
+      // row per member once the org card is expanded. One non-owner member
+      // keeps the role select editable and rendered in both layouts.
+      if (!a11ySeeded) return sendJson(req, res, 200, { members: [], total: 0 });
+      return sendJson(req, res, 200, {
+        members: [
+          {
+            user_id: 2,
+            username: "e2e-member",
+            full_name: "E2E Member",
+            role: "member",
+            joined_at: nowIso(),
+          },
+        ],
+        total: 1,
+      });
+    }
     if (method === "GET" && path === "/api/groups") {
       return sendJson(req, res, 200, GROUPS_FIXTURE);
     }

@@ -6,9 +6,9 @@
 // jsdom does not implement color-scheme in getComputedStyle, so the check
 // parses the stylesheet source directly: it extracts each theme block
 // (`:root`, `.dark`, `.high-contrast`) by brace matching and asserts the
-// declaration and its expected value inside that block. The applied-behavior
-// leg (computed colorScheme per applied theme in a real browser) is carried
-// by the Playwright C4 spec.
+// declaration and its expected value inside that block. jsdom cannot exercise
+// applied color-scheme behavior at all; the declaration itself is the pinned
+// contract here (no Playwright leg carries a computed colorScheme assertion).
 //
 // Expected RED at base: the blocks parse but contain no color-scheme
 // declaration ("No test files found" is the frozen base signature — this

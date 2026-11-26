@@ -12,28 +12,57 @@
 //       (read from the tracked lockfile, so the assertion is replay-stable
 //       across the bump).
 
-import { describe, it, expect } from "vitest";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { describe, it, expect, afterAll } from "vitest";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
-import { AxeVersionError, assertAxeVersion, compareVersions } from "../../e2e/axe-version-gate.mjs";
+import { AxeVersionError, assertAxeVersion, comparePrerelease, compareVersions } from "../../e2e/axe-version-gate.mjs";
 
 const e2eDir = resolve(__dirname, "../../e2e");
+// Test-OWNED temp dir (closeout review on F-009: the previous helper wrote
+// into the shared node_modules/@fixtures scope and its afterAll rmSync
+// could delete unrelated content there; mkdtemp gives this run an
+// exclusive directory to remove).
+const fixturesRoot = mkdtempSync(resolve(tmpdir(), "axe-gate-fixtures-"));
 
 /** Write a fixture axe package dir carrying the given version; return its axe.min.js path. */
-function fixtureAxe(version: string): string {
-  const dir = resolve(e2eDir, `../node_modules/@fixtures/axe-${version}`);
+function fixtureAxe(version: string, name = "axe-core"): string {
+  const dir = resolve(fixturesRoot, `axe-${version}-${name}`);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(resolve(dir, "package.json"), JSON.stringify({ name: "axe-core", version }));
+  writeFileSync(resolve(dir, "package.json"), JSON.stringify({ name, version }));
   const axePath = resolve(dir, "axe.min.js");
   writeFileSync(axePath, "/* fixture */");
   return axePath;
 }
+
+afterAll(() => {
+  rmSync(fixturesRoot, { recursive: true, force: true });
+});
 
 describe("axe version gate — comparator (#871 AC5)", () => {
   it("compareVersions orders 4.13.0 below 4.14.0 and 4.14.1 above it", () => {
     expect(compareVersions("4.13.0", "4.14.0")).toBeLessThan(0);
     expect(compareVersions("4.14.0", "4.14.0")).toBe(0);
     expect(compareVersions("4.14.1", "4.14.0")).toBeGreaterThan(0);
+  });
+
+  it("a pre-release of the minimum sorts BELOW the minimum (semver precedence)", () => {
+    // Feedback round F-009/CORR-003: "4.14.0-rc.1" used to compare equal to
+    // "4.14.0" and slip through the gate.
+    expect(compareVersions("4.14.0-rc.1", "4.14.0")).toBeLessThan(0);
+    expect(compareVersions("4.14.0", "4.14.0-rc.1")).toBeGreaterThan(0);
+    expect(compareVersions("4.14.1-rc.1", "4.14.0")).toBeGreaterThan(0);
+  });
+
+  it("pre-release identifiers order per semver §11 (numeric < alphanumeric, longer set wins over its prefix)", () => {
+    // Stage-B review on F-009: rc-vs-beta used to compare equal (0).
+    expect(comparePrerelease("rc.1", "beta")).toBeGreaterThan(0);
+    expect(comparePrerelease("beta", "rc.1")).toBeLessThan(0);
+    expect(comparePrerelease("1", "2")).toBeLessThan(0);
+    expect(comparePrerelease("2", "10")).toBeLessThan(0); // numeric, not lexicographic
+    expect(comparePrerelease("alpha", "alpha.1")).toBeLessThan(0);
+    expect(comparePrerelease("rc.1.1", "rc.1")).toBeGreaterThan(0);
+    expect(comparePrerelease("same", "same")).toBe(0);
   });
 
   it("rejects an installed axe below the minimum with a named error", () => {
@@ -58,6 +87,23 @@ describe("axe version gate — comparator (#871 AC5)", () => {
     expect(assertAxeVersion({ axePath: fixturePath, minimum: "4.14.0" })).toBe("4.14.0");
   });
 
+  it("rejects a pre-release of the minimum", () => {
+    const fixturePath = fixtureAxe("4.14.0-rc.1");
+    expect(() => assertAxeVersion({ axePath: fixturePath, minimum: "4.14.0" })).toThrowError(AxeVersionError);
+  });
+
+  it("rejects a manifest whose name is not axe-core (foreign or mis-planted manifest)", () => {
+    const fixturePath = fixtureAxe("4.14.1", "not-axe");
+    try {
+      assertAxeVersion({ axePath: fixturePath, minimum: "4.14.0" });
+      expect.unreachable("a foreign manifest must fail closed");
+    } catch (err) {
+      const e = err as AxeVersionError;
+      expect(e.name).toBe("AxeVersionError");
+      expect(e.message).toContain('name "not-axe"');
+    }
+  });
+
   it("the REAL installed axe-core beside the injected bundle is >= 4.14.0", () => {
     const realAxePath = resolve(e2eDir, "../node_modules/axe-core/axe.min.js");
     const version = assertAxeVersion({ axePath: realAxePath, minimum: "4.14.0" });
@@ -66,8 +112,13 @@ describe("axe version gate — comparator (#871 AC5)", () => {
 });
 
 describe("axe version gate — production wiring pin (#871 AC5)", () => {
-  const matrixSpec = readFileSync(resolve(e2eDir, "a11y-matrix.spec.ts"), "utf-8");
-  const extensionsSpec = readFileSync(resolve(e2eDir, "accessibility_gate_extensions.spec.ts"), "utf-8");
+  // Comment-blind pins are theater (feedback round F-009/TEST-010): a
+  // commented-out assertAxeVersion call used to satisfy the regex. Strip
+  // comments BEFORE matching so only live code settles the pin.
+  const stripComments = (source: string) =>
+    source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/^\s*\/\/.*$/gm, "");
+  const matrixSpec = stripComments(readFileSync(resolve(e2eDir, "a11y-matrix.spec.ts"), "utf-8"));
+  const extensionsSpec = stripComments(readFileSync(resolve(e2eDir, "accessibility_gate_extensions.spec.ts"), "utf-8"));
 
   it("a11y-matrix.spec.ts invokes the gate on the SAME path it injects", () => {
     expect(matrixSpec).toMatch(/assertAxeVersion\(\{\s*axePath:\s*AXE_PATH/);

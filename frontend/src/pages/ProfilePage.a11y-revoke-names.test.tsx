@@ -132,4 +132,19 @@ describe("ProfilePage a11y revoke names (#1159 AC3)", () => {
       expect(screen.getByRole("button", { name: "Revoke — current session cannot be revoked here" })).toBeInTheDocument()
     );
   });
+
+  it("sessions missing device and IP data fall back to the named placeholders (feedback round F-010)", async () => {
+    // Feedback round: the `|| "Unknown device"` / `|| "unknown IP"`
+    // fallbacks at ProfilePage.tsx:499 were never exercised. A session row
+    // with a null user_agent and ip_address must still produce an
+    // identifying name (id present, placeholders in place).
+    const sparseSessions = [
+      { id: 201, user_id: 1, user_agent: null, ip_address: null, created_at: "2026-11-23T10:00:00Z", expires_at: "2027-01-01T00:00:00Z", is_current: false },
+    ];
+    api.listSessions.mockResolvedValue({ sessions: sparseSessions });
+    render(<ProfilePage />);
+    const btn = await screen.findByRole("button", { name: /^Revoke session 201: Unknown device \(unknown IP\)$/ });
+    expect(btn).toBeInTheDocument();
+    expect(btn.getAttribute("aria-label")).toBe("Revoke session 201: Unknown device (unknown IP)");
+  });
 });
