@@ -52,14 +52,15 @@
   `quality-contracts` recipe, and all EIGHT script-inventory mirrors
   (`AGENTS.md`, `docs/engineering/conventions.md`,
   `docs/engineering/testing.md`, `CONTRIBUTING.md`, the
-  `ci-compatibility-audit` and `ci-fix-monitor` skills); contract tests in
+  `ci-compatibility-audit` and `ci-fix-monitor` skills); contract tests (13) in
   `backend/tests/test_double_hold_guardrail.py`.
 
 ## Why
 
 - #1209: the sanitizer executed on the event-loop thread in both
   completion paths (the thread-placement defect #1209 names; the same
-  class was fixed for chat.py call sites under #1202, and LLMClient was
+  class was fixed for chat.py call sites under #1202 (whose PR #1211 has since
+merged), and LLMClient was
   the deferred residual). Loop responsiveness under expensive regex
   passes is a separate, still-open property owned by #1215.
 - #1199: the 18 organizations handlers held two pooled SQLite connections
