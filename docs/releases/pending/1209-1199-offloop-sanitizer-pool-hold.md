@@ -2,7 +2,12 @@
 
 ## What changed
 
-- **#1209** — `backend/app/services/llm_client.py`: both completion paths
+- **#1209** — `backend/app/services/llm_client.py` (note: the sanitizer
+  now runs on the asyncio DEFAULT thread pool, which it shares with
+  handler SQL dispatch; pool CHECKOUTS stay on their dedicated executor;
+  executor-occupancy isolation is routed to #1215 alongside the loop-stall
+  bound, and cancellation abandons the worker — the pass runs to
+  completion): both completion paths
   (`chat_completion` and the non-SSE branch of `chat_completion_stream`)
   now dispatch `_strip_thinking_content` through `asyncio.to_thread`, so
   the regex-heavy assistant sanitizer (five `re.sub` passes plus a
@@ -14,14 +19,24 @@
   regex pass still holds the GIL for its duration, so a single expensive
   pass can still stall the loop (adversarial input measured at 421s wall /
   421s max heartbeat gap off-thread); that residual is tracked in #1215.
-- **#1199** — `backend/app/api/routes/organizations.py`: all 18 handlers
-  migrated from a second standalone `pool.get_connection_async()` checkout
-  to the request-scoped `db: sqlite3.Connection = Depends(get_db)`
-  connection shared with the `require_role` auth chain (the pattern PR #1198
-  shipped for users.py). One pooled checkout and one release per request
-  now holds across success, pre-auth denial, authenticated in-handler 403,
-  and exception outcomes — pinned by the five-leg counting-pool spec
-  (`backend/tests/test_p02c_orgs_pool_single_connection.py`).
+- **#1199** — scope corrected to the code-verified double-hold class:
+  all 18 `backend/app/api/routes/organizations.py` handlers migrated from a
+  second standalone `pool.get_connection_async()` checkout to the
+  request-scoped `db: sqlite3.Connection = Depends(get_db)` connection
+  shared with the `require_role` auth chain (the pattern PR #1198 shipped
+  for users.py). One pooled checkout and one release per request now holds
+  across success, pre-auth denial, authenticated in-handler 403, and
+  exception outcomes — pinned by the five-leg counting-pool spec
+  (`backend/tests/test_p02c_orgs_pool_single_connection.py`). The issue's
+  published AC1 (prompts.py count 0) and AC2 (service_accounts.py count 0)
+  are REFUTED, not met: every handler in those files authenticates via
+  `require_scope` (header-only — `backend/app/security/__init__.py:434-462`,
+  no pool use anywhere in the dependency), and the pool checkout the issue's
+  triage attributed to that chain at `security/__init__.py:501` actually
+  lives inside `require_service_account` (:465+), which acquires AND
+  releases inside the dependency — one connection per request there, no
+  double-hold. The guardrail (0 violations at head, CI-wired) is the
+  ongoing check for the corrected class.
 - Nine direct-caller/race harness suites migrated to the `db=` call-site
   seam (distinct connections per simulated request preserved).
 - New Quality-contracts guardrail `scripts/check_double_hold_routes.py`
@@ -55,5 +70,10 @@ guardrail).
 
 - Direct Python callers of the migrated organizations handlers must now
   pass `db=` (HTTP contract unchanged).
-- The guardrail fails closed: a new `Depends(require_...)`-shaped auth
-  dependency must be classified in the script's holding/non-holding sets.
+- The guardrail fails closed within its scanned lane (handler-signature
+  `Depends(require_*...)`/`Depends(get_current*...)` defaults): a new
+  auth dependency declared there must be classified in the script's
+  holding/non-holding sets. Router-level `APIRouter(dependencies=[...])`,
+  `Annotated`-style params, `head`/`options` decorators, and acquisitions
+  extracted into module-level helpers are outside the scan (documented in
+  the script; widening is tracked follow-up work).

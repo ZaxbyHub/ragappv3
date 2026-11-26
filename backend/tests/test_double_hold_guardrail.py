@@ -5,7 +5,7 @@ against the live routes tree proves only that today's known shape is
 recognized; these tests pin its CONTRACTS on synthetic sources so each rule
 and classification is proven to bite independently of the live tree:
 
-- unknown auth dependency fails closed (C-DBLHOLD-2)
+- unknown require_*/get_current*-prefixed handler-default dependency fails closed (C-DBLHOLD-2 scanned lane)
 - every acquisition form is detected under a holding dependency
   (get_connection_async, get_connection, connection_async, connection)
 - a direct Depends(get_db) default is itself a holding dependency
