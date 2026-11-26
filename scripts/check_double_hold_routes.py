@@ -16,11 +16,18 @@ Contracts enforced:
       (``.get_connection_async()`` / ``.get_connection()`` /
       ``.connection_async()`` / ``.connection()``) in its subtree.
 
-  C-DBLHOLD-2 (fail-closed): any handler whose defaults carry a
-      ``Depends(require_...)`` or ``Depends(get_current...)``-shaped call
-      NOT in the classified sets (holding or non-holding) is reported as a
-      violation naming the handler — an unclassified auth dependency can
-      never silently pass the gate.
+  C-DBLHOLD-2 (fail-closed within the scanned lane): any handler whose
+      PARAMETER DEFAULTS carry a bare ``Depends(require_...)`` or
+      ``Depends(get_current...)``-shaped call NOT in the classified sets
+      (holding or non-holding) is reported as a violation naming the
+      handler. KNOWN LIMITATIONS of the scanned lane (deliberate for this
+      gate's first rung; widening is tracked follow-up work): router-level
+      ``APIRouter(dependencies=[...])`` attachments, ``Annotated[..., Depends(...)]``
+      parameters, alias-imported names, ``head``/``options``/``trace``/
+      ``api_route`` decorators, and pool acquisitions extracted into
+      module-level helpers are NOT scanned — new auth gates should be
+      declared as handler-default ``Depends(...)`` calls with classified
+      names, and acquisitions belong inside the handler body.
 
   C-DBLHOLD-3: no route handler with a HOLDING dependency may call
       ``.release_connection(...)`` manually — with the request-scoped
