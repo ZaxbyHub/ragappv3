@@ -1285,10 +1285,37 @@ async def lifespan(app: FastAPI):
 
         await drain_inflight_upload_commits()
     except Exception as exc:
-        # Shutdown must still close the pool; record why the drain failed.
+        # The finalizer gate below decides whether the pool can close; record
+        # why the upload drain could not settle first.
         logger.warning(
             "Upload commit drain failed during shutdown: %s", type(exc).__name__
         )
+    await _finalize_turns_and_close_pool(app)
+    try:
+        from app.services.auth_service import _auth_executor
+        _auth_executor.shutdown(wait=False)
+    except Exception:
+        pass
+    with contextlib_suppress(Exception):
+        # PR #1113 (swarm-pr-review N-05a): the wiki lint scan executor is
+        # created at routes import time; shut it down with the same
+        # convention as the auth/curator executors so a queued scan does
+        # not extend interpreter exit.
+        from app.api.routes.wiki import _WIKI_LINT_EXECUTOR
+        _WIKI_LINT_EXECUTOR.shutdown(wait=False)
+    with contextlib_suppress(Exception):
+        from app.services import redis_io
+        redis_io.shutdown_executor()
+
+
+async def _finalize_turns_and_close_pool(app) -> None:
+    """Drain durable turn finalizers, then close the pool only when safe.
+
+    Keeping this decision in one runtime-testable function makes an
+    unconditional close (or a close that races a live finalizer) observable
+    instead of relying on source-order inspection alone.
+    """
+    turn_finalizers_drained = False
     try:
         # Issue #1202: cancellation finalizes run on a worker; drain them before
         # the pool becomes unusable, or an interrupted turn can be lost.
@@ -1306,26 +1333,14 @@ async def lifespan(app: FastAPI):
             getattr(entry, "task", None)
             for entry in list(_turn_registry().values())
         ]
-        await shutdown_turn_finalizers(
+        turn_finalizers_drained = await shutdown_turn_finalizers(
             producers,
-            app.state.db_pool,
             TURN_PRODUCER_SHUTDOWN_TIMEOUT_SECONDS,
             TURN_FINALIZE_DRAIN_TIMEOUT_SECONDS,
         )
-    except Exception:
-        pass
-    try:
-        from app.services.auth_service import _auth_executor
-        _auth_executor.shutdown(wait=False)
-    except Exception:
-        pass
-    with contextlib_suppress(Exception):
-        # PR #1113 (swarm-pr-review N-05a): the wiki lint scan executor is
-        # created at routes import time; shut it down with the same
-        # convention as the auth/curator executors so a queued scan does
-        # not extend interpreter exit.
-        from app.api.routes.wiki import _WIKI_LINT_EXECUTOR
-        _WIKI_LINT_EXECUTOR.shutdown(wait=False)
-    with contextlib_suppress(Exception):
-        from app.services import redis_io
-        redis_io.shutdown_executor()
+    except Exception as exc:
+        logger.warning(
+            "Durable turn finalizer shutdown check failed: %s", type(exc).__name__
+        )
+    if turn_finalizers_drained:
+        app.state.db_pool.close_all()

@@ -31,7 +31,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -231,8 +231,6 @@ async def test_cancellation_backstop_finalizes_interrupted_turn_off_the_event_lo
 
 async def test_shutdown_helper_persists_accepted_durable_turn(env):
     """shutdown_turn_finalizers drains a real submitted finalize before close."""
-    from unittest.mock import MagicMock
-
     original = chat_routes._finalize_durable_turn_sync
     started = threading.Event()
     release = threading.Event()
@@ -253,14 +251,12 @@ async def test_shutdown_helper_persists_accepted_durable_turn(env):
         assert not producer.done()
         await _cancel_and_await(producer)
         assert started.wait(timeout=2.0)
-        closed = MagicMock()
         helper = asyncio.create_task(
-            chat_routes.shutdown_turn_finalizers([], closed, 0.01, 5.0)
+            chat_routes.shutdown_turn_finalizers([], 0.01, 5.0)
         )
         await asyncio.sleep(0.05)
         release.set()
         assert await helper
-        closed.close_all.assert_called_once()
         rows = [r for r in env.rows() if r[0] == "assistant"]
         assert len(rows) == 1
         assert rows[0][1] == "interrupted"
@@ -268,6 +264,48 @@ async def test_shutdown_helper_persists_accepted_durable_turn(env):
     finally:
         release.set()
         chat_routes._finalize_durable_turn_sync = original
+        await _cancel_and_await(producer)
+
+
+async def test_eager_finalize_registers_on_producer_thread(env):
+    """The stream must register the eager finalize before its first await.
+
+    Moving that submission into ``asyncio.to_thread`` reopens the window in
+    which shutdown can retire the producer before the finalize future is
+    tracked; this test fails on that mutation.
+    """
+    loop_thread = threading.get_ident()
+    submit_threads = []
+    original_submit = chat_routes._submit_durable_turn_finalize_future
+
+    def recording_submit(*args, **kwargs):
+        submit_threads.append(threading.get_ident())
+        return original_submit(*args, **kwargs)
+
+    env.gate.set()
+    response = env.make_stream("eager-registration-1")
+    entry = chat_routes._turn_registry().get((env.session_id, "eager-registration-1"))
+    assert entry is not None and entry.task is not None
+    producer = entry.task
+    try:
+        with patch.object(
+            chat_routes,
+            "_submit_durable_turn_finalize_future",
+            recording_submit,
+        ):
+            async for _chunk in response.body_iterator:
+                pass
+            deadline = time.monotonic() + 10
+            while not producer.done() and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+        assert submit_threads, "the eager finalize was never submitted"
+        assert submit_threads == [loop_thread], (
+            f"eager finalize registered off the producer thread: {submit_threads}"
+        )
+        rows = [r for r in env.rows() if r[0] == "assistant"]
+        assert len(rows) == 1
+        assert rows[0][1] == "complete"
+    finally:
         await _cancel_and_await(producer)
 
 
@@ -418,23 +456,38 @@ def test_cancellation_backstop_lifespan_calls_drain_before_pool_close():
             and predicate(node)
         ]
 
-    helper_lines = shutdown_calls(
+    shutdown_helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_finalize_turns_and_close_pool"
+    )
+    helper_lines = [
+        node.lineno
+        for node in ast.walk(shutdown_helper)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "shutdown_turn_finalizers"
+    ]
+    close_lines = [
+        node.lineno
+        for node in ast.walk(shutdown_helper)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "close_all"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "db_pool"
+    ]
+    assert shutdown_calls(
         lambda n: (
             isinstance(n.func, ast.Name)
-            and n.func.id == "shutdown_turn_finalizers"
+            and n.func.id == "_finalize_turns_and_close_pool"
         )
-    )
-    close_lines = shutdown_calls(
-        lambda n: (
-            isinstance(n.func, ast.Attribute)
-            and n.func.attr == "close_all"
-            and isinstance(n.func.value, ast.Attribute)
-            and n.func.value.attr == "db_pool"
-        )
-    )
-    assert helper_lines, "lifespan shutdown never CALLS the finalize helper"
-    assert not close_lines, (
-        "pool close must stay inside shutdown_turn_finalizers after the drain"
+    ), "lifespan shutdown never CALLS the finalize/close helper"
+    assert helper_lines, "shutdown helper never CALLS the finalize drain"
+    assert close_lines, "shutdown helper never closes the DB pool"
+    assert min(close_lines) > min(helper_lines), (
+        "pool close must run after the finalize helper reports the drain"
     )
 
 

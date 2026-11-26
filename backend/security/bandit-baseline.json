@@ -28,15 +28,15 @@
       "skipped_tests": 1
     },
     "_totals": {
-      "CONFIDENCE.HIGH": 34,
+      "CONFIDENCE.HIGH": 33,
       "CONFIDENCE.LOW": 25,
       "CONFIDENCE.MEDIUM": 69,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 6,
-      "SEVERITY.LOW": 59,
+      "SEVERITY.LOW": 58,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 104823,
+      "loc": 104860,
       "nosec": 0,
       "skipped_tests": 73
     },
@@ -127,7 +127,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3281,
+      "loc": 3307,
       "nosec": 0,
       "skipped_tests": 7
     },
@@ -444,15 +444,15 @@
       "skipped_tests": 2
     },
     "backend/app/lifespan.py": {
-      "CONFIDENCE.HIGH": 7,
+      "CONFIDENCE.HIGH": 6,
       "CONFIDENCE.LOW": 0,
       "CONFIDENCE.MEDIUM": 0,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 7,
+      "SEVERITY.LOW": 6,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 975,
+      "loc": 986,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3433,7 +3433,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "1314         )\n1315     except Exception:\n1316         pass\n1317     try:\n",
+      "code": "1296         _auth_executor.shutdown(wait=False)\n1297     except Exception:\n1298         pass\n1299     with contextlib_suppress(Exception):\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3444,31 +3444,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1315,
+      "line_number": 1297,
       "line_range": [
-        1315,
-        1316
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
-      "test_id": "B110",
-      "test_name": "try_except_pass"
-    },
-    {
-      "code": "1319         _auth_executor.shutdown(wait=False)\n1320     except Exception:\n1321         pass\n1322     with contextlib_suppress(Exception):\n",
-      "col_offset": 4,
-      "end_col_offset": 12,
-      "filename": "backend/app/lifespan.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 703,
-        "link": "https://cwe.mitre.org/data/definitions/703.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1320,
-      "line_range": [
-        1320,
-        1321
+        1297,
+        1298
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",

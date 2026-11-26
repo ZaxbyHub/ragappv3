@@ -119,24 +119,36 @@ async def _retire_turn_producers(tasks, timeout: float) -> set:
     return pending
 
 
-async def shutdown_turn_finalizers(producers, db_pool, producer_timeout, drain_timeout) -> bool:
-    """Retire producers before draining; never close the pool with live producers."""
-    pending = await _retire_turn_producers(producers, producer_timeout)
-    if pending:
+async def shutdown_turn_finalizers(producers, producer_timeout, drain_timeout) -> bool:
+    """Retire producers before draining; report whether the pool may close.
+
+    The outer timeout covers executor queue time as well as the drain's own
+    wait. A timeout is never reported as a successful drain.
+    """
+    try:
+        async with asyncio.timeout(producer_timeout + drain_timeout):
+            pending = await _retire_turn_producers(producers, producer_timeout)
+            if pending:
+                logger.warning(
+                    "Durable turn producers still active at shutdown; leaving "
+                    "executor and DB pool open for their finalizers"
+                )
+                return False
+            drained = await asyncio.to_thread(
+                _drain_turn_finalize_executor, drain_timeout
+            )
+            if not drained:
+                logger.warning(
+                    "Durable finalize drain timed out; leaving DB pool open so "
+                    "queued finalizers can finish before interpreter exit"
+                )
+            return drained
+    except TimeoutError:
         logger.warning(
-            "Durable turn producers still active at shutdown; leaving "
-            "executor and DB pool open for their finalizers"
+            "Durable finalize shutdown exceeded its total budget; leaving "
+            "executor and DB pool open"
         )
         return False
-    drained = await asyncio.to_thread(_drain_turn_finalize_executor, drain_timeout)
-    if drained:
-        db_pool.close_all()
-    else:
-        logger.warning(
-            "Durable finalize drain timed out; leaving DB pool open so "
-            "queued finalizers can finish before interpreter exit"
-        )
-    return drained
 
 
 def _drain_turn_finalize_executor(timeout=None) -> bool:
@@ -156,13 +168,15 @@ def _drain_turn_finalize_executor(timeout=None) -> bool:
     return True
 
 
-def _submit_durable_turn_finalize(
+def _submit_durable_turn_finalize_future(
     db_pool, turn_state: Dict[str, Any], status: str
-) -> bool:
-    """Hand the cancellation finalize to the worker; never wait for it.
+):
+    """Return the tracked finalize future, or None when no worker is available.
 
-    No inline fallback: that would put the sanitizer back on the event loop
-    and violate #1202 AC1. A failure to create a worker is logged and skipped.
+    Both the eager post-completion path and the cancellation backstop use this
+    seam, so shutdown's drain accounts for every finalizer that can touch the
+    pool. No inline fallback is allowed: it would put the sanitizer back on the
+    event loop and violate #1202 AC1.
     """
     try:
         with _TURN_FINALIZE_FUTURES_LOCK:
@@ -172,9 +186,21 @@ def _submit_durable_turn_finalize(
             _TURN_FINALIZE_FUTURES.add(future)
     except RuntimeError as exc:
         logger.warning("durable turn finalize worker unavailable (%s); skipped", exc)
-        return False
+        return None
     future.add_done_callback(_discard_turn_finalize_future)
-    return True
+    return future
+
+
+def _submit_durable_turn_finalize(
+    db_pool, turn_state: Dict[str, Any], status: str
+) -> bool:
+    """Hand the cancellation finalize to the worker; never wait for it."""
+    return _submit_durable_turn_finalize_future(db_pool, turn_state, status) is not None
+
+
+def _wait_durable_turn_finalize(future) -> bool:
+    """Wait off-loop for an already-registered finalize future."""
+    return bool(future.result())
 
 
 def _require_session_owner_or_admin(session_owner_id, user: dict) -> None:
@@ -1634,13 +1660,18 @@ def stream_chat_response(
                     # inside the helper, inside the thread; only a successful
                     # return sets the finalized flag.
                     if turn_state["prewrite_ok"]:
-                        await asyncio.to_thread(
-                            _finalize_durable_turn_sync,
+                        # Register on the event-loop thread before the await so
+                        # a shutdown cancellation cannot land in the window
+                        # between starting the worker and tracking its future.
+                        eager_future = _submit_durable_turn_finalize_future(
                             db_pool,
                             turn_state,
                             turn_state["status"] or _TURN_STATUS_INTERRUPTED,
                         )
-                        turn_state["finalized"] = True
+                        if eager_future is not None and await asyncio.to_thread(
+                            _wait_durable_turn_finalize, eager_future
+                        ):
+                            turn_state["finalized"] = True
                 finally:
                     # Cancellation backstop (#553 semantics, producer-owned):
                     # shutdown cancels this task and lands here during
