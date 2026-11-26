@@ -124,6 +124,15 @@ case with an expected outcome, then compare before/after replays
 (`POST /api/quality/eval-cases/{id}/compare`) — a reported failure must be
 replayable against the same inputs and comparable after the fix.
 
+If the referenced message, session or report is deleted between the handler's
+lookup and its write, the report endpoints answer the route's documented 404
+(`Session not found`, `Message not found in this session`, or `Quality report
+not found`) rather than mapping the constraint failure to the duplicate-submit
+winner or returning HTTP 500. A retry of the same `(message_id, category)`
+identity still returns the canonical row. A differing note from a second
+authorized user is folded into the canonical note with the repo's ` || `
+convention and the submitter id; an identical retry is a no-op.
+
 ## Trace-based evaluation (E09, deferred)
 
 Evaluating over OTLP traces (question, retrieved contexts, answer captured

@@ -8,11 +8,14 @@ the RAG engine for context-aware responses.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import sqlite3
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack
 from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple, Union
 
@@ -59,6 +62,7 @@ from app.services.wiki_citation_helpers import (
 from app.services.wiki_store import WikiStore
 from app.utils.assistant_sanitizer import sanitize_chat_messages_content
 from app.utils.request_context import request_id_var
+from app.utils.sqlite_errors import is_unique_violation
 
 # Track background tasks to prevent garbage collection
 _background_tasks: Set[asyncio.Task] = set()
@@ -74,6 +78,187 @@ router = APIRouter()
 CHAT_HEARTBEAT_INTERVAL = 15.0  # seconds
 
 logger = logging.getLogger(__name__)
+
+
+_TURN_FINALIZE_EXECUTOR = None
+_TURN_FINALIZE_FUTURES = set()
+_TURN_FINALIZE_FUTURES_LOCK = threading.Lock()
+
+TURN_FINALIZE_DRAIN_TIMEOUT_SECONDS = 10.0
+TURN_PRODUCER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
+
+def _get_turn_finalize_executor():
+    """Lazily create the process-wide worker for cancellation finalization.
+
+    Called from a finally block reached while CancelledError unwinds, where an
+    await would lose the interrupted row. The submitter never waits on the
+    future; lifespan drains this executor before closing the DB pool.
+    """
+    global _TURN_FINALIZE_EXECUTOR
+    if _TURN_FINALIZE_EXECUTOR is None:
+        _TURN_FINALIZE_EXECUTOR = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="chat-turn-finalize"
+        )
+    return _TURN_FINALIZE_EXECUTOR
+
+
+def _discard_turn_finalize_future(future) -> None:
+    with _TURN_FINALIZE_FUTURES_LOCK:
+        _TURN_FINALIZE_FUTURES.discard(future)
+
+
+async def _retire_turn_producers(tasks, timeout: float) -> set:
+    """Cancel live producers and return the still-pending subset."""
+    tasks = [task for task in tasks if task is not None and not task.done()]
+    for task in tasks:
+        task.cancel()
+    if not tasks:
+        return set()
+    _done, pending = await asyncio.wait(tasks, timeout=timeout)
+    return pending
+
+
+async def shutdown_turn_finalizers(producers, producer_timeout, drain_timeout) -> bool:
+    """Retire producers before draining; report whether the pool may close.
+
+    The outer timeout covers executor queue time as well as the drain's own
+    wait. A timeout is never reported as a successful drain.
+    """
+    try:
+        async with asyncio.timeout(producer_timeout + drain_timeout):
+            pending = await _retire_turn_producers(producers, producer_timeout)
+            if pending:
+                logger.warning(
+                    "Durable turn producers still active at shutdown; leaving "
+                    "executor and DB pool open for their finalizers"
+                )
+                return False
+            drained = await asyncio.to_thread(
+                _drain_turn_finalize_executor, drain_timeout
+            )
+            if not drained:
+                logger.warning(
+                    "Durable finalize drain timed out; leaving DB pool open so "
+                    "queued finalizers can finish before interpreter exit"
+                )
+            return drained
+    except TimeoutError:
+        logger.warning(
+            "Durable finalize shutdown exceeded its total budget; leaving "
+            "executor and DB pool open"
+        )
+        return False
+
+
+def _drain_turn_finalize_executor(timeout=None) -> bool:
+    """Wait for queued finalizes before pool close; do not close the worker.
+
+    Production passes a finite bound from lifespan shutdown; isolated tests
+    may pass their own. The executor stays alive for later turns.
+    """
+    with _TURN_FINALIZE_FUTURES_LOCK:
+        futures = list(_TURN_FINALIZE_FUTURES)
+    if not futures:
+        return True
+    _done, not_done = concurrent.futures.wait(futures, timeout=timeout)
+    if not_done:
+        logger.warning("durable turn finalize drain left %d job(s) pending", len(not_done))
+        return False
+    return True
+
+
+def _submit_durable_turn_finalize_future(
+    db_pool, turn_state: Dict[str, Any], status: str
+):
+    """Return the tracked finalize future, or None when no worker is available.
+
+    Both the eager post-completion path and the cancellation backstop use this
+    seam, so shutdown's drain accounts for every finalizer that can touch the
+    pool. No inline fallback is allowed: it would put the sanitizer back on the
+    event loop and violate #1202 AC1.
+    """
+    try:
+        with _TURN_FINALIZE_FUTURES_LOCK:
+            future = _get_turn_finalize_executor().submit(
+                _finalize_durable_turn_sync, db_pool, turn_state, status
+            )
+            _TURN_FINALIZE_FUTURES.add(future)
+    except RuntimeError as exc:
+        logger.warning("durable turn finalize worker unavailable (%s); skipped", exc)
+        return None
+    future.add_done_callback(_discard_turn_finalize_future)
+    return future
+
+
+def _submit_durable_turn_finalize(
+    db_pool, turn_state: Dict[str, Any], status: str
+) -> bool:
+    """Hand the cancellation finalize to the worker; never wait for it."""
+    return _submit_durable_turn_finalize_future(db_pool, turn_state, status) is not None
+
+
+def _wait_durable_turn_finalize(future) -> bool:
+    """Wait off-loop for an already-registered finalize future."""
+    return bool(future.result())
+
+
+def _require_session_owner_or_admin(session_owner_id, user: dict) -> None:
+    """Refuse a member who neither owns the session nor administers it.
+
+    A legacy NULL owner stays shared-vault-accessible; the caller has already
+    checked the vault, so this check only adds the owner dimension.
+    """
+    if (
+        session_owner_id is not None
+        and session_owner_id != user["id"]
+        and user.get("role") not in ("superadmin", "admin")
+    ):
+        raise HTTPException(
+            status_code=403, detail="Cannot modify another user's session"
+        )
+
+
+def _reject_over_cap_user_content(content: str) -> None:
+    """Enforce the #922 user-message cap on the two durable write routes."""
+    cap = settings.chat_message_max_chars
+    if len(content) > cap:
+        raise HTTPException(
+            status_code=422,
+            detail=f"the message exceeds chat_message_max_chars ({cap} characters)",
+        )
+
+
+ASSISTANT_CHARS_PER_TOKEN = 8
+"""Characters-per-token allowance used to scale the assistant backstop with the
+live thinking-mode budget. Eight is deliberately above average tokenizer density
+so a legitimate answer at the configured token ceiling still saves (#1202 AC22)."""
+
+
+def _effective_assistant_cap() -> int:
+    """The assistant backstop follows the live thinking-mode token budget."""
+    return max(
+        settings.assistant_message_max_chars,
+        settings.thinking_max_tokens * ASSISTANT_CHARS_PER_TOKEN,
+    )
+
+
+def _reject_over_cap_assistant_content(content: str, allowed_cap: int | None = None) -> None:
+    """Bound assistant-role bodies on the durable write routes (#1202/#922).
+
+    ``allowed_cap`` is used only for a #553 reconcile of a row the server
+    already persisted: it may be longer than the current budget after an
+    operator lowers ``thinking_max_tokens``, but it may never grow.
+    """
+    cap = _effective_assistant_cap() if allowed_cap is None else allowed_cap
+    if len(content) > cap:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"the message exceeds assistant_message_max_chars effective ceiling "
+                f"({cap} characters; configured floor {settings.assistant_message_max_chars})"
+            ),
+        )
 
 # Inline generation-control modes (issue #510). Hoisted to module-level
 # aliases (PRR-022) so the request models and the stream/non-stream helper
@@ -678,7 +863,9 @@ def _prewrite_user_turn(
                     (session_id, turn_id, new_id),
                 )
                 conn.commit()
-            except sqlite3.IntegrityError:
+            except sqlite3.IntegrityError as exc:
+                if not is_unique_violation(exc):
+                    raise
                 # Double delivery of the same stream POST: the user row for
                 # this turn already exists. Durability is already guaranteed;
                 # clear the failed statement and keep server-side writes on.
@@ -798,7 +985,9 @@ def _upsert_assistant_turn(conn, payload: Dict[str, Any]) -> None:
                 new_id,
             ),
         )
-    except sqlite3.IntegrityError:
+    except sqlite3.IntegrityError as exc:
+        if not is_unique_violation(exc):
+            raise
         # A concurrent finalize won the race (e.g. the eager path racing the
         # disconnect backstop). Adopt the surviving row: clear the failed
         # statement, re-SELECT, and update it in place.
@@ -1262,8 +1451,8 @@ def stream_chat_response(
         # content is the canonical text — citation-repaired when repairs
         # applied, sanitized either way (issue #1153 AC1: answer wrapper tags
         # never survive into the canonical/persisted content).
-        canonical_content, canonical_differs = _canonical_done_content(
-            full_content, repaired_content
+        canonical_content, canonical_differs = await asyncio.to_thread(
+            _canonical_done_content, full_content, repaired_content
         )
         turn_state["status"] = _TURN_STATUS_COMPLETE
         turn_state["payload"]["content"] = canonical_content
@@ -1471,13 +1660,18 @@ def stream_chat_response(
                     # inside the helper, inside the thread; only a successful
                     # return sets the finalized flag.
                     if turn_state["prewrite_ok"]:
-                        await asyncio.to_thread(
-                            _finalize_durable_turn_sync,
+                        # Register on the event-loop thread before the await so
+                        # a shutdown cancellation cannot land in the window
+                        # between starting the worker and tracking its future.
+                        eager_future = _submit_durable_turn_finalize_future(
                             db_pool,
                             turn_state,
                             turn_state["status"] or _TURN_STATUS_INTERRUPTED,
                         )
-                        turn_state["finalized"] = True
+                        if eager_future is not None and await asyncio.to_thread(
+                            _wait_durable_turn_finalize, eager_future
+                        ):
+                            turn_state["finalized"] = True
                 finally:
                     # Cancellation backstop (#553 semantics, producer-owned):
                     # shutdown cancels this task and lands here during
@@ -1490,12 +1684,14 @@ def stream_chat_response(
                         turn_state["prewrite_ok"]
                         and not turn_state["finalized"]
                     ):
-                        _finalize_durable_turn_sync(
+                        if _submit_durable_turn_finalize(
                             db_pool,
                             turn_state,
                             turn_state["status"] or _TURN_STATUS_INTERRUPTED,
-                        )
-                        turn_state["finalized"] = True
+                        ):
+                            # Ownership transferred to the finalize worker;
+                            # the row is written asynchronously by that worker.
+                            turn_state["finalized"] = True
                     # Guarantee readers terminate: a turn cut off before its
                     # terminal frame (shutdown mid-generation) gets the
                     # protocol error+done pair appended pure-sync, so a late
@@ -1883,7 +2079,9 @@ async def non_stream_chat_response(
 
     # Sanitize as final defense in depth — strips any residual thinking
     # traces before the response leaves the API boundary.
-    full_content = sanitize_chat_messages_content(full_content)
+    full_content = await asyncio.to_thread(
+        sanitize_chat_messages_content, full_content
+    )
 
     # Enqueue post-answer wiki compile job (non-blocking, same as streaming path).
     if vault_id is not None and (wiki_used or sources or memories_used):
@@ -2094,7 +2292,7 @@ async def get_stream_auth(
         durable_session_vault = None
         if body.session_id is not None:
             durable_session_row = conn.execute(
-                "SELECT id, vault_id FROM chat_sessions WHERE id = ?",
+                "SELECT id, vault_id, user_id FROM chat_sessions WHERE id = ?",
                 (body.session_id,),
             ).fetchone()
             if durable_session_row is None:
@@ -2141,6 +2339,7 @@ async def get_stream_auth(
                 raise HTTPException(
                     status_code=403, detail="No write access to this vault"
                 )
+            _require_session_owner_or_admin(durable_session_row[2], user)
         # Stash the role-derived flags on the user dict so chat_stream can
         # thread them into the RAG engine without re-opening a connection.
         user["_include_global_memories"] = is_admin
@@ -3164,7 +3363,7 @@ async def add_message(
     Updates the session's updated_at timestamp.
     """
     # Verify session exists
-    session_query = "SELECT id, title, vault_id FROM chat_sessions WHERE id = ?"
+    session_query = "SELECT id, title, vault_id, user_id FROM chat_sessions WHERE id = ?"
     session_result = await asyncio.to_thread(conn.execute, session_query, (session_id,))
     session_row = await asyncio.to_thread(session_result.fetchone)
 
@@ -3173,6 +3372,11 @@ async def add_message(
 
     if not await evaluate(user, "vault", session_row[2], "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
+    _require_session_owner_or_admin(session_row[3], user)
+    if body.role == "user":
+        _reject_over_cap_user_content(body.content)
+    elif body.role == "assistant":
+        _reject_over_cap_assistant_content(body.content)
 
     # Check if this is the first message
     count_query = "SELECT COUNT(*) FROM chat_messages WHERE session_id = ?"
@@ -3215,7 +3419,7 @@ async def add_message(
     # any thinking/reasoning trace that slipped past the LLM-time stripper or
     # was injected by a misbehaving client. User content is left untouched.
     persisted_content = (
-        sanitize_chat_messages_content(body.content)
+        await asyncio.to_thread(sanitize_chat_messages_content, body.content)
         if body.role == "assistant"
         else body.content
     )
@@ -3432,7 +3636,7 @@ async def add_messages_batch(
     row regardless of network timing. Any failure rolls back the whole batch —
     a retry can never duplicate a successful sibling write.
     """
-    session_query = "SELECT id, title, vault_id FROM chat_sessions WHERE id = ?"
+    session_query = "SELECT id, title, vault_id, user_id FROM chat_sessions WHERE id = ?"
     session_result = await asyncio.to_thread(conn.execute, session_query, (session_id,))
     session_row = await asyncio.to_thread(session_result.fetchone)
 
@@ -3441,15 +3645,36 @@ async def add_messages_batch(
 
     if not await evaluate(user, "vault", session_row[2], "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
-
+    _require_session_owner_or_admin(session_row[3], user)
     # Validate and prepare every row BEFORE touching the database so a bad row
-    # cannot leave a partially applied turn behind.
+    # cannot leave a partially applied turn behind. The durable-row lookup is
+    # hoisted here from the write loop so a #553 reconcile can be bounded by
+    # the length the server already persisted: it may shorten or re-post that
+    # answer after the operator lowers the budget, but a client cannot use a
+    # small bootstrapped row to grow an unbounded assistant body.
     prepared = []
     for item in body.messages:
+        existing_id: Optional[int] = None
+        existing_length = 0
+        if item.turn_id:
+            existing_result = await asyncio.to_thread(
+                conn.execute,
+                "SELECT id, LENGTH(content) FROM chat_messages "
+                "WHERE session_id = ? AND turn_id = ? AND role = ?",
+                (session_id, item.turn_id, item.role),
+            )
+            existing_row = await asyncio.to_thread(existing_result.fetchone)
+            if existing_row is not None:
+                existing_id, existing_length = existing_row[0], existing_row[1] or 0
+        if item.role == "user":
+            _reject_over_cap_user_content(item.content)
+        elif item.role == "assistant":
+            allowed_cap = max(_effective_assistant_cap(), existing_length)
+            _reject_over_cap_assistant_content(item.content, allowed_cap)
         if not item.content:
             raise HTTPException(status_code=422, detail="Message content must not be empty")
         persisted_content = (
-            sanitize_chat_messages_content(item.content)
+            await asyncio.to_thread(sanitize_chat_messages_content, item.content)
             if item.role == "assistant"
             else item.content
         )
@@ -3468,6 +3693,7 @@ async def add_messages_batch(
                 "claims_json": json.dumps(item.unverifiable_claims) if item.unverifiable_claims else None,
                 "currency_json": json.dumps(item.currency_warnings) if item.currency_warnings else None,
                 "enforcement_json": json.dumps(item.citation_enforcement) if item.citation_enforcement else None,
+                "existing_id": existing_id,
             }
         )
 
@@ -3484,17 +3710,7 @@ async def add_messages_batch(
         # turn_id (pre-#507 clients) keep the legacy insert path verbatim.
         saved_ids: List[int] = []
         for row in prepared:
-            existing_id: Optional[int] = None
-            if row["turn_id"]:
-                existing_result = await asyncio.to_thread(
-                    conn.execute,
-                    "SELECT id FROM chat_messages "
-                    "WHERE session_id = ? AND turn_id = ? AND role = ?",
-                    (session_id, row["turn_id"], row["role"]),
-                )
-                existing_row = await asyncio.to_thread(existing_result.fetchone)
-                if existing_row is not None:
-                    existing_id = existing_row[0]
+            existing_id = row["existing_id"]
             if existing_id is not None:
                 # Issue #1153 AC9 completion fence (F7c): a row the server
                 # already finalized as 'complete' is never downgraded by a
@@ -3696,7 +3912,7 @@ async def truncate_session_messages(
             status_code=422, detail="Truncate requires keep_seq or keep_count"
         )
     boundary = body.keep_seq if body.keep_seq is not None else body.keep_count
-    session_query = "SELECT id, vault_id FROM chat_sessions WHERE id = ?"
+    session_query = "SELECT id, vault_id, user_id FROM chat_sessions WHERE id = ?"
     session_result = await asyncio.to_thread(conn.execute, session_query, (session_id,))
     session_row = await asyncio.to_thread(session_result.fetchone)
 
@@ -3705,6 +3921,7 @@ async def truncate_session_messages(
 
     if not await evaluate(user, "vault", session_row[1], "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
+    _require_session_owner_or_admin(session_row[2], user)
 
     # Issue #684 (T1-13-S-05): when the client states its observed tail, refuse
     # the truncate unless the server's current tail equals it — any mismatch
@@ -3926,7 +4143,7 @@ async def update_session(
     Updates the session's title and updated_at timestamp.
     """
     # Verify session exists and get vault_id
-    select_query = "SELECT id, vault_id FROM chat_sessions WHERE id = ?"
+    select_query = "SELECT id, vault_id, user_id FROM chat_sessions WHERE id = ?"
     select_result = await asyncio.to_thread(conn.execute, select_query, (session_id,))
     select_row = await asyncio.to_thread(select_result.fetchone)
 
@@ -3935,6 +4152,7 @@ async def update_session(
 
     if not await evaluate(user, "vault", select_row[1], "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
+    _require_session_owner_or_admin(select_row[2], user)
 
     # Update session
     update_query = "UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
@@ -3975,7 +4193,7 @@ async def delete_session(
     associated with the session.
     """
     # Verify session exists and get vault_id
-    select_query = "SELECT id, vault_id FROM chat_sessions WHERE id = ?"
+    select_query = "SELECT id, vault_id, user_id FROM chat_sessions WHERE id = ?"
     select_result = await asyncio.to_thread(conn.execute, select_query, (session_id,))
     select_row = await asyncio.to_thread(select_result.fetchone)
 
@@ -3984,6 +4202,7 @@ async def delete_session(
 
     if not await evaluate(user, "vault", select_row[1], "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
+    _require_session_owner_or_admin(select_row[2], user)
 
     # Delete session (CASCADE will delete messages)
     delete_query = "DELETE FROM chat_sessions WHERE id = ?"
