@@ -451,7 +451,9 @@ class AssistantCapTest(_Base):
         )
         self.assertEqual(fresh.status_code, 422, fresh.text)
 
-        # The durable row reconciles even under the lowered budget, in place.
+        # The durable row reconciles in place when the re-post does not grow
+        # past the length the server already persisted, even under the lower
+        # budget. A client-bootstrapped row cannot grow into an uncapped body.
         retry = self.client.post(
             f"/api/chat/sessions/{sid}/messages/batch", json=payload
         )
@@ -463,3 +465,37 @@ class AssistantCapTest(_Base):
         ).fetchall()
         self.assertEqual(len(rows), 1)
         self.assertEqual(len(rows[0][1]), len(long_answer))
+
+        bootstrap_turn = "client-bootstrapped-small-row"
+        bootstrap = self.client.post(
+            f"/api/chat/sessions/{sid}/messages/batch",
+            json={
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "seed",
+                        "turn_id": bootstrap_turn,
+                    }
+                ]
+            },
+        )
+        self.assertEqual(bootstrap.status_code, 200, bootstrap.text)
+        growth = self.client.post(
+            f"/api/chat/sessions/{sid}/messages/batch",
+            json={
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": long_answer,
+                        "turn_id": bootstrap_turn,
+                    }
+                ]
+            },
+        )
+        self.assertEqual(growth.status_code, 422, growth.text)
+        stored = self.conn.execute(
+            "SELECT content FROM chat_messages "
+            "WHERE session_id = ? AND turn_id = ? AND role = 'assistant'",
+            (sid, bootstrap_turn),
+        ).fetchone()[0]
+        self.assertEqual(stored, "seed")

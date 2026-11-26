@@ -22,7 +22,8 @@
   with the stream route's 422 shape, after auth, vault and owner checks; an over-cap batch writes
   nothing. Assistant-role items are bounded separately by the larger of
   `assistant_message_max_chars` (131072) and eight times the live `thinking_max_tokens`; a #553
-  reconcile of an answer the stream already persisted is exempt, per the #922 contract.
+  reconcile may re-post no more than the length the server already persisted, so a client cannot
+  grow a bootstrapped row into an unbounded body, per the #922 contract.
 - **Fence tracking is container-aware** (#1202 AC3, AC4). Literal `<answer>` markup inside a
   block-quoted or list-item fence survives, including wrapper tags before the container markers on
   the opener line; a second pass is a fixed point. Plain top-level fences behave as before.

@@ -174,13 +174,21 @@ def _effective_assistant_cap() -> int:
     )
 
 
-def _reject_over_cap_assistant_content(content: str) -> None:
-    """Bound assistant-role bodies on the durable write routes (#1202/#922)."""
-    cap = _effective_assistant_cap()
+def _reject_over_cap_assistant_content(content: str, allowed_cap: int | None = None) -> None:
+    """Bound assistant-role bodies on the durable write routes (#1202/#922).
+
+    ``allowed_cap`` is used only for a #553 reconcile of a row the server
+    already persisted: it may be longer than the current budget after an
+    operator lowers ``thinking_max_tokens``, but it may never grow.
+    """
+    cap = _effective_assistant_cap() if allowed_cap is None else allowed_cap
     if len(content) > cap:
         raise HTTPException(
             status_code=422,
-            detail=f"the message exceeds assistant_message_max_chars ({cap} characters)",
+            detail=(
+                f"the message exceeds assistant_message_max_chars effective ceiling "
+                f"({cap} characters; configured floor {settings.assistant_message_max_chars})"
+            ),
         )
 
 # Inline generation-control modes (issue #510). Hoisted to module-level
@@ -3566,26 +3574,29 @@ async def add_messages_batch(
     _require_session_owner_or_admin(session_row[3], user)
     # Validate and prepare every row BEFORE touching the database so a bad row
     # cannot leave a partially applied turn behind. The durable-row lookup is
-    # hoisted here from the write loop so an #553 reconcile of an answer the
-    # server already persisted is exempt from the assistant backstop: the live
-    # user cap and a genuinely new assistant row are still bounded.
+    # hoisted here from the write loop so a #553 reconcile can be bounded by
+    # the length the server already persisted: it may shorten or re-post that
+    # answer after the operator lowers the budget, but a client cannot use a
+    # small bootstrapped row to grow an unbounded assistant body.
     prepared = []
     for item in body.messages:
         existing_id: Optional[int] = None
+        existing_length = 0
         if item.turn_id:
             existing_result = await asyncio.to_thread(
                 conn.execute,
-                "SELECT id FROM chat_messages "
+                "SELECT id, LENGTH(content) FROM chat_messages "
                 "WHERE session_id = ? AND turn_id = ? AND role = ?",
                 (session_id, item.turn_id, item.role),
             )
             existing_row = await asyncio.to_thread(existing_result.fetchone)
             if existing_row is not None:
-                existing_id = existing_row[0]
+                existing_id, existing_length = existing_row[0], existing_row[1] or 0
         if item.role == "user":
             _reject_over_cap_user_content(item.content)
-        elif item.role == "assistant" and existing_id is None:
-            _reject_over_cap_assistant_content(item.content)
+        elif item.role == "assistant":
+            allowed_cap = max(_effective_assistant_cap(), existing_length)
+            _reject_over_cap_assistant_content(item.content, allowed_cap)
         if not item.content:
             raise HTTPException(status_code=422, detail="Message content must not be empty")
         persisted_content = (
