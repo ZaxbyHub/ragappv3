@@ -19,8 +19,9 @@
   regex pass still holds the GIL for its duration, so a single expensive
   pass can still stall the loop (adversarial input measured at 421s wall /
   421s max heartbeat gap off-thread); that residual is tracked in #1215.
-- **#1199** — scope corrected to the code-verified double-hold class:
-  all 18 `backend/app/api/routes/organizations.py` handlers migrated from a
+- **#1199** — scope corrected to the code-verified double-hold class
+  IN THIS FILE: all 18 `backend/app/api/routes/organizations.py` handlers
+  migrated from a
   second standalone `pool.get_connection_async()` checkout to the
   request-scoped `db: sqlite3.Connection = Depends(get_db)` connection
   shared with the `require_role` auth chain (the pattern PR #1198 shipped
@@ -36,15 +37,22 @@
   lives inside `require_service_account` (:465+), which acquires AND
   releases inside the dependency — one connection per request there, no
   double-hold. The guardrail (0 violations at head, CI-wired) is the
-  ongoing check for the corrected class.
+  ongoing check for the corrected class. NOTE: the gate scans handler
+  subtrees only, so it cannot see acquisitions in module-level helpers —
+  a LIVE instance of the same class remains in the documents.py upload path
+  (the handler holds a request-scoped connection via require_vault_permission
+  while _do_upload takes a second one at documents.py:2884; pre-existing and
+  unchanged by this PR), filed as a Priority follow-up.
 - Nine direct-caller/race harness suites migrated to the `db=` call-site
   seam (distinct connections per simulated request preserved).
 - New Quality-contracts guardrail `scripts/check_double_hold_routes.py`
-  (fail-closed on unclassified auth dependencies; C-DBLHOLD-1 double-hold,
-  C-DBLHOLD-2 unknown-auth, C-DBLHOLD-3 manual-release rules), wired into
-  `ci.yml`, the `justfile` `quality-contracts` recipe, and the script
-  inventories in `AGENTS.md`, `docs/engineering/conventions.md`, and
-  `docs/engineering/testing.md`; contract tests in
+  (fail-closed within its scanned lane on unclassified auth dependencies;
+  C-DBLHOLD-1 double-hold, C-DBLHOLD-2 unknown-auth, C-DBLHOLD-3
+  manual-release rules), wired into `ci.yml`, the `justfile`
+  `quality-contracts` recipe, and all EIGHT script-inventory mirrors
+  (`AGENTS.md`, `docs/engineering/conventions.md`,
+  `docs/engineering/testing.md`, `CONTRIBUTING.md`, the
+  `ci-compatibility-audit` and `ci-fix-monitor` skills); contract tests in
   `backend/tests/test_double_hold_guardrail.py`.
 
 ## Why

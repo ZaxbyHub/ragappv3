@@ -27,7 +27,11 @@ Contracts enforced:
       ``api_route`` decorators, and pool acquisitions extracted into
       module-level helpers are NOT scanned — new auth gates should be
       declared as handler-default ``Depends(...)`` calls with classified
-      names, and acquisitions belong inside the handler body.
+      names, and acquisitions belong inside the handler body. A HOLDING
+      dependency whose name carries neither the ``require_`` nor the
+      ``get_current_`` prefix (e.g. ``verify_admin``) also escapes both
+      rules: C-DBLHOLD-1 needs a classified name, C-DBLHOLD-2 needs one of
+      the two prefixes.
 
   C-DBLHOLD-3: no route handler with a HOLDING dependency may call
       ``.release_connection(...)`` manually — with the request-scoped
@@ -41,8 +45,8 @@ reading the dependency sources):
     directly): require_role, require_admin_role, require_vault_permission,
     require_document_admin, get_current_active_user,
     get_current_user_or_service_account, _optional_current_user
-    (backend/app/api/routes/documents.py:96),
-    get_evaluate_policy (backend/app/api/deps.py:803), and a direct
+    (backend/app/api/routes/documents.py:97),
+    get_evaluate_policy (backend/app/api/deps.py:804), and a direct
     ``Depends(get_db)`` default.
   - NON-HOLDING: require_scope, require_service_account
     (backend/app/security/__init__.py: header-only or

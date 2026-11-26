@@ -753,6 +753,8 @@ class LLMClient:
             # thread (#1209's thread-placement contract). Note: each regex
             # pass still holds the GIL for its duration, so a single
             # expensive pass can still stall the loop — tracked in #1215.
+            # The worker is not reclaimable: a cancelled request abandons
+            # it and the pass runs to completion.
             content = await asyncio.to_thread(
                 self._strip_thinking_content, content
             )
@@ -1026,7 +1028,8 @@ class LLMClient:
                         raise LLMError("Invalid response: no choices in response")
                     body_choice = choices[0]
                     # Sanitize off the event loop (#1209) — same dispatch as
-                    # the non-stream path above.
+                    # the non-stream path above (including its GIL and
+                    # non-reclaimable-worker caveats).
                     content = await asyncio.to_thread(
                         self._strip_thinking_content,
                         body_choice.get("message", {}).get("content", ""),
