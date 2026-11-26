@@ -273,13 +273,64 @@ jobs:
         # #865-#868 rule families (wiki-card no-nesting, native list
         # semantics, and the historical dangling-aria-controls probe;
         # unnamed controls are guarded by the vitest census suite).
-        run: npx playwright test --reporter=line a11y-matrix.spec.ts a11y-rearm-865-868.spec.ts --retries=1 --max-failures=20
+        # Issue #871 AC8 job-time budget: THIS job's total work (matrix +
+        # re-arm) runs under a hard 492s watchdog = 110% of the recorded
+        # pre-extension baseline (447s matrix step, base CI job
+        # 139309699740, same --retries=1 flags). The #871 extension specs
+        # live in their OWN job (a11y-gate-extensions below) with their own
+        # bounded budget, so this job's total stays within the AC's 10%
+        # ceiling. TERM at the ceiling, KILL 5s later.
+        run: timeout --kill-after=5s 492s npx playwright test --reporter=line a11y-matrix.spec.ts a11y-rearm-865-868.spec.ts --retries=1 --max-failures=20
 
       - name: Upload a11y failure artifacts
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: a11y-matrix-report
+          path: frontend/e2e/test-results/
+          retention-days: 7
+
+  # Issue #871 AC6/AC7/AC8: the gate-extension specs (focus-outline
+  # measurement + the version-gated extensions suite) run in their OWN job so
+  # the a11y-matrix job's total stays within its 110% AC8 budget; this job
+  # carries its own bounded 120s ceiling (measured ~45-60s locally incl.
+  # browser boot). Same install/boot shape as the a11y-matrix job.
+  a11y-gate-extensions:
+    name: Playwright a11y gate extensions
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend/e2e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.22.2"
+          cache: npm
+          cache-dependency-path: frontend/e2e/package-lock.json
+
+      - name: Install e2e dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Install app dependencies and build
+        working-directory: frontend
+        run: |
+          npm ci --engine-strict
+          npm run build
+
+      - name: Run a11y gate extensions (focus outline + version-gated suites)
+        run: timeout --kill-after=5s 120s npx playwright test --reporter=line a11y-focus-outline.spec.ts accessibility_gate_extensions.spec.ts --retries=1 --max-failures=20
+
+      - name: Upload extensions failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: a11y-extensions-report
           path: frontend/e2e/test-results/
           retention-days: 7
 

@@ -817,7 +817,7 @@ export default function CanvasPage() {
                   type="button"
                   onClick={() => void handleSave(false)}
                   disabled={saving || viewingOldVersion || !isDirty}
-                  aria-label="Save as a new version"
+                  aria-label={saving ? "Saving version" : "Save version as new"}
                   data-testid="canvas-save-button"
                 >
                   {saving ? (

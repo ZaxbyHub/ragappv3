@@ -493,7 +493,11 @@ function ProfilePageContent() {
                       variant="outline"
                       onClick={() => handleRevokeSession(session.id)}
                       disabled={session.is_current || revokingSessionIds.has(session.id)}
-                      aria-label={session.is_current ? "Current session cannot be revoked here" : "Revoke session"}
+                      aria-label={
+                        session.is_current
+                          ? "Revoke — current session cannot be revoked here"
+                          : `Revoke session ${session.id}: ${session.user_agent || "Unknown device"} (${session.ip_address || "unknown IP"})`
+                      }
                     >
                       {revokingSessionIds.has(session.id) ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <LogOut className="w-4 h-4 mr-2" />}
                       Revoke

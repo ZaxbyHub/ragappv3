@@ -69,7 +69,7 @@ function SourceCard({ source, fallbackIndex, validCitationLabels, onClick }: Sou
       <div className="flex items-start justify-between gap-2">
         <div className="flex items-center gap-2 min-w-0">
           <span
-            className="shrink-0 flex items-center justify-center min-w-5 h-5 px-1 rounded-full bg-primary/10 text-primary text-[10px] font-bold"
+            className="shrink-0 flex items-center justify-center min-w-5 h-5 px-1 rounded-full bg-primary text-primary-foreground text-[10px] font-bold"
             aria-label={`Source label ${badgeLabel}`}
           >
             {badgeLabel}

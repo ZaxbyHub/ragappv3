@@ -75,7 +75,7 @@
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.3.0",
     "@vitest/coverage-v8": "^5.1.0",
-    "axe-core": "^4.13.0",
+    "axe-core": "^4.14.1",
     "eslint": "^10.14.0",
     "eslint-plugin-jsx-a11y-x": "^0.2.0",
     "eslint-plugin-react-hooks": "^7.1.1",

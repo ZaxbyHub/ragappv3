@@ -113,12 +113,14 @@ async function visibleWithin(locator: Locator, timeout = 15_000): Promise<boolea
   }
 }
 
-/** The vault-selector trigger, wherever it renders: the real VaultSelector's
- *  button carries aria-label starting "Active vault:" or "All vaults". */
+/** The vault-selector trigger, wherever it renders: the trigger's accessible
+ *  name composes from its visible content plus an sr-only descriptor ending
+ *  "— active vault" / "— all vaults selected" (#871 Label-in-Name rework), so
+ *  match the descriptors rather than a stale aria-label prefix. */
 function selectorTriggers(page: Page): Locator {
-  return page.locator(
-    'button[aria-label^="All vaults"], button[aria-label^="Active vault:"]'
-  );
+  return page.getByRole("button", {
+    name: /active vault|all vaults selected/i,
+  });
 }
 
 /** Pick `name` in the nearest vault selector dropdown (opens the trigger,
@@ -131,7 +133,7 @@ async function pickVault(page: Page, vaultName: RegExp | string): Promise<boolea
   if (!(await visibleWithin(item, 10_000))) return false;
   await doClick(item);
   const active = await visibleWithin(
-    page.getByRole("button", { name: /active vault:/i }).first(),
+    page.getByRole("button", { name: /active vault/is }).first(),
     10_000
   );
   return active;
@@ -307,8 +309,9 @@ test.describe("first-run baseline (trace 781-vaultgate-first-run-baseline / C1)"
           `MemoryPage null-vault branch shows the "Select a vault" EmptyState ` +
           `(title reads ${memoriesTitle ? '"Memories"' : '"Memory"'}: heading "Memories" ` +
           `visible=${memoriesTitle}) and its copy says "Choose a vault from the vault ` +
-          `selector", but no vault-selector trigger (aria-label "All vaults…"/` +
-          `"Active vault:…") is rendered anywhere on the page (count=${triggerCount}).`,
+          `selector", but no vault-selector trigger (accessible name carrying ` +
+          `"— active vault" / "— all vaults selected") is rendered anywhere on ` +
+          `the page (count=${triggerCount}).`,
       });
       completed.push("memory-null-branch-visited (dead end A detected)");
     } else if (nullBranchVisible) {
@@ -455,10 +458,10 @@ test.describe("first-run baseline (trace 781-vaultgate-first-run-baseline / C1)"
     // "All Vaults" for this leg. If a successful create auto-selected the new
     // vault, explicitly switch back to All Vaults via the header selector.
     const allVaultsTrigger = page
-      .getByRole("button", { name: /all vaults \(\d+ files total\)/i })
+      .getByRole("button", { name: /all vaults.*all vaults selected/is })
       .first();
     const activeVaultTrigger = page
-      .getByRole("button", { name: /active vault:/i })
+      .getByRole("button", { name: /active vault/is })
       .first();
     let composerAllVaults = await visibleWithin(allVaultsTrigger, 10_000);
     if (!composerAllVaults && (await visibleWithin(activeVaultTrigger, 5_000))) {

@@ -684,12 +684,18 @@
 
     /* Radius - Material 3 style (slightly more rounded) */
     --radius: 0.75rem;
+
+    /* Issue #1159 AC1: pin native UA rendering (form controls, scrollbars,
+       default widgets) to this theme's light palette. */
+    color-scheme: light;
   }
 
   .dark {
     /* Dark mode - Near-black luxury feel */
     --background: 210 12% 7%;           /* Near-black with cool tint */
     --foreground: 200 10% 95%;           /* Soft white */
+    /* Issue #1159 AC1: native controls follow the dark palette. */
+    color-scheme: dark;
     --card: 210 12% 10%;                /* Slightly lifted surface */
     --card-foreground: 200 10% 95%;
     --popover: 210 12% 7%;
@@ -802,7 +808,27 @@
     --border: 0 0% 0%;
     --input: 0 0% 0%;
     --ring: 195 100% 24%;
+
+    /* Issue #1159 AC1: high-contrast is light-based (pure-white surfaces,
+       black foreground — same call main.tsx makes for the Toaster). */
+    color-scheme: light;
   }
+}
+
+/*
+ * Issue #1159 AC4: global keyboard-focus floor. Deliberately UNLAYERED:
+ * unlayered normal declarations outrank Tailwind's @layer utilities, so this
+ * rule also re-arms controls whose utilities opt out via
+ * focus-visible:outline-hidden. Components that pair a ring with the outline
+ * keep both (indicator redundancy is acceptable); controls with no focus
+ * utilities at all — the audit's 0.8px/none gap — now inherit the floor.
+ * --ring is theme-tokened in all three themes and differs from every surface
+ * token it can be drawn over (the outline sits outside the border edge, over
+ * the adjacent surface).
+ */
+:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
 }
 
 @layer base {
