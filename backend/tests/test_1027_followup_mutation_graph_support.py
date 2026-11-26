@@ -65,9 +65,10 @@ from app.services.authz_policy import (
 
 class _SupportHarness:
     """Private copy of the frozen file's _MutationHarness pattern: full-app
-    harness (own temp DB, get_db override, csrf override, users/organizations
-    module get_pool patches, settings save/restore, mutable acting-user dict)
-    plus the builders the support matrix needs."""
+    harness (own temp DB, get_db override, csrf override, settings
+    save/restore, mutable acting-user dict) plus the builders the support
+    matrix needs. The org routes take their request-scoped connection
+    through the get_db override (#798 AC4)."""
 
     def __init__(self):
         # Snapshot-restore (not pop) for app.dependency_overrides: a nested
@@ -98,12 +99,6 @@ class _SupportHarness:
 
         app.dependency_overrides[get_db] = override_get_db
         app.dependency_overrides[csrf_protect] = lambda: "t1028-csrf"
-
-        from app.api.routes import organizations as orgs_module
-        self._mods = (orgs_module,)
-        self._orig_get_pools = [m.get_pool for m in self._mods]
-        for m in self._mods:
-            m.get_pool = lambda path: self.pool
 
         from app.config import settings
 
@@ -289,8 +284,6 @@ class _SupportHarness:
     def close(self):
         app.dependency_overrides.clear()
         app.dependency_overrides.update(self._overrides_snapshot)
-        for m, orig in zip(self._mods, self._orig_get_pools):
-            m.get_pool = orig
         for key, value in self._saved.items():
             setattr(self._settings, key, value)
         self.pool.close_all()

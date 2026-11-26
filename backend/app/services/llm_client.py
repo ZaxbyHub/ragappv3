@@ -749,7 +749,13 @@ class LLMClient:
             # Log connection pool metrics
             self._log_pool_stats()
 
-            content = self._strip_thinking_content(content)
+            # Sanitize off the event loop (#1209): the sanitizer is
+            # regex-heavy (five re.sub DOTALL passes plus a line-walking
+            # wrapper stripper over the full response), so it must not stall
+            # the loop while concurrent requests wait.
+            content = await asyncio.to_thread(
+                self._strip_thinking_content, content
+            )
             # Issue #571: prefer provider-exact token counts when the
             # provider reports them (OpenAI-compatible `usage`; Ollama maps
             # prompt_eval_count/eval_count onto these fields). The char-based
@@ -1019,8 +1025,11 @@ class LLMClient:
                         self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "invalid_response"}
                         raise LLMError("Invalid response: no choices in response")
                     body_choice = choices[0]
-                    content = self._strip_thinking_content(
-                        body_choice.get("message", {}).get("content", "")
+                    # Sanitize off the event loop (#1209) — same dispatch as
+                    # the non-stream path above.
+                    content = await asyncio.to_thread(
+                        self._strip_thinking_content,
+                        body_choice.get("message", {}).get("content", ""),
                     )
                     # The answer text is visible output: count it and record
                     # why the generation stopped, exactly as the SSE delta

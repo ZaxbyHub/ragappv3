@@ -69,17 +69,19 @@ class _MultiConnPool:
 
 
 class _OrgRenameEnv:
+    """Per-test world: fresh db, real pool, per-caller facade connections.
+
+    update_organization takes a request-scoped ``db=`` connection (#798
+    AC4), so the direct handler call checks its connection out of the
+    facade at the call site — one fresh connection per simulated request,
+    exactly as the pre-migration handler checkout did."""
+
     def __init__(self, tmp_path: Path) -> None:
         _pool_cache.clear()
         self.db_path = str(tmp_path / "update-org-stale-caller.db")
         init_db(self.db_path)
         self.pool = SQLiteConnectionPool(self.db_path, max_size=4)
         self.facade: object = _MultiConnPool(self.pool)
-        from app.api.routes import organizations as org_mod
-
-        self._org_mod = org_mod
-        self._saved_get_pool = org_mod.get_pool
-        org_mod.get_pool = lambda _p: self.facade
         seed = self.pool.get_connection()
         try:
             seed.execute(
@@ -126,7 +128,6 @@ class _OrgRenameEnv:
             self.pool.release_connection(conn)
 
     def close(self) -> None:
-        self._org_mod.get_pool = self._saved_get_pool
         for conn in list(getattr(self.facade, "_out", [])):
             try:
                 self.pool.release_connection(conn)
@@ -165,14 +166,17 @@ def test_update_organization_stale_caller_is_refused(tmp_path: Path) -> None:
 
     async def drive():
         asyncio.to_thread = scripted
+        conn = await env.facade.get_connection_async()
         try:
             return await update_organization(
                 ORG_ID,
                 OrganizationUpdateRequest(name="Renamed By Stale Caller"),
                 user=STALE_CALLER,
                 _csrf_token="t",
+                db=conn,
             )
         finally:
+            env.facade.release_connection(conn)
             asyncio.to_thread = real_to_thread
 
     async def run():
@@ -214,12 +218,17 @@ def test_update_organization_happy_path_still_renames(tmp_path: Path) -> None:
     env = _OrgRenameEnv(tmp_path)
     try:
         async def go():
-            return await update_organization(
-                ORG_ID,
-                OrganizationUpdateRequest(name="Fresh Name"),
-                user=STALE_CALLER,  # org admin, never demoted here
-                _csrf_token="t",
-            )
+            conn = await env.facade.get_connection_async()
+            try:
+                return await update_organization(
+                    ORG_ID,
+                    OrganizationUpdateRequest(name="Fresh Name"),
+                    user=STALE_CALLER,  # org admin, never demoted here
+                    _csrf_token="t",
+                    db=conn,
+                )
+            finally:
+                env.facade.release_connection(conn)
 
         result = asyncio.run(go())
         assert result["name"] == "Fresh Name"

@@ -67,7 +67,6 @@ from pathlib import Path  # noqa: E402
 
 from fastapi import HTTPException  # noqa: E402
 
-from app.api.routes import organizations as org_mod  # noqa: E402
 from app.api.routes.organizations import (  # noqa: E402
     OrgMemberUpdateRequest,
     TransferOwnershipRequest,
@@ -229,7 +228,12 @@ class _StaleRoleReadConn:
 
 
 class _RaceEnv:
-    """Per-test world: fresh db, real pool, patched org-route pool binding."""
+    """Per-test world: fresh db, real pool, per-caller facade connections.
+
+    The org routes take a request-scoped ``db=`` connection (#798 AC4), so
+    direct handler calls check their connection out of the facade at the
+    call site — one fresh connection per simulated request, exactly as the
+    pre-migration handler checkout did."""
 
     def __init__(self, tmp_path: Path) -> None:
         _pool_cache.clear()
@@ -237,8 +241,6 @@ class _RaceEnv:
         init_db(self.db_path)
         self.pool = SQLiteConnectionPool(self.db_path, max_size=6)
         self.facade: object = _MultiConnPool(self.pool)
-        self._saved_get_pool = org_mod.get_pool
-        org_mod.get_pool = lambda _p: self.facade
 
     def seed_org(self, user2_org_role: str = "member") -> None:
         """Users 1 (org owner), 2 (at ``user2_org_role``), 3 (member), 99
@@ -301,7 +303,6 @@ class _RaceEnv:
         return [row[0] for row in rows]
 
     def close(self) -> None:
-        org_mod.get_pool = self._saved_get_pool
         for conn in list(getattr(self.facade, "_out", [])):
             try:
                 self.pool.release_connection(conn)
@@ -345,42 +346,54 @@ def _after_target_read_interleave(interleave):
     return build, state
 
 
-def _drive_interleaved(build, drive_factory) -> dict:  # noqa: ANN001
+def _drive_interleaved(build, env, drive_factory) -> dict:  # noqa: ANN001
     """Run the driven handler with the wrapped asyncio.to_thread. Non-HTTP
     exceptions (e.g. the base tree's TypeError on a vanished target) are
-    captured in ``outcome['error']`` rather than escaping the test."""
+    captured in ``outcome['error']`` rather than escaping the test.
+
+    ``drive_factory`` receives the request-scoped ``db=`` connection,
+    checked out of the env facade per simulated request and released by
+    this CALLER afterwards (the handler no longer releases db, #798 AC4)."""
     real_to_thread = asyncio.to_thread
     scripted = build(real_to_thread)
     outcome: dict = {}
 
     async def drive() -> None:
         asyncio.to_thread = scripted
+        conn = await env.facade.get_connection_async()
         try:
-            result = await drive_factory()
+            result = await drive_factory(conn)
             outcome["ok"] = str(result)
         except HTTPException as exc:
             outcome["refused_status"] = exc.status_code
         except Exception as exc:  # noqa: BLE001
             outcome["error"] = f"{type(exc).__name__}: {exc}"
         finally:
+            env.facade.release_connection(conn)
             asyncio.to_thread = real_to_thread
 
     asyncio.run(drive())
     return outcome
 
 
-def _drive(drive_factory) -> dict:  # noqa: ANN001
-    """Run the driven handler without any to_thread patching."""
+def _drive(env, drive_factory) -> dict:  # noqa: ANN001
+    """Run the driven handler without any to_thread patching. The driven
+    call takes its request-scoped ``db=`` connection from the env facade
+    (fresh per simulated request) and this CALLER releases it afterwards
+    (the handler no longer releases db, #798 AC4)."""
     outcome: dict = {}
 
     async def drive() -> None:
+        conn = await env.facade.get_connection_async()
         try:
-            result = await drive_factory()
+            result = await drive_factory(conn)
             outcome["ok"] = str(result)
         except HTTPException as exc:
             outcome["refused_status"] = exc.status_code
         except Exception as exc:  # noqa: BLE001
             outcome["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            env.facade.release_connection(conn)
 
     asyncio.run(drive())
     return outcome
@@ -419,22 +432,29 @@ def test_target_read_racing_ownership_transfer_is_refused(tmp_path: Path) -> Non
         )
 
         async def racing_transfer() -> None:
-            await transfer_ownership(
-                ORG_ID,
-                TransferOwnershipRequest(new_owner_user_id=TARGET_USER_ID),
-                user=OWNER,
-                _csrf_token="t",
-            )
+            conn = await env.facade.get_connection_async()
+            try:
+                await transfer_ownership(
+                    ORG_ID,
+                    TransferOwnershipRequest(new_owner_user_id=TARGET_USER_ID),
+                    user=OWNER,
+                    _csrf_token="t",
+                    db=conn,
+                )
+            finally:
+                env.facade.release_connection(conn)
 
         build, state = _after_target_read_interleave(racing_transfer)
         outcome = _drive_interleaved(
             build,
-            lambda: update_org_member_role(
+            env,
+            lambda db: update_org_member_role(
                 ORG_ID,
                 TARGET_USER_ID,
                 OrgMemberUpdateRequest(role="member"),
                 user=OWNER,
                 _csrf_token="t",
+                db=db,
             ),
         )
 
@@ -473,24 +493,32 @@ def test_caller_demoted_before_transaction_is_refused(tmp_path: Path) -> None:
 
         async def racing_caller_demotion() -> None:
             # Demote user 2 (the driven caller) from org admin to plain
-            # member after their privilege check has already passed.
-            await update_org_member_role(
-                ORG_ID,
-                TARGET_USER_ID,
-                OrgMemberUpdateRequest(role="member"),
-                user=OWNER,
-                _csrf_token="t",
-            )
+            # member after their privilege check has already passed. Runs
+            # on its own fresh facade connection (db= at the call site).
+            conn = await env.facade.get_connection_async()
+            try:
+                await update_org_member_role(
+                    ORG_ID,
+                    TARGET_USER_ID,
+                    OrgMemberUpdateRequest(role="member"),
+                    user=OWNER,
+                    _csrf_token="t",
+                    db=conn,
+                )
+            finally:
+                env.facade.release_connection(conn)
 
         build, state = _after_target_read_interleave(racing_caller_demotion)
         outcome = _drive_interleaved(
             build,
-            lambda: update_org_member_role(
+            env,
+            lambda db: update_org_member_role(
                 ORG_ID,
                 THIRD_USER_ID,
                 OrgMemberUpdateRequest(role="member"),
                 user=ADMIN_CALLER,
                 _csrf_token="t",
+                db=db,
             ),
         )
 
@@ -529,17 +557,25 @@ def test_vanished_target_returns_404_not_an_unhandled_error(
         env.seed_org(user2_org_role="member")
 
         async def racing_target_removal() -> None:
-            await remove_org_member(ORG_ID, TARGET_USER_ID, user=OWNER, _csrf_token="t")
+            conn = await env.facade.get_connection_async()
+            try:
+                await remove_org_member(
+                    ORG_ID, TARGET_USER_ID, user=OWNER, _csrf_token="t", db=conn
+                )
+            finally:
+                env.facade.release_connection(conn)
 
         build, state = _after_target_read_interleave(racing_target_removal)
         outcome = _drive_interleaved(
             build,
-            lambda: update_org_member_role(
+            env,
+            lambda db: update_org_member_role(
                 ORG_ID,
                 TARGET_USER_ID,
                 OrgMemberUpdateRequest(role="admin"),
                 user=OWNER,
                 _csrf_token="t",
+                db=db,
             ),
         )
 
@@ -576,13 +612,15 @@ def test_zero_row_update_refuses_and_leaves_role_unchanged(tmp_path: Path) -> No
         env.facade = _SingleConnFacade(env.pool, wrapped)
 
         outcome = _drive(
-            lambda: update_org_member_role(
+            env,
+            lambda db: update_org_member_role(
                 ORG_ID,
                 TARGET_USER_ID,
                 OrgMemberUpdateRequest(role="member"),
                 user=OWNER,
                 _csrf_token="t",
-            )
+                db=db,
+            ),
         )
 
         assert wrapped.shim_fired, (
@@ -628,13 +666,15 @@ def test_owner_at_write_without_role_predicate_refuses_and_preserves_owner(
         env.facade = _SingleConnFacade(env.pool, wrapped)
 
         outcome = _drive(
-            lambda: update_org_member_role(
+            env,
+            lambda db: update_org_member_role(
                 ORG_ID,
                 1,
                 OrgMemberUpdateRequest(role="member"),
                 user=ADMIN_CALLER,
                 _csrf_token="t",
-            )
+                db=db,
+            ),
         )
 
         assert wrapped.stale_reads >= 1, (
