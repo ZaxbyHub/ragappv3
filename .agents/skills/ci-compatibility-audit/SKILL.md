@@ -61,6 +61,12 @@ Repository contract job:
   CI job/script inventory names fewer jobs or scripts than `ci.yml` defines
   (issue #655).
 - `python scripts/check_config_contract.py`
+- `python scripts/check_double_hold_routes.py` — fails when a route handler
+  combines a holding auth dependency (the `Depends(get_db)` chain) with a
+  standalone pool acquisition/release (the #1199 double-hold class), or
+  carries an unclassified `require_*`/`get_current*`-shaped auth dependency
+  in a handler default (fail-closed; classify new gates in the script's
+  sets).
 - `python scripts/check_g06_setup_docs.py --check all` — `.env.example`/setup-doc
   drift gate (issue #738): no active localhost `REDIS_URL`, `cp` sources tracked,
   template `ALLOWED_EXTENSIONS` covers the code default, `DATA_DIR` consistent with
@@ -186,6 +192,7 @@ cd frontend && VITE_APP_BASENAME=/knowledgevault VITE_API_URL=/knowledgevault/ap
 cd backend && ruff check . && pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto --cov --cov-report=term-missing tests/
 python scripts/check_runtime_contract.py
 python scripts/check_config_contract.py
+python scripts/check_double_hold_routes.py
 python scripts/check_g06_setup_docs.py --check all
 python scripts/check_settings_consumers.py
 python scripts/check_batch_mock_seq.py
