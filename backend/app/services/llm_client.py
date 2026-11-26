@@ -749,10 +749,10 @@ class LLMClient:
             # Log connection pool metrics
             self._log_pool_stats()
 
-            # Sanitize off the event loop (#1209): the sanitizer is
-            # regex-heavy (five re.sub DOTALL passes plus a line-walking
-            # wrapper stripper over the full response), so it must not stall
-            # the loop while concurrent requests wait.
+            # Run the sanitizer on a worker thread, not the event-loop
+            # thread (#1209's thread-placement contract). Note: each regex
+            # pass still holds the GIL for its duration, so a single
+            # expensive pass can still stall the loop — tracked in #1215.
             content = await asyncio.to_thread(
                 self._strip_thinking_content, content
             )
