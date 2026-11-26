@@ -87,6 +87,7 @@ def _claim(chunk_id, quote, text="Alpha is verified"):
     return {
         "claim_text": text,
         "claim_type": "fact",
+        "subject": "Alpha",
         "source_quote": quote,
         "chunk_id": chunk_id,
         "confidence": 0.9,

@@ -10,6 +10,7 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, List, Optional
 
+from app.services.content_classifiers import is_toc_text
 from app.services.store_utils import cosine_similarity as _cosine_similarity_shared
 
 if TYPE_CHECKING:
@@ -47,6 +48,29 @@ class ProcessedChunk:
     parent_window_start: Optional[int] = None
     parent_window_end: Optional[int] = None
     chunk_position: Optional[int] = None
+
+
+def filter_toc_chunks(chunks: List[ProcessedChunk]) -> List[ProcessedChunk]:
+    """Drop table-of-contents chunks at FINAL-output granularity (issue #1162 AC5).
+
+    A chunk whose text classifies wholly as a TOC block is not retrievable
+    knowledge; mixed chunks (TOC lines plus substantive prose) survive.
+    Applied once at every chunker's final return — after all merging and on
+    every fallback path — so the emitted set, ``chunk_index``,
+    ``total_chunks``, and the downstream ``files.chunk_count`` all reflect
+    the filtered list. Existing files re-filter on their next
+    recompile/reindex (no auto-rechunk).
+    """
+    kept = [c for c in chunks if not is_toc_text(c.text)]
+    if len(kept) == len(chunks):
+        return chunks
+    renumbered = []
+    for new_idx, chunk in enumerate(kept):
+        chunk.chunk_index = new_idx
+        chunk.metadata["chunk_index"] = new_idx
+        chunk.metadata["total_chunks"] = len(kept)
+        renumbered.append(chunk)
+    return renumbered
 
 
 class SemanticChunker:
@@ -233,7 +257,9 @@ class SemanticChunker:
         # Post-process chunks to merge those that split inside code blocks or tables
         processed_chunks = self._post_process_chunks(processed_chunks)
 
-        return processed_chunks
+        # Issue #1162 AC5: one final-output TOC filter (after all merging), so
+        # the emitted set and its indices are TOC-free.
+        return filter_toc_chunks(processed_chunks)
 
     def _post_process_chunks(
         self, chunks: List[ProcessedChunk]
@@ -596,7 +622,9 @@ class EmbeddingSemanticChunker:
         if not chunks:
             return self._fallback_chunk_text(text, section_title)
 
-        return chunks
+        # Issue #1162 AC5: final-output TOC filter on the assembly path; the
+        # fallback paths filter inside SemanticChunker.chunk_elements.
+        return filter_toc_chunks(chunks)
 
     def _fallback_chunk_text(
         self, text: str, section_title: Optional[str] = None

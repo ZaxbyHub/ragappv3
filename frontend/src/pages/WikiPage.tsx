@@ -104,42 +104,65 @@ export default function WikiPage() {
     filtersRef.current = { search, page_type: activeType };
   }, [search, activeType]);
 
-  // AC39 (#515): /wiki?page=<id|slug> deep link — WikiCards navigates here
-  // with `page_id` (or slug). Opens the detail without a list click, once per
-  // mount; Back clears the param so popstate returns to the list.
-  const deepLinkHandledRef = useRef(false);
-  // PRR-004 (#531): switching vaults re-arms the one-shot deep link so the
-  // still-present ?page= param opens in the NEW vault's context. Declared
-  // BEFORE the deep-link effect so the reset lands before it runs; within a
-  // single vault the ref still guarantees once-per-mount handling (no
-  // re-trigger for the same URL param).
+  // AC39 (#515) + #1161 AC1: the `?page=` URL param is the SINGLE owner of
+  // which wiki page is open. WikiCards navigates here with page_id/slug;
+  // list clicks WRITE the param (handleSelectPage); this effect is the only
+  // caller of openPage, once per distinct param value (no duplicate
+  // fetches); removing the param (Back / popstate) closes the detail.
+  const lastOpenedParamRef = useRef<string | null>(null);
+  // PRR-004 (#531): switching vaults re-arm the param ownership so the
+  // still-present ?page= opens in the NEW vault's context. Declared BEFORE
+  // the param effect so the reset lands before it runs.
   useEffect(() => {
-    deepLinkHandledRef.current = false;
+    lastOpenedParamRef.current = null;
   }, [activeVaultId]);
   useEffect(() => {
-    if (!activeVaultId || deepLinkHandledRef.current) return;
-    const raw = searchParams?.get("page");
-    if (!raw) return;
+    if (!activeVaultId) return;
+    const raw = searchParams?.get("page") ?? null;
+    if (raw == null) {
+      if (lastOpenedParamRef.current != null) {
+        lastOpenedParamRef.current = null;
+        closePage();
+      }
+      return;
+    }
+    if (lastOpenedParamRef.current === raw) return; // already open — no re-fetch
     const numericId = Number.parseInt(raw, 10);
     if (Number.isInteger(numericId) && numericId > 0) {
-      deepLinkHandledRef.current = true;
+      lastOpenedParamRef.current = raw;
       openPage(numericId);
       return;
     }
     // Slug form — resolve against the loaded list (best effort).
     const bySlug = pages.find((p) => p.slug === raw);
     if (bySlug) {
-      deepLinkHandledRef.current = true;
+      lastOpenedParamRef.current = raw;
       openPage(bySlug.id);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeVaultId, searchParams, pages]);
+
+  // #1161 AC1: list clicks put the page's identifier in the address; the
+  // param effect above performs the open (single owner — no double fetch).
+  const handleSelectPage = useCallback(
+    (pageId: number) => {
+      if (setSearchParams && searchParams) {
+        const next = new URLSearchParams(searchParams);
+        next.set("page", String(pageId));
+        setSearchParams(next);
+        return;
+      }
+      openPage(pageId); // outside a Router (unit tests) — fall back
+    },
+    [searchParams, setSearchParams, openPage]
+  );
 
   const handleBack = useCallback(() => {
     if (searchParams?.has("page") && setSearchParams) {
       const next = new URLSearchParams(searchParams);
       next.delete("page");
       setSearchParams(next, { replace: true });
+      return; // the param effect closes the detail
     }
     closePage();
   }, [searchParams, setSearchParams, closePage]);
@@ -367,7 +390,7 @@ export default function WikiPage() {
             <WikiPageList
               pages={pages}
               loading={loading}
-              onSelect={openPage}
+              onSelect={handleSelectPage}
               vaultId={activeVaultId}
               onRefresh={() => fetchPages({ page_type: activeType || undefined, search: search || undefined })}
               hasMore={pages.length < total}

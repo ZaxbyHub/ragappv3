@@ -1464,6 +1464,24 @@ const server = http.createServer(async (req, res) => {
         per_page: 200,
       });
     }
+    if (method === "GET" && path === "/api/review/queue") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, {
+        items: [
+          {
+            kind: "wiki_page",
+            id: 1,
+            title: "Coolant Maintenance Wiki",
+            slug: "coolant-maintenance",
+            status: "needs_review",
+            file_id: null,
+            updated_at: nowIso(),
+            source_quote: "Coolant intervals run every 500 hours.",
+          },
+        ],
+        count: 1,
+      });
+    }
     if (method === "GET" && path === "/api/kms/entries/1") {
       if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
       return sendJson(req, res, 200, a11yKmsEntry());

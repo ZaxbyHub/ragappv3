@@ -1,7 +1,7 @@
 // frontend/src/tests/command-palette-capability-off.issue775.test.tsx
 // Issue #775 review PRR-308(e) — the capability-gated branch of the
 // palette's destination filter is exercised: an admin WITHOUT the Draft
-// Room capability must not see the /draft-room destination (11 of 12), and
+// Room capability must not see the /draft-room destination (12 of 13), and
 // the exclusion comes from isNavItemVisible's capabilityGated clause, not
 // from role gating (every other palette suite mocks the capability ON, so
 // C5's member count never exercises this clause palette-side).
@@ -42,7 +42,7 @@ describe("issue #775 review — palette respects the Draft Room capability gate"
     cleanup();
   });
 
-  it("an admin without the capability sees 11 destinations and no Draft Room entry", () => {
+  it("an admin without the capability sees 12 destinations and no Draft Room entry", () => {
     render(
       <MemoryRouter>
         <CommandPalette />
@@ -58,6 +58,6 @@ describe("issue #775 review — palette respects the Draft Room capability gate"
       within(palette).queryByRole("button", { name: /draft room/i }),
       "capability-gated /draft-room must be excluded when the capability is absent"
     ).toBeNull();
-    expect(labels.filter((l) => l.startsWith("Go to ")).length).toBe(11);
+    expect(labels.filter((l) => l.startsWith("Go to ")).length).toBe(12);
   });
 });

@@ -175,6 +175,7 @@ class TestCuratorClaimParity(unittest.TestCase):
         payload = json.dumps({"claims": [{
             "claim_text": _CLAIM_TEXT,
             "claim_type": "fact",
+            "subject": "Alpha",
             "source_quote": _CLAIM_TEXT,   # verbatim in chunk "1_0"
             "chunk_id": "1_0",
             "confidence": 0.9,
@@ -246,6 +247,7 @@ class TestCuratorClaimParity(unittest.TestCase):
         payload = json.dumps({"claims": [{
             "claim_text": _CLAIM_TEXT,
             "claim_type": "fact",
+            "subject": "Alpha",
             "source_quote": _CLAIM_TEXT,
             "chunk_id": "1_0",
             "confidence": 0.9,
@@ -280,6 +282,7 @@ class TestCuratorClaimParity(unittest.TestCase):
         payload = json.dumps({"claims": [{
             "claim_text": _CLAIM_TEXT,
             "claim_type": "fact",
+            "subject": "Alpha",
             "source_quote": _CLAIM_TEXT,
             "chunk_id": "text_0",
             "confidence": 0.9,
@@ -338,6 +341,7 @@ class TestCuratorClaimParity(unittest.TestCase):
             # (final-critic round 1).
             "claim_text": f"{_CLAIM_TEXT}!",
             "claim_type": "fact",
+            "subject": "Alpha",
             "source_quote": _CLAIM_TEXT,
             "chunk_id": "1_0",
             "confidence": 0.9,
@@ -366,6 +370,7 @@ class TestCuratorClaimParity(unittest.TestCase):
         payload = json.dumps({"claims": [{
             "claim_text": _CLAIM_TEXT,
             "claim_type": "fact",
+            "subject": "Alpha",
             "source_quote": _CLAIM_TEXT,
             "chunk_id": "1_0",
             "confidence": 0.9,
@@ -399,6 +404,7 @@ class TestCuratorClaimParity(unittest.TestCase):
         payload = json.dumps({"claims": [{
             "claim_text": _CLAIM_TEXT,
             "claim_type": "fact",
+            "subject": "Alpha",
             "source_quote": _CLAIM_TEXT,
             "chunk_id": "1_0",
             "confidence": 0.9,

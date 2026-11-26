@@ -370,6 +370,18 @@ class DocumentParseError(Exception):
     pass
 
 
+class UnsupportedContentTypeError(DocumentParseError):
+    """The wiki compile fallback refused the file's CONTENT TYPE.
+
+    Issue #1162: a stable, typed signal distinguishing a type refusal from
+    a parser crash on a supported type. Raised ONLY by the wiki compile
+    fallback path (wiki_compiler.py), decided by an explicit extension
+    allowlist + binary sniff there — NEVER by the shared DocumentParser,
+    whose supported set includes NUL-leading binary formats (PDF/DOCX/
+    PPTX are ZIP- or binary-container files the parser handles normally).
+    """
+
+
 # --- Ingestion error redaction (issue #562 / C26) ---------------------------
 #
 # Strings persisted to files.error_message, files.phase_message and

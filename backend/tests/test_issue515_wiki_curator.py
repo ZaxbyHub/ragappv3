@@ -169,6 +169,7 @@ class TestIssue515Ac12ChangedNumberQuotes(_Issue515CuratorTestBase):
                 {
                     "claim_text": "The session lasts 30 minutes",
                     "claim_type": "fact",
+                    "subject": "The session",
                     "source_quote": "The session lasts 30 minutes.",
                     "chunk_id": "42_0",
                     "confidence": 0.9,
@@ -230,12 +231,14 @@ class TestIssue515Ac13DedupeKeyFullEquality(_Issue515CuratorTestBase):
                 {
                     "claim_text": "Claim alpha regarding the session timeout",
                     "claim_type": "fact",
+                    "subject": "the session timeout",
                     "source_quote": "The session timeout",
                     "chunk_id": "42_0",
                 },
                 {
                     "claim_text": "Claim beta regarding the session timeout",
                     "claim_type": "fact",
+                    "subject": "the session timeout",
                     "source_quote": "The session timeout",
                     "chunk_id": "42_0",
                 },
@@ -243,6 +246,7 @@ class TestIssue515Ac13DedupeKeyFullEquality(_Issue515CuratorTestBase):
                     # Exact repeat of candidate 1 — must still be deduped.
                     "claim_text": "Claim alpha regarding the session timeout",
                     "claim_type": "fact",
+                    "subject": "the session timeout",
                     "source_quote": "The session timeout",
                     "chunk_id": "42_0",
                 },

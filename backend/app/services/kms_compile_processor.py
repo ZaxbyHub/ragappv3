@@ -18,6 +18,10 @@ from typing import TYPE_CHECKING, Optional
 
 from app.config import settings
 from app.services.admission import AdmissionClass, get_admission_controller
+from app.services.content_classifiers import (
+    document_has_qualifying_items,
+    entry_summary,
+)
 from app.services.job_lease import JobLease
 
 if TYPE_CHECKING:
@@ -27,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 POLL_INTERVAL = 5  # seconds between polls when queue is empty
 MAX_RETRIES = 3    # max automatic retries before a job is permanently failed
-SUMMARY_CHARS = 500  # leading characters of body used as the entry summary
 
 # Issue #792: the error code handed to _fail_job when a dispatch raises.
 # GET /kms/jobs returns that column to any vault reader, so it carries this
@@ -477,7 +480,16 @@ class KMSCompileProcessor:
 
     @staticmethod
     def _compile_file(conn, store, vault_id: int, file_id: int) -> dict:
-        """Create/refresh the document-sourced KMS entry for one file."""
+        """Create/refresh the document-sourced KMS entry for one file.
+
+        Issue #1162 (owner decision, November 18 2026): the PURE
+        deterministic qualification rule gates CREATION — an unqualifying
+        document creates no entry (no wiki-evidence DB read; the
+        curator-aware owner for ingest documents is the wiki compile
+        worker, which upserts the same entry when the document qualifies).
+        An EXISTING document entry is always refreshed: suppression gates
+        creation only, and the recompute lifecycle keeps content current.
+        """
         if not conn.execute(
             "SELECT 1 FROM vaults WHERE id = ?", (vault_id,)
         ).fetchone():
@@ -495,7 +507,12 @@ class KMSCompileProcessor:
         body = d.get("parsed_text") or ""
         if not body.strip():
             return {"skipped": True, "reason": "no parsed_text to compile"}
-        summary = body[:SUMMARY_CHARS].strip()
+        existing_id = store.get_entry_by_file(vault_id, file_id, source_type="document")
+        if existing_id is None and not document_has_qualifying_items(body):
+            return {"skipped": True, "reason": "no qualifying items"}
+        # Issue #1162 AC4: boilerplate (licence/copyright/change-record/TOC)
+        # blocks are excluded from the summary; the body stays complete.
+        summary = entry_summary(body)
         entry = store.upsert_document_entry(
             vault_id=vault_id,
             file_id=file_id,

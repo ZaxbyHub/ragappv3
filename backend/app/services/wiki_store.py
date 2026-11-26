@@ -2612,6 +2612,25 @@ class WikiStore:
             return None
         return self.get_page(row[0], load_relations=False)
 
+    def list_pages_by_file(self, vault_id: int, file_id: int) -> list:
+        """ALL pages a file is associated with (entity AND procedure pages).
+
+        Issue #1162: the unqualifying-recompute lifecycle refreshes every
+        file-associated page, not just the oldest association — procedure
+        pages from a prior revision must go stale with their siblings.
+        """
+        rows = self._db.execute(
+            "SELECT page_id FROM wiki_page_files WHERE vault_id = ? AND file_id = ? "
+            "ORDER BY id",
+            (vault_id, file_id),
+        ).fetchall()
+        pages = []
+        for row in rows:
+            page = self.get_page(row[0], load_relations=False)
+            if page is not None:
+                pages.append(page)
+        return pages
+
     # -----------------------------------------------------------------------
     # Wiki Links (DD-C030)
     # -----------------------------------------------------------------------

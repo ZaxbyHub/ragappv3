@@ -264,6 +264,7 @@ class TestReactivationGate(unittest.TestCase):
         payload = json.dumps({"claims": [{
             "claim_text": "Alpha is verified",
             "claim_type": "fact",
+            "subject": "Alpha",
             "source_quote": "Fabricated quote that appears nowhere 12345",
             "chunk_id": "bogus",
             "confidence": 0.9,
@@ -284,6 +285,7 @@ class TestReactivationGate(unittest.TestCase):
         payload = json.dumps({"claims": [{
             "claim_text": "Alpha is verified",
             "claim_type": "fact",
+            "subject": "Alpha",
             "source_quote": "Alpha is verified",
             "chunk_id": "1_0",
             "confidence": 0.9,

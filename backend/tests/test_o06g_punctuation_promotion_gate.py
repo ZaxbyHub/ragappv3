@@ -283,6 +283,7 @@ class TestCuratorTwinPunctuationGate(unittest.TestCase):
             # lookup misses, the normalized lookup hits.
             "claim_text": VARIANT_TEXT,
             "claim_type": "fact",
+            "subject": "Alpha",
             # The quote is the SEEDED punctuation form, verbatim in the
             # chunk below, so the candidate is quote-verified active.
             "source_quote": SEEDED_TEXT,
@@ -316,6 +317,7 @@ class TestCuratorTwinPunctuationGate(unittest.TestCase):
         payload = json.dumps({"claims": [{
             "claim_text": "Exact curator twin text",
             "claim_type": "fact",
+            "subject": "Alpha",
             "source_quote": "Exact curator twin text",
             "chunk_id": "1_0",
             "confidence": 0.9,
@@ -342,6 +344,7 @@ class TestCuratorTwinPunctuationGate(unittest.TestCase):
             # (punctuation stripped) but carries different numbers.
             "claim_text": "The fee is 5.10 USD",
             "claim_type": "fact",
+            "subject": "Alpha",
             "source_quote": "The fee is 5.10 USD",
             "chunk_id": "1_0",
             "confidence": 0.9,
@@ -364,6 +367,7 @@ class TestCuratorTwinPunctuationGate(unittest.TestCase):
         payload = json.dumps({"claims": [{
             "claim_text": VARIANT_TEXT,
             "claim_type": "fact",
+            "subject": "Alpha",
             "source_quote": SEEDED_TEXT,
             "chunk_id": "1_0",
             "confidence": 0.9,
@@ -389,6 +393,7 @@ class TestCuratorTwinPunctuationGate(unittest.TestCase):
         payload = json.dumps({"claims": [{
             "claim_text": "Exact curator superseded twin",
             "claim_type": "fact",
+            "subject": "Alpha",
             "source_quote": "Exact curator superseded twin",
             "chunk_id": "1_0",
             "confidence": 0.9,
