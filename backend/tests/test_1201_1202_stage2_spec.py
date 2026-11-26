@@ -355,6 +355,178 @@ class MergeVanishedReportTest(_Base):
         self.assertIn("Quality report not found", raced.text)
 
 
+class ReportNoteBoundsTest(_Base):
+    def test_reserved_separator_and_cap_are_enforced(self):
+        sid, mid = self._session()
+        reserved = self.client.post(
+            "/api/quality/reports",
+            json={
+                "session_id": sid,
+                "message_id": mid,
+                "category": "incorrect_answer",
+                "note": "first || second",
+            },
+        )
+        self.assertEqual(reserved.status_code, 422, reserved.text)
+        self.assertIn("reserved separator", reserved.text)
+
+        cap = settings.chat_message_max_chars
+        max_note = qr._note_body_limit()
+        self.current = ADMIN
+        bounded_first = self.client.post(
+            "/api/quality/reports",
+            json={
+                "session_id": sid,
+                "message_id": mid,
+                "category": "stale_source",
+                "note": "a" * max_note,
+            },
+        )
+        self.assertEqual(bounded_first.status_code, 200, bounded_first.text)
+        self.current = SECOND_ADMIN
+        bounded_second = self.client.post(
+            "/api/quality/reports",
+            json={
+                "session_id": sid,
+                "message_id": mid,
+                "category": "stale_source",
+                "note": "b" * max_note,
+            },
+        )
+        self.assertEqual(bounded_second.status_code, 200, bounded_second.text)
+        bounded_note = self.conn.execute(
+            "SELECT note FROM quality_reports WHERE message_id = ? "
+            "AND category = 'stale_source'",
+            (mid,),
+        ).fetchone()[0]
+        self.assertLessEqual(len(bounded_note), qr.QUALITY_REPORT_NOTE_MAX_CHARS)
+        self.assertIn("(submitted by user 7)", bounded_note)
+
+
+        overlong = self.client.post(
+            "/api/quality/reports",
+            json={
+                "session_id": sid,
+                "message_id": mid,
+                "category": "missing_source",
+                "note": "x" * (max_note + 1),
+            },
+        )
+        self.assertEqual(overlong.status_code, 422, overlong.text)
+
+    def test_full_canonical_note_overflow_is_rejected_through_route(self):
+        sid, mid = self._session()
+        cap = qr.QUALITY_REPORT_NOTE_MAX_CHARS
+        full_note = "x" * cap
+        self.conn.execute(
+            "INSERT INTO quality_reports (session_id, message_id, category, note, "
+            "turn_id, seq, config_ref, source_file_hashes) VALUES (?, ?, ?, ?, 't', 1, 'x', '[]')",
+            (sid, mid, "bad_extraction", full_note),
+        )
+        self.conn.commit()
+        self.current = SECOND_ADMIN
+        response = self.client.post(
+            "/api/quality/reports",
+            json={
+                "session_id": sid,
+                "message_id": mid,
+                "category": "bad_extraction",
+                "note": "another note",
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("report-note cap", response.text)
+        stored = self.conn.execute(
+            "SELECT note FROM quality_reports WHERE message_id = ? "
+            "AND category = 'bad_extraction'",
+            (mid,),
+        ).fetchone()[0]
+        self.assertEqual(stored, full_note)
+
+    def test_existing_note_folds_and_short_retry_is_idempotent(self):
+        sid, mid = self._session()
+        cap = settings.chat_message_max_chars
+        self.conn.execute(
+            "INSERT INTO quality_reports (session_id, message_id, category, note, "
+            "turn_id, seq, config_ref, source_file_hashes) VALUES (?, ?, ?, ?, 't', 1, 'x', '[]')",
+            (sid, mid, "missing_source", "x" * cap),
+        )
+        self.conn.commit()
+        self.current = SECOND_ADMIN
+        overflow = self.client.post(
+            "/api/quality/reports",
+            json={
+                "session_id": sid,
+                "message_id": mid,
+                "category": "missing_source",
+                "note": "another note",
+            },
+        )
+        self.assertEqual(overflow.status_code, 200, overflow.text)
+        folded_overflow = self.conn.execute(
+            "SELECT note FROM quality_reports WHERE message_id = ? "
+            "AND category = 'missing_source'",
+            (mid,),
+        ).fetchone()[0]
+        self.assertLessEqual(len(folded_overflow), qr.QUALITY_REPORT_NOTE_MAX_CHARS)
+        self.assertIn("another note (submitted by user 7)", folded_overflow)
+
+        self.current = ADMIN
+        first_body = {
+            "session_id": sid,
+            "message_id": mid,
+            "category": "bad_extraction",
+            "note": "short note",
+        }
+        first = self.client.post("/api/quality/reports", json=first_body)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.current = SECOND_ADMIN
+        body = {**first_body, "note": "folded note"}
+        folded = self.client.post("/api/quality/reports", json=body)
+        self.assertEqual(folded.status_code, 200, folded.text)
+        stored = self.conn.execute(
+            "SELECT note FROM quality_reports WHERE message_id = ? "
+            "AND category = 'bad_extraction'",
+            (mid,),
+        ).fetchone()[0]
+        self.assertEqual(stored, "folded note (submitted by user 7) || short note")
+        retry = self.client.post("/api/quality/reports", json=body)
+        self.assertEqual(retry.status_code, 200, retry.text)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT note FROM quality_reports WHERE message_id = ? "
+                "AND category = 'bad_extraction'",
+                (mid,),
+            ).fetchone()[0],
+            stored,
+        )
+
+
+class SettingsWireTest(_Base):
+    def test_assistant_cap_update_and_read_round_trip(self):
+        original = settings.assistant_message_max_chars
+        try:
+            updated = self.client.put(
+                "/api/settings",
+                json={"assistant_message_max_chars": 99999},
+            )
+            self.assertEqual(updated.status_code, 200, updated.text)
+            self.assertEqual(
+                updated.json()["assistant_message_max_chars"], 99999
+            )
+            read_back = self.client.get("/api/settings")
+            self.assertEqual(read_back.status_code, 200, read_back.text)
+            self.assertEqual(
+                read_back.json()["assistant_message_max_chars"], 99999
+            )
+        finally:
+            restored = self.client.put(
+                "/api/settings",
+                json={"assistant_message_max_chars": original},
+            )
+            self.assertEqual(restored.status_code, 200, restored.text)
+
+
 class ShareLinkPinTest(_Base):
     def test_share_link_pin_cross_user_get_stays_allowed(self):
         """#573's share link stays functional: a member with vault read can

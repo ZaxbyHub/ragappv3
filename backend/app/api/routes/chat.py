@@ -12,6 +12,7 @@ import concurrent.futures
 import json
 import logging
 import sqlite3
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -81,6 +82,10 @@ logger = logging.getLogger(__name__)
 
 _TURN_FINALIZE_EXECUTOR = None
 _TURN_FINALIZE_FUTURES = set()
+_TURN_FINALIZE_FUTURES_LOCK = threading.Lock()
+
+TURN_FINALIZE_DRAIN_TIMEOUT_SECONDS = 10.0
+TURN_PRODUCER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
 def _get_turn_finalize_executor():
@@ -98,13 +103,50 @@ def _get_turn_finalize_executor():
     return _TURN_FINALIZE_EXECUTOR
 
 
+def _discard_turn_finalize_future(future) -> None:
+    with _TURN_FINALIZE_FUTURES_LOCK:
+        _TURN_FINALIZE_FUTURES.discard(future)
+
+
+async def _retire_turn_producers(tasks, timeout: float) -> set:
+    """Cancel live producers and return the still-pending subset."""
+    tasks = [task for task in tasks if task is not None and not task.done()]
+    for task in tasks:
+        task.cancel()
+    if not tasks:
+        return set()
+    _done, pending = await asyncio.wait(tasks, timeout=timeout)
+    return pending
+
+
+async def shutdown_turn_finalizers(producers, db_pool, producer_timeout, drain_timeout) -> bool:
+    """Retire producers before draining; never close the pool with live producers."""
+    pending = await _retire_turn_producers(producers, producer_timeout)
+    if pending:
+        logger.warning(
+            "Durable turn producers still active at shutdown; leaving "
+            "executor and DB pool open for their finalizers"
+        )
+        return False
+    drained = await asyncio.to_thread(_drain_turn_finalize_executor, drain_timeout)
+    if drained:
+        db_pool.close_all()
+    else:
+        logger.warning(
+            "Durable finalize drain timed out; leaving DB pool open so "
+            "queued finalizers can finish before interpreter exit"
+        )
+    return drained
+
+
 def _drain_turn_finalize_executor(timeout=None) -> bool:
     """Wait for queued finalizes before pool close; do not close the worker.
 
-    The optional bound is used by isolated tests; production calls it with
-    no bound and waits fully. The executor stays alive for later turns.
+    Production passes a finite bound from lifespan shutdown; isolated tests
+    may pass their own. The executor stays alive for later turns.
     """
-    futures = list(_TURN_FINALIZE_FUTURES)
+    with _TURN_FINALIZE_FUTURES_LOCK:
+        futures = list(_TURN_FINALIZE_FUTURES)
     if not futures:
         return True
     _done, not_done = concurrent.futures.wait(futures, timeout=timeout)
@@ -123,15 +165,16 @@ def _submit_durable_turn_finalize(
     and violate #1202 AC1. A failure to create a worker is logged and skipped.
     """
     try:
-        future = _get_turn_finalize_executor().submit(
-            _finalize_durable_turn_sync, db_pool, turn_state, status
-        )
-        _TURN_FINALIZE_FUTURES.add(future)
-        future.add_done_callback(_TURN_FINALIZE_FUTURES.discard)
-        return True
+        with _TURN_FINALIZE_FUTURES_LOCK:
+            future = _get_turn_finalize_executor().submit(
+                _finalize_durable_turn_sync, db_pool, turn_state, status
+            )
+            _TURN_FINALIZE_FUTURES.add(future)
     except RuntimeError as exc:
         logger.warning("durable turn finalize worker unavailable (%s); skipped", exc)
         return False
+    future.add_done_callback(_discard_turn_finalize_future)
+    return True
 
 
 def _require_session_owner_or_admin(session_owner_id, user: dict) -> None:

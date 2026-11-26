@@ -229,6 +229,48 @@ async def test_cancellation_backstop_finalizes_interrupted_turn_off_the_event_lo
         )
 
 
+async def test_shutdown_helper_persists_accepted_durable_turn(env):
+    """shutdown_turn_finalizers drains a real submitted finalize before close."""
+    from unittest.mock import MagicMock
+
+    original = chat_routes._finalize_durable_turn_sync
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked(db_pool, turn_state, status):
+        started.set()
+        release.wait(timeout=5.0)
+        return original(db_pool, turn_state, status)
+
+    chat_routes._finalize_durable_turn_sync = blocked
+    turn_id = "shutdown-helper-persist-1"
+    response = env.make_stream(turn_id)
+    entry = chat_routes._turn_registry().get((env.session_id, turn_id))
+    assert entry is not None and entry.task is not None
+    producer = entry.task
+    try:
+        await _consume_until(response, _is_content_event)
+        assert not producer.done()
+        await _cancel_and_await(producer)
+        assert started.wait(timeout=2.0)
+        closed = MagicMock()
+        helper = asyncio.create_task(
+            chat_routes.shutdown_turn_finalizers([], closed, 0.01, 5.0)
+        )
+        await asyncio.sleep(0.05)
+        release.set()
+        assert await helper
+        closed.close_all.assert_called_once()
+        rows = [r for r in env.rows() if r[0] == "assistant"]
+        assert len(rows) == 1
+        assert rows[0][1] == "interrupted"
+        assert "<answer>" not in rows[0][4]
+    finally:
+        release.set()
+        chat_routes._finalize_durable_turn_sync = original
+        await _cancel_and_await(producer)
+
+
 async def test_cancellation_backstop_sanitizer_invoked_at_least_once(env):
     """Guards the backstop thread assertion against a vacuous pass: the
     cancelled turn's finalize path invokes the persistence-boundary
@@ -247,11 +289,19 @@ async def test_cancellation_backstop_submission_does_not_block_loop(env):
     original = chat_routes._finalize_durable_turn_sync
     calls = []
     started_event = threading.Event()
+    release_event = threading.Event()
+    cancel_returned = threading.Event()
+    watchdog_released = threading.Event()
+
+    def release_after_cancel():
+        if not cancel_returned.wait(timeout=5.0):
+            watchdog_released.set()
+        release_event.set()
 
     def slow(db_pool, turn_state, status):
         calls.append(threading.get_ident())
         started_event.set()
-        time.sleep(0.4)
+        release_event.wait(timeout=5.0)
         return original(db_pool, turn_state, status)
 
     chat_routes._finalize_durable_turn_sync = slow
@@ -264,18 +314,17 @@ async def test_cancellation_backstop_submission_does_not_block_loop(env):
     try:
         await _consume_until(response, _is_content_event)
         assert not producer.done()
-        started = time.monotonic()
+        threading.Thread(target=release_after_cancel, daemon=True).start()
         await _cancel_and_await(producer)
-        elapsed = time.monotonic() - started
-        # Observe worker start only AFTER measuring responsiveness.
-        for _ in range(250):
-            if started_event.is_set():
-                break
-            await asyncio.sleep(0.01)
-        assert started_event.is_set(), "the finalize helper never ran"
-        assert elapsed < 0.2, f"cancellation blocked {elapsed:.3f}s on the finalize"
+        assert started_event.wait(timeout=2.0), "the finalize helper never ran"
+        assert not watchdog_released.is_set(), (
+            "cancellation blocked until the watchdog released the finalize worker"
+        )
         assert all(t != loop_thread for t in calls), "finalize ran on the loop thread"
+        cancel_returned.set()
     finally:
+        cancel_returned.set()
+        release_event.set()
         drain = getattr(chat_routes, "_drain_turn_finalize_executor", None)
         if drain is not None:
             drain(timeout=5.0)
@@ -369,10 +418,10 @@ def test_cancellation_backstop_lifespan_calls_drain_before_pool_close():
             and predicate(node)
         ]
 
-    drain_lines = shutdown_calls(
+    helper_lines = shutdown_calls(
         lambda n: (
             isinstance(n.func, ast.Name)
-            and n.func.id == "_drain_turn_finalize_executor"
+            and n.func.id == "shutdown_turn_finalizers"
         )
     )
     close_lines = shutdown_calls(
@@ -383,10 +432,9 @@ def test_cancellation_backstop_lifespan_calls_drain_before_pool_close():
             and n.func.value.attr == "db_pool"
         )
     )
-    assert drain_lines, "lifespan shutdown never CALLS the finalize drain"
-    assert close_lines, "lifespan shutdown no longer closes the DB pool"
-    assert min(drain_lines) < min(close_lines), (
-        "the pool is closed before the worker is drained"
+    assert helper_lines, "lifespan shutdown never CALLS the finalize helper"
+    assert not close_lines, (
+        "pool close must stay inside shutdown_turn_finalizers after the drain"
     )
 
 

@@ -1904,6 +1904,12 @@ class Settings(BaseSettings):
         """Validate chat_message_max_chars is >= 1."""
         return cls._validate_int_range(v, 1, None, "chat_message_max_chars")
 
+    @field_validator("assistant_message_max_chars", mode="after")
+    @classmethod
+    def validate_assistant_message_max_chars(cls, v: int) -> int:
+        """Validate the assistant backstop floor is >= 1."""
+        return cls._validate_int_range(v, 1, None, "assistant_message_max_chars")
+
     @field_validator("unique_docs_in_top_k", mode="after")
     @classmethod
     def validate_unique_docs_in_top_k(cls, v: int) -> int:

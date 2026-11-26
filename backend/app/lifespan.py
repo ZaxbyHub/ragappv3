@@ -293,6 +293,7 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             "instant_memory_context_top_k",
             "instant_max_tokens",
             "thinking_max_tokens",
+            "assistant_message_max_chars",
             "instant_enable_thinking",
             # Per-mode HTTP request timeouts (issue #652)
             "thinking_request_timeout_seconds",
@@ -1291,10 +1292,26 @@ async def lifespan(app: FastAPI):
     try:
         # Issue #1202: cancellation finalizes run on a worker; drain them before
         # the pool becomes unusable, or an interrupted turn can be lost.
-        from app.api.routes.chat import _drain_turn_finalize_executor
+        from app.api.routes.chat import (
+            TURN_FINALIZE_DRAIN_TIMEOUT_SECONDS,
+            TURN_PRODUCER_SHUTDOWN_TIMEOUT_SECONDS,
+            _turn_registry,
+            shutdown_turn_finalizers,
+        )
 
-        _drain_turn_finalize_executor()
-        app.state.db_pool.close_all()
+        # Cancel live stream producers first so their cancellation backstops
+        # submit before the gate closes. Retirement is bounded; the drain runs
+        # in a worker so the event loop never blocks on future completion.
+        producers = [
+            getattr(entry, "task", None)
+            for entry in list(_turn_registry().values())
+        ]
+        await shutdown_turn_finalizers(
+            producers,
+            app.state.db_pool,
+            TURN_PRODUCER_SHUTDOWN_TIMEOUT_SECONDS,
+            TURN_FINALIZE_DRAIN_TIMEOUT_SECONDS,
+        )
     except Exception:
         pass
     try:

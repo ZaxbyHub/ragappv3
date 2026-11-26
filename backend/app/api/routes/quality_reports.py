@@ -20,7 +20,7 @@ import sqlite3
 from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.api.deps import (
     get_current_active_user,
@@ -36,6 +36,17 @@ from app.utils.sqlite_errors import is_unique_violation
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+# Report notes are provenance records, not prompt-input hot paths. A generous
+# independent cap leaves room for two full accepted notes and their attributions;
+# overflow is rejected explicitly rather than destroying submitted text.
+QUALITY_REPORT_NOTE_MAX_CHARS = 1_000_000
+_NOTE_ATTRIBUTION_RESERVE = len(" (submitted by user 999999)") + len(" || ")
+
+
+def _note_body_limit() -> int:
+    """Bound one accepted note so two notes plus attributions fit the cap."""
+    return (QUALITY_REPORT_NOTE_MAX_CHARS - 2 * _NOTE_ATTRIBUTION_RESERVE) // 2
 
 #: Structured report categories (issue #237). A generic thumbs-down counter
 #: is insufficient — each category routes to a different repair path.
@@ -102,6 +113,20 @@ class QualityReportRequest(BaseModel):
     category: str
     note: Optional[str] = None
 
+    @field_validator("note")
+    @classmethod
+    def validate_note_separator(cls, value: Optional[str]) -> Optional[str]:
+        """Reserve the separator and bound the note against the live cap."""
+        if value is None:
+            return value
+        if " || " in value:
+            raise ValueError("note must not contain the reserved separator ' || '")
+        if len(value) > _note_body_limit():
+            raise ValueError(
+                f"note exceeds the live bound of {_note_body_limit()} characters"
+            )
+        return value
+
 
 class ConvertReportRequest(BaseModel):
     """Body for POST /quality/reports/{report_id}/convert."""
@@ -147,10 +172,27 @@ def _merge_report_note(existing: str, incoming: str, submitter_id: int) -> str:
     if not incoming or incoming == existing:
         return existing
     parts = [part for part in (existing or "").split(" || ") if part.strip()]
-    attributed = f"{incoming} (submitted by user {submitter_id})"
-    if attributed not in parts:
-        parts.append(attributed)
-    return " || ".join(parts)
+    cap = QUALITY_REPORT_NOTE_MAX_CHARS
+    suffix = f" (submitted by user {submitter_id})"
+    attributed = f"{incoming}{suffix}"
+    if attributed in parts:
+        return existing or ""
+    parts.insert(0, attributed)
+    return _fit_note_parts(parts, cap)
+
+
+def _fit_note_parts(parts, cap: int) -> str:
+    """Return the full canonical note or reject overflow without changing it."""
+    merged = " || ".join(parts)
+    if len(merged) <= cap:
+        return merged
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            f"quality report note exceeds report-note cap ({cap} characters); "
+            "submit a shorter note"
+        ),
+    )
 
 
 def _merge_note_or_missing(conn, row_id: int, incoming: str, user_id: int) -> bool:
