@@ -55,7 +55,7 @@ async function seed(page: Page) {
 async function selectE2eVault(page: Page) {
   const gateBtn = page
     .getByTestId("vault-gate")
-    .getByRole("button", { name: /all vaults \(\d+ files total\)/i });
+    .getByRole("button", { name: /all vaults.*all vaults selected/is });
   // The gate mounts asynchronously after navigation; wait for it (or a short
   // budget) before deciding which control to click, else both render and the
   // unscoped locator strict-mode-fails.
@@ -63,11 +63,11 @@ async function selectE2eVault(page: Page) {
   if (gated) {
     await gateBtn.click();
   } else {
-    await page.getByRole("button", { name: /all vaults \(\d+ files total\)/i }).first().click();
+    await page.getByRole("button", { name: /all vaults.*all vaults selected/is }).first().click();
   }
   await page.getByRole("menuitem", { name: /e2e vault/i }).click();
   await expect(
-    page.getByRole("button", { name: /active vault: e2e vault/i })
+    page.getByRole("button", { name: /e2e vault.*active vault/is })
   ).toBeVisible({ timeout: 10_000 });
 }
 

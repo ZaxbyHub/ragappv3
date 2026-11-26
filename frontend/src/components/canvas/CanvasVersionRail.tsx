@@ -34,7 +34,6 @@ export function CanvasVersionRail({
             type="button"
             onClick={() => onSelect(version.version_no)}
             aria-current={isSelected ? "true" : undefined}
-            aria-label={`View version ${version.version_no}`}
             data-testid="canvas-version-button"
             data-version-no={version.version_no}
             className={cn(

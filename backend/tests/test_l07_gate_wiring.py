@@ -223,9 +223,12 @@ def test_roster_below_minimum_rejected(tmp_path: Path) -> None:
 
 
 def test_axe_run_options_rejected(tmp_path: Path) -> None:
-    # Re-arm invariant (#865-#868 closed): the gate runs the FULL default
-    # rule set -- ANY axe.run option object (rules, runOnly, exclude) is a
-    # waiver channel and is rejected, whatever its spelling.
+    # Re-arm invariant (#865-#868 closed; carve restricted 2026-11-26): the
+    # gate runs the FULL default rule set -- ANY axe.run option object
+    # (rules, runOnly, exclude) is a waiver channel and is rejected. In the
+    # FROZEN matrix spec any argument at all is a miss (the carve is
+    # exclusive to the extensions spec); in the extensions spec it fails the
+    # allowlist battery (pinned by test_axe_run_context_carve_rejects_...).
     for spelling in (
         'axe.run({ rules: { "region": { enabled: false } } });',
         'axe.run({"runOnly": ["wcag2a"]});',
@@ -236,7 +239,8 @@ def test_axe_run_options_rejected(tmp_path: Path) -> None:
         _plant_full(tmp_path, spec_text=seeded)
         result = _run_guard(tmp_path)
         assert result.returncode == 1, spelling
-        assert "axe.run with options" in result.stdout, spelling
+        assert "passes an axe.run argument" in result.stdout, spelling
+        assert "carve is exclusive to accessibility_gate_extensions.spec.ts" in result.stdout, spelling
 
 
 def test_axe_run_comment_not_counted(tmp_path: Path) -> None:
@@ -248,7 +252,7 @@ def test_axe_run_comment_not_counted(tmp_path: Path) -> None:
     )
     _plant_full(tmp_path, spec_text=commented)
     result = _run_guard(tmp_path)
-    assert "axe.run with options" not in result.stdout, result.stdout
+    assert "non-allowlisted argument" not in result.stdout, result.stdout
 
 
 def test_census_unnamed_spec_rejected(tmp_path: Path) -> None:
@@ -282,3 +286,158 @@ def test_guard_fails_closed_without_workflow(tmp_path: Path) -> None:
 
     result = _run_guard(tmp_path)
     assert result.returncode == 2
+
+
+# ---- issue #871 AC7 context carve (RESTRICTED by the 2026-11-26 feedback
+# round): the matcher admits EXACTLY the allowlisted DOM-context shapes, and
+# ONLY in accessibility_gate_extensions.spec.ts — every other gated spec
+# (the frozen a11y-matrix.spec.ts included) must stay argument-less.
+# Rejected everywhere: bare identifiers (options smuggled via a variable),
+# arbitrary calls (getOptions()), parenthesized object literals, and any
+# second (top-level-comma) argument.
+
+_EXTENSIONS_REL = Path("frontend") / "e2e" / "accessibility_gate_extensions.spec.ts"
+
+# FULL_CI plus the extensions job (needed so the census leg accepts a
+# planted extensions spec file).
+FULL_CI_WITH_EXTENSIONS = FULL_CI + """  a11y-gate-extensions:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npx playwright test --reporter=line a11y-focus-outline.spec.ts accessibility_gate_extensions.spec.ts
+"""
+
+
+def _plant_full_with_extensions(
+    tmp_path: Path,
+    ext_spec_text: str,
+    ci_text: str = FULL_CI_WITH_EXTENSIONS,
+) -> None:
+    _plant_full(tmp_path, ci_text=ci_text)
+    (tmp_path / _EXTENSIONS_REL.parent).mkdir(parents=True, exist_ok=True)
+    (tmp_path / _EXTENSIONS_REL).write_text(ext_spec_text, encoding="utf-8")
+
+
+EXT_SPEC_BASE = (
+    "const VIEWPORTS = [{ width: 320, height: 568 }, { width: 640, height: 360 }];" + _NL
+    + "axe.run();" + _NL
+)
+
+
+def test_axe_run_context_carve_allowed_shapes(tmp_path: Path) -> None:
+    # Allowed shapes live ONLY in the extensions spec now.
+    for spelling in (
+        "axe.run();",
+        'axe.run(document.getElementById("synthetic-root"));',
+        'axe.run(document.querySelector("#synthetic-root"));',
+        'axe.run(document.querySelectorAll(".probe-root"));',
+        'axe.run("#synthetic-root");',
+        'axe.run("#synthetic-root .nested");',
+    ):
+        seeded = EXT_SPEC_BASE.replace("axe.run();", spelling)
+        _plant_full_with_extensions(tmp_path, seeded)
+        result = _run_guard(tmp_path)
+        assert result.returncode == 0, (spelling, result.stdout)
+
+
+def test_axe_run_context_carve_is_exclusive_to_extensions_spec(tmp_path: Path) -> None:
+    # The SAME allowlisted shape planted in the FROZEN matrix spec (or any
+    # other gated spec) is a miss: the carve is exclusive to the extensions
+    # spec, and the matrix stays argument-less.
+    seeded = FULL_SPEC.replace(
+        "axe.run();",
+        'axe.run(document.getElementById("synthetic-root"));',
+    )
+    _plant_full(tmp_path, spec_text=seeded)
+    result = _run_guard(tmp_path)
+    assert result.returncode == 1
+    assert "carve is exclusive to accessibility_gate_extensions.spec.ts" in result.stdout
+
+
+def test_axe_run_context_carve_rejects_bypass_shapes(tmp_path: Path) -> None:
+    for spelling in (
+        "axe.run(options);",
+        "axe.run(getOptions());",
+        "axe.run(({ rules: [] }));",
+        "axe.run({});",
+        'axe.run(document.getElementById("a"), {});',
+        "axe.run(win.axeOpts);",
+    ):
+        seeded = EXT_SPEC_BASE.replace("axe.run();", spelling)
+        _plant_full_with_extensions(tmp_path, seeded)
+        result = _run_guard(tmp_path)
+        assert result.returncode == 1, spelling
+        assert "non-allowlisted argument" in result.stdout, spelling
+
+
+def test_axe_run_context_carve_multiline_argument(tmp_path: Path) -> None:
+    # The balanced-paren scan must see through line breaks inside the call.
+    seeded = EXT_SPEC_BASE.replace(
+        "axe.run();",
+        "axe.run(\n  document.getElementById(\"synthetic-root\")\n);",
+    )
+    _plant_full_with_extensions(tmp_path, seeded)
+    result = _run_guard(tmp_path)
+    assert result.returncode == 0, result.stdout
+
+
+def test_explicit_repo_root_selects_the_supplied_tree(tmp_path: Path) -> None:
+    # Issue #871 AC3 (original clause), pinned in its LITERAL shape: the
+    # check runs with its cwd inside an IN-REPOSITORY TEMPORARY directory
+    # (created under this repo for the test, removed on exit), and
+    # --repo-root must select the SUPPLIED tree instead of the competing
+    # repository root the cwd walk would otherwise find. The planted tree
+    # carries a violation, so a pass would prove the guard resolved some
+    # OTHER tree than the one the flag supplied.
+    import tempfile
+
+    planted = tmp_path / "tree"
+    _plant_full(planted)
+    shrunken = FULL_SPEC.replace(_FULL_ROUTES, '    path: "r1",' + _NL)
+    (planted / SPEC_REL).write_text(shrunken, encoding="utf-8")
+
+    with tempfile.TemporaryDirectory(dir=REPO, prefix="l07-ac3-cwd-") as in_repo_temp:
+        result = _run_guard_with_root(Path(in_repo_temp), planted)
+    assert result.returncode == 1
+    assert "route roster has 1 entries" in result.stdout
+    assert "MISSING a11y-matrix" in result.stdout
+
+
+def _run_guard_with_root(cwd: Path, root: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(A11Y_SCRIPT), "--repo-root", str(root)],
+        cwd=cwd,
+        timeout=120,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_repo_root_flag_requires_a_path() -> None:
+    result = subprocess.run(
+        [sys.executable, str(A11Y_SCRIPT), "--repo-root"],
+        cwd=REPO,
+        timeout=120,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert "--repo-root requires a path" in result.stderr
+
+
+def test_allowlist_regex_is_linear_on_pathological_input() -> None:
+    # Feedback round F-008/SEC-001: the pre-fix selector-segment class
+    # overlapped its own separator ([ >.] vs [A-Za-z0-9_.#-]) and admitted
+    # catastrophic backtracking — 4.79s EXECUTION-PROVEN at 26 dot segments.
+    # The linearized grammar must settle the same input ~instantly.
+    import importlib.util
+    import time
+
+    spec = importlib.util.spec_from_file_location("l07mod", A11Y_SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    evil = '"#a' + ".a" * 26 + "!"
+    start = time.perf_counter()
+    verdict = mod._AXE_CONTEXT_ALLOWLIST.match(evil)
+    elapsed = time.perf_counter() - start
+    assert verdict is None
+    assert elapsed < 1.0, f"allowlist match took {elapsed:.2f}s — backtracking regression"

@@ -102,11 +102,6 @@ export function VaultSelector({ className }: VaultSelectorProps) {
         <Button
           variant="outline"
           className={cn("gap-2", className)}
-          aria-label={
-            activeVault
-              ? `Active vault: ${activeVault.name} (${activeVault.file_count} files)`
-              : `All vaults (${totalFiles} files total)`
-          }
         >
           <Database className="h-4 w-4" aria-hidden="true" />
           <span className="truncate max-w-[150px]">{activeVault?.name ?? "All Vaults"}</span>
@@ -116,6 +111,12 @@ export function VaultSelector({ className }: VaultSelectorProps) {
             {activeVault ? activeVault.file_count : totalFiles}
           </Badge>
           <ChevronDown className="h-3 w-3 opacity-50" aria-hidden="true" />
+          {/* WCAG 2.5.3 (#871, axe 4.14): the accessible name composes from
+              the visible content above plus this sr-only descriptor, so the
+              visible text is contained in the name by construction. */}
+          <span className="sr-only">
+            {activeVault ? "— active vault" : "— all vaults selected"}
+          </span>
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-56">

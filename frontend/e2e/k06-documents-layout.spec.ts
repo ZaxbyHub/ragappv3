@@ -51,10 +51,10 @@ async function seed(page: Page) {
 // delete actions are vault-gated (a fresh context defaults to "All vaults",
 // which selects no concrete vault and hides every Delete affordance).
 async function selectE2eVault(page: Page) {
-  await page.getByRole("button", { name: /all vaults \(\d+ files total\)/i }).click();
+  await page.getByRole("button", { name: /all vaults.*all vaults selected/is }).click();
   await page.getByRole("menuitem", { name: /e2e vault/i }).click();
   await expect(
-    page.getByRole("button", { name: /active vault: e2e vault/i })
+    page.getByRole("button", { name: /e2e vault.*active vault/is })
   ).toBeVisible({ timeout: 10_000 });
 }
 
@@ -365,7 +365,10 @@ test.describe("k06 documents layout (issue #769)", () => {
 
     // Card branch (below md): open the first card's Actions menu and
     // measure its Delete item; table branch (>= md): the direct button.
-    const directDelete = page.getByRole("button", { name: "Delete document" }).first();
+    // The TABLE delete only: getByRole name matching is substring-based, so
+    // the card's "Delete Document (<file>)" would also match a role-name
+    // probe — branch on the exact attribute instead.
+    const directDelete = page.locator('button[aria-label="Delete document"]').first();
     const inCardBranch = !(await directDelete.isVisible().catch(() => false));
     if (inCardBranch) {
       const firstCard = page.locator('[aria-label^="Document: "]').first();

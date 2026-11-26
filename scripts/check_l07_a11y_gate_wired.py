@@ -55,10 +55,74 @@ MIN_ROUTES = 20
 # name, colon, end of line (optional trailing comment).
 JOB_HEADER_RE = re.compile(r"^  ([A-Za-z0-9_.-]+):\s*(?:#.*)?$")
 
+# Issue #871 AC7 context carve (feedback round 2026-11-26: restricted and
+# linearized). The ONLY argument shapes an axe.run( call may carry — and
+# ONLY in accessibility_gate_extensions.spec.ts (every other gated spec,
+# including the frozen a11y-matrix.spec.ts, must stay argument-less: the
+# frozen matrix is the baseline gate and gains nothing from a context). A
+# DOM context restricts WHICH tree is measured; shrinking the tree DOES skip
+# everything outside it, so a context is a scoped narrowing that must stay
+# visible, single-purpose, and confined to the extensions spec. Anchored
+# full-match against the extracted argument text, so bare identifiers,
+# arbitrary calls, parenthesized/object literals, and any second
+# (top-level-comma) argument all fail. The selector-segment class excludes
+# the separators (space, >, .) themselves, so the pattern is LINEAR — the
+# earlier [A-Za-z0-9_.#-]+ inner class overlapped its own [ >.] separator
+# and admitted catastrophic backtracking (~4.8s at 26 dot segments,
+# execution-proven in the feedback round).
+_AXE_CONTEXT_ALLOWLIST = re.compile(
+    r"""^(?:|
+        document\.(?:getElementById|querySelector|querySelectorAll)\s*\(\s*(['"])[^'"]*\1\s*\)
+        |
+        (['"])[#][A-Za-z0-9_-]+(?:(?:[ >]\.?|\.)[A-Za-z0-9_-]+)*\2
+        |
+        (['"])\.[A-Za-z0-9_-]+(?:(?:[ >]\.?|\.)[A-Za-z0-9_-]+)*\3
+    )$""",
+    re.X,
+)
 
-def resolve_repo_root() -> Path:
-    """Repo root for path resolution: walk up from cwd to the git root; fall
-    back to cwd (then the script's own parents[1]) when no .git is found."""
+# The one spec file the context carve is exclusive to (feedback round
+# F-003): shrinking axe's measured tree is a deliberate narrowing, so it
+# must stay confined to the spec whose job is exactly that discrimination.
+CONTEXT_CARVE_SPEC = "accessibility_gate_extensions.spec.ts"
+
+
+def _extract_call_argument(code: str, open_paren_end: int) -> str | None:
+    """Return the full argument text of the call whose '(' just ended at
+    ``open_paren_end`` (index just past it), via a quote-aware balanced-paren
+    scan. ``None`` when the parens never balance."""
+    depth = 1
+    i = open_paren_end
+    quote: str | None = None
+    while i < len(code):
+        ch = code[i]
+        if quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'`":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return code[open_paren_end:i].strip()
+        i += 1
+    return None
+
+
+def resolve_repo_root(explicit: Path | None = None) -> Path:
+    """Repo root for path resolution. An EXPLICIT root (``--repo-root``) wins
+    outright — that is issue #871 AC3's original clause: when the check runs
+    under an in-repository temporary directory, the caller must be able to
+    select the supplied tree instead of relying on the cwd walk. Without one,
+    walk up from cwd to the git root; fall back to cwd (then the script's own
+    parents[1]) when no .git is found."""
+    if explicit is not None:
+        return explicit
     cwd = Path.cwd()
     for candidate in (cwd, *cwd.parents):
         if (candidate / ".git").exists():
@@ -116,8 +180,16 @@ def run_lines(job_lines: list[str]) -> list[str]:
     ]
 
 
-def main() -> int:
-    root = resolve_repo_root()
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    explicit_root: Path | None = None
+    if "--repo-root" in args:
+        idx = args.index("--repo-root")
+        if idx + 1 >= len(args):
+            print("a11y-matrix: --repo-root requires a path argument", file=sys.stderr)
+            return 2
+        explicit_root = Path(args[idx + 1])
+    root = resolve_repo_root(explicit_root)
     spec_path = root / SPEC_REL
     ci_path = root / CI_REL
 
@@ -199,12 +271,26 @@ def main() -> int:
                 f"{MIN_ROUTES} (>= 20 gated routes)"
             )
 
-        # 4. Re-arm invariant (issues #865-#868 closed): the gate runs axe
-        #    with its FULL default rule set -- every axe.run( call in every
-        #    a11y-gate spec must be argument-less. This subsumes every
-        #    waiver spelling (rules/enabled:false in any quoting or line
-        #    split, runOnly, exclude): any option object restricts what the
-        #    gate measures.
+        # 4. Re-arm invariant (issues #865-#868 closed; #871 context carve,
+        #    restricted by the 2026-11-26 feedback round): the gate runs axe
+        #    with its FULL default rule set. Every axe.run( call in every
+        #    a11y-gate spec must be argument-less — except in
+        #    accessibility_gate_extensions.spec.ts, whose job IS root
+        #    discrimination, where EXACTLY ONE allowlisted DOM-context
+        #    argument is allowed:
+        #      - document.getElementById|querySelector|querySelectorAll(<string literal>)
+        #      - a simple selector string literal ("#id" / ".class" shapes)
+        #    A context element restricts WHICH tree is measured — and
+        #    shrinking the tree skips everything outside it, so a context is
+        #    a real narrowing: it stays confined to the one spec whose
+        #    purpose is that discrimination, and every other spec (the
+        #    frozen matrix included) stays argument-less. Everything else
+        #    stays rejected: option objects in any spelling (leading `{`,
+        #    parenthesized `({...})`), bare identifiers (axe.run(options)),
+        #    arbitrary calls (axe.run(getOptions())), and any second
+        #    (top-level-comma) argument. The argument text is extracted with
+        #    a quote-aware balanced-paren scan, so no bypass can smuggle an
+        #    options object through the tail.
         for spec_path in sorted((root / E2E_DIR_REL).glob("*.spec.ts")):
             try:
                 spec_code = spec_path.read_text(encoding="utf-8")
@@ -214,14 +300,31 @@ def main() -> int:
             code = re.sub(r"/\*.*?\*/", " ", spec_code, flags=re.S)
             code = re.sub(r"^\s*//.*$", " ", code, flags=re.M)
             for m in re.finditer(r"axe\.run\s*\(", code):
-                tail = code[m.end():].lstrip()
-                if not tail.startswith(")"):
-                    rel = spec_path.relative_to(root).as_posix()
-                    line_no = code[: m.start()].count("\n") + 1
+                rel = spec_path.relative_to(root).as_posix()
+                line_no = code[: m.start()].count("\n") + 1
+                arg = _extract_call_argument(code, m.end())
+                if arg is None:
                     misses.append(
-                        f"{rel}:{line_no} calls axe.run with options; the "
-                        "re-armed gate runs the full default rule set "
-                        "(axe.run() takes no arguments)"
+                        f"{rel}:{line_no} axe.run argument could not be parsed "
+                        "(unbalanced parens); the gate must stay inspectable"
+                    )
+                    continue
+                if arg == "":
+                    continue
+                if spec_path.name != CONTEXT_CARVE_SPEC:
+                    misses.append(
+                        f"{rel}:{line_no} passes an axe.run argument; the "
+                        "DOM-context carve is exclusive to "
+                        f"{CONTEXT_CARVE_SPEC} and every other gated spec "
+                        "runs argument-less"
+                    )
+                elif not _AXE_CONTEXT_ALLOWLIST.match(arg):
+                    misses.append(
+                        f"{rel}:{line_no} calls axe.run with a non-allowlisted "
+                        "argument; the re-armed gate runs the full default rule "
+                        "set (only a DOM context — document.getElementById/"
+                        "querySelector/querySelectorAll(<literal>) or a simple "
+                        "selector string literal — may be passed)"
                     )
 
     # 5. Run-line hygiene across ALL jobs (issue #778 review PRR-016):

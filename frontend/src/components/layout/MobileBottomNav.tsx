@@ -152,7 +152,12 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
               built-in close control (absolutely positioned on SheetContent)
               stays pinned and reachable while scrolled (review PRR-002).
               Issue #776 (UI-R4-04): this sheet must not add a second close. */}
-          <SheetContent side="bottom" className="flex h-[50vh] flex-col rounded-t-2xl" aria-describedby="mobile-more-desc">
+          <SheetContent
+            side="bottom"
+            className="flex h-[50vh] flex-col rounded-t-2xl"
+            aria-labelledby="mobile-more-title"
+            aria-describedby="mobile-more-desc"
+          >
             <SheetHeader className="shrink-0 pb-2">
               <SheetTitle id="mobile-more-title" className="text-xl font-semibold">More</SheetTitle>
               <SheetDescription id="mobile-more-desc">Access settings, help, and other options</SheetDescription>

@@ -95,6 +95,7 @@ import {
 } from "@playwright/test";
 import path from "node:path";
 import fs from "node:fs";
+import { assertAxeVersion } from "./axe-version-gate.mjs";
 
 const STUB_PORT = process.env.E2E_STUB_PORT || "9090";
 const STUB_ORIGIN = `http://localhost:${STUB_PORT}`;
@@ -105,6 +106,11 @@ if (!fs.existsSync(AXE_PATH)) {
     `axe-core not found at ${AXE_PATH} — install frontend dependencies before running this spec`
   );
 }
+// Issue #871 AC5 (#1060 AC2 absorbed): the INSTALLED axe version silently is
+// the checker — this spec injects AXE_PATH directly, so assert the version
+// at load and fail loudly when a regressed pin changes what the gate
+// measures (4.14 changed label-content-name-mismatch behavior).
+assertAxeVersion({ axePath: AXE_PATH, minimum: "4.14.0" });
 
 // 320x568 (small phone) and 640x360 (200% zoom of 1280x720). Written as
 // literals: scripts/check_l07_a11y_gate_wired.py greps for 320/568/640/360.

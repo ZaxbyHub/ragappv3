@@ -1589,7 +1589,7 @@ function SessionRailContent({
             variant="outline"
             size="sm"
             onClick={() => dispatchCommandPaletteOpen()}
-            aria-label="Open command palette"
+            aria-label="Commands: open the command palette"
           >
             <Search className="mr-1.5 h-4 w-4" aria-hidden="true" />
             Commands

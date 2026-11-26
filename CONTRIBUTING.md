@@ -232,9 +232,10 @@ frontend, and embedding/LLM services together.
 
 ## Before you push — run the CI gates locally
 
-CI (`.github/workflows/ci.yml`) runs eight jobs — Frontend, Playwright e2e
-smoke, Playwright a11y matrix, Quality contracts, Detect docker scope, Docker
-build smoke, SAST (bandit), and Backend (full inventory:
+CI (`.github/workflows/ci.yml`) runs nine jobs — Frontend, Playwright e2e
+smoke, Playwright a11y matrix, Playwright a11y gate extensions, Quality
+contracts, Detect docker scope, Docker build smoke, SAST (bandit), and
+Backend (full inventory:
 `docs/engineering/testing.md`, section 4). Reproduce them locally so your PR
 goes green on the first try:
 

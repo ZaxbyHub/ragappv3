@@ -243,7 +243,7 @@ export function DocumentCard({
               className="h-11 w-full"
               onClick={() => onDelete(docId)}
               disabled={isDeleting}
-              aria-label={`Delete ${document.filename}`}
+              aria-label={isDeleting ? `Deleting Document (${document.filename})` : `Delete Document (${document.filename})`}
               aria-busy={isDeleting}
             >
               <Trash2 className="w-4 h-4 mr-2" />

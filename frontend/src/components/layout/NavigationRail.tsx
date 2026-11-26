@@ -417,12 +417,15 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
         </div>
       </div>
 
-      {/* Expand button */}
+      {/* Expand button — #1159 AC2: the accessible name names the action the
+          button performs in its CURRENT state (collapse when expanded),
+          mirroring the ChatShell/FolderTree state-aware-name idiom. */}
       <button
         type="button"
         onClick={() => setIsExpanded(!isExpanded)}
         className="size-8 flex items-center justify-center p-1.5 mb-2 rounded-sm text-muted-foreground bg-card hover:text-foreground transition-colors absolute top-1/2 -translate-y-1/2 border border-border -right-4"
-        aria-label="Expand sidebar"
+        aria-label={isExpanded ? "Collapse sidebar" : "Expand sidebar"}
+        aria-expanded={isExpanded}
       >
         {isExpanded ? <ChevronLeft className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
       </button>
