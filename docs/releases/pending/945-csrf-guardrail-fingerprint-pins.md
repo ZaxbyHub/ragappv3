@@ -35,9 +35,14 @@ Issue: #945 (follow-up to PR #890 / #709)
   `backend/app/api/routes/service_accounts.py`) must persist exactly
   `admin_scope_fingerprint(<creating admin token>)`, the same helper the
   audit-redaction migration in `backend/app/models/database.py` matches.
+  The creating admin token carries several scopes in unsorted order, so a
+  route that re-inlined its own formula (no `sorted()`, another separator,
+  a hardcoded digest) fails the equality. The test runs on the shared
+  `c04_fixtures.seeded_env` (fully migrated temp DB, pool closed on
+  teardown).
   These close the three residual gaps the #945 review found in
-  `test_admin_scope_fingerprint_shape` (non-discriminating order check, no
-  hex-charset check, no created_by equality assertion).
+  `test_admin_scope_fingerprint_shape` (no order check — its input was
+  pre-sorted — no hex-charset check, no created_by equality assertion).
 - **AC4 (preserving)**: GET prompts routes' scope/auth dependencies are
   untouched; `TestListExperimentsEndpoint` in
   `backend/tests/test_prompt_ab_variants.py` passes unchanged.

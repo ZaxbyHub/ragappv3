@@ -20,7 +20,10 @@ completely:
 - EQUALITY with the service-account ``created_by`` formula: a live
   ``POST /api/service-accounts`` must persist exactly
   ``admin_scope_fingerprint(<creating admin token>)`` — the same helper
-  the audit-redaction migration matches (app/models/database.py).
+  the audit-redaction migration matches (app/models/database.py). The
+  creating token carries several scopes in deliberately unsorted order, so
+  a route that re-inlined its own formula (no ``sorted()``, another
+  separator, a hardcoded digest) diverges from the helper and fails.
 """
 
 import hashlib
@@ -121,7 +124,7 @@ def test_empty_scope_value(monkeypatch):
 
 
 @pytest.mark.usefixtures("seeded_env")
-def test_service_account_created_by_equals_fingerprint():
+def test_service_account_created_by_equals_fingerprint(monkeypatch):
     """``created_by`` persisted by POST /api/service-accounts is exactly
     ``admin_scope_fingerprint(<creating admin token>)``.
 
@@ -132,11 +135,19 @@ def test_service_account_created_by_equals_fingerprint():
     token.
 
     ``c04_fixtures.seeded_env`` points ``settings.data_dir`` (so
-    ``settings.sqlite_path``) at a temp directory, maps its admin token to
-    ``["admin:config"]`` server-side, and drains and closes this run's pool
-    entry on teardown, so the route's real ``get_pool`` checkout lands on
-    the temp database and no open connection outlives the test.
+    ``settings.sqlite_path``) at a temp directory and drains and closes this
+    run's pool entry on teardown, so the route's real ``get_pool`` checkout
+    lands on the temp database and no open connection outlives the test.
+
+    The fixture maps its admin token to a single scope, under which every
+    join/sort variant of the formula collapses to the same digest. Remap it
+    to several scopes in deliberately unsorted order (still including the
+    ``admin:config`` the route requires) so the equality discriminates.
     """
+    monkeypatch.setattr(
+        "app.config.settings.admin_token_scopes",
+        {SEEDED_ADMIN_TOKEN: ["admin:users", "admin:config"]},
+    )
     db_path = str(settings.sqlite_path)
     app = FastAPI()
     app.include_router(service_accounts_router, prefix="/api")
@@ -162,6 +173,6 @@ def test_service_account_created_by_equals_fingerprint():
     # Equality with the helper for the SAME creating admin token...
     assert row[0] == expected
     # ...and with the documented formula for that token's scope set.
-    assert row[0] == _FIXED_B
+    assert row[0] == _FIXED_A
     # The secret token itself is never persisted in the audit column.
     assert row[0] != SEEDED_ADMIN_TOKEN
