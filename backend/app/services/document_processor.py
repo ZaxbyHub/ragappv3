@@ -1212,7 +1212,7 @@ def _get_parse_executor() -> ThreadPoolExecutor:
     entry in the same interpreter (tests, embedded runs) can still parse.
     """
     global _PARSE_EXECUTOR
-    if getattr(_PARSE_EXECUTOR, "_shutdown", False):
+    if getattr(_PARSE_EXECUTOR, "_shutdown", False) is True:
         _PARSE_EXECUTOR = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="ingest-parse"
         )

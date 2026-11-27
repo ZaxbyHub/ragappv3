@@ -147,7 +147,7 @@ def _get_curator_offload_executor() -> concurrent.futures.ThreadPoolExecutor:
     schedule work.
     """
     global _CURATOR_OFFLOAD_EXECUTOR
-    if getattr(_CURATOR_OFFLOAD_EXECUTOR, "_shutdown", False):
+    if getattr(_CURATOR_OFFLOAD_EXECUTOR, "_shutdown", False) is True:
         _CURATOR_OFFLOAD_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="wiki-curator"
         )

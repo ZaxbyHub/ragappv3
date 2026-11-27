@@ -3439,11 +3439,18 @@ class BackgroundProcessor:
 
         async def _bounded_call(awaitable, stage: str):
             # Result-returning twin of _bounded for the maintenance calls
-            # whose outcome is logged: returns None on budget expiry (the
-            # janitor/startup-recovery backstops named in their comments own
-            # the un-finished work in that case).
+            # whose outcome is logged. These are the shutdown-critical
+            # "hand the leases back" sweeps: a single fast UPDATE that must
+            # not be STARVED when the drain phases consumed the whole
+            # budget (test_559_lease_integration: a 3 s quiescence wait
+            # burning the full budget must still release the lease). A
+            # small reserved slice keeps them running while preserving
+            # boundedness: worst case stop() takes timeout + slice, and the
+            # slice is capped at the timeout itself so a tiny test budget
+            # cannot stretch far past its own scale.
+            slice_s = min(5.0, timeout)
             try:
-                return await asyncio.wait_for(awaitable, timeout=remaining())
+                return await asyncio.wait_for(awaitable, timeout=max(remaining(), slice_s))
             except asyncio.TimeoutError:
                 logger.warning(
                     "Shutdown stage '%s' exceeded the aggregate stop() budget; "
