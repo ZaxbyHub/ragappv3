@@ -227,9 +227,11 @@ def test_real_lifespan_stop_is_awaited_on_shutdown():
                 )
                 original_stop = processor.stop
 
-                async def recording_stop():
+                async def recording_stop(timeout: float = 60.0):
+                    # #854: the lifespan now passes the remaining aggregate
+                    # budget as stop()'s timeout argument.
                     stop_calls.append(1)
-                    await original_stop()
+                    await original_stop(timeout=timeout)
 
                 processor.stop = recording_stop
 

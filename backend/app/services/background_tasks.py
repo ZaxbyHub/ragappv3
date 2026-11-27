@@ -3698,10 +3698,12 @@ class BackgroundProcessor:
                     len(parked_file_ids),
                 )
                 try:
+                    # _reset_parked_retry_files is a coroutine: await it
+                    # DIRECTLY under the bounded wrapper (to_thread would
+                    # merely CREATE the coroutine in a worker and drop it —
+                    # the never-awaited warning the b13 gate catches).
                     await _bounded_call(
-                        asyncio.to_thread(
-                            self._reset_parked_retry_files, parked_file_ids
-                        ),
+                        self._reset_parked_retry_files(parked_file_ids),
                         "parked-retry file reset",
                     )
                 except Exception:  # noqa: BLE001 — best-effort recovery hint

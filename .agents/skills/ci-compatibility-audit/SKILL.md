@@ -125,6 +125,10 @@ Repository contract job:
   DraftClaim/DraftClaimSource `Optional` fields and the hand-maintained
   TypeScript `| null` mirror drift apart in either direction (issue #789 /
   #912).
+- `python scripts/check_p03_graceful_shutdown.py` — fails if the Dockerfile
+  CMD or start-services.ps1 loses the integer
+  `--timeout-graceful-shutdown` bound, or docker-compose's
+  `stop_grace_period` is not strictly greater than it (issues #854/#799).
 
 SAST job:
 
@@ -202,6 +206,7 @@ python scripts/check_l09_skill_trigger_paths.py
 python scripts/check_l09_index_assets.py
 python scripts/check_l09_memory_response_fields.py
 python scripts/check_n05_draftclaim_nullable.py
+python scripts/check_p03_graceful_shutdown.py
 python scripts/run_bandit.py
 ```
 
