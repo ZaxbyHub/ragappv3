@@ -1,10 +1,14 @@
 """
-Tests for parallelized get_effective_vault_permissions.
+Tests for get_effective_vault_permissions query dispatch.
 
-Covers the asyncio.gather(asyncio.to_thread(...)) concurrent execution at deps.py:420-425.
+Historically covered the asyncio.gather(asyncio.to_thread(...)) concurrent
+dispatch; issue #1206 removed it (concurrent to_thread closures on the
+caller's single shared sqlite3.Connection wedged inside db.execute under
+full-suite CI load — Backend exit 88, watchdog quiet arm, no failing test).
+The file now pins the post-#1206 contract:
 
-Test cases:
-1. All four queries run concurrently via asyncio.gather (verify gather called once with 4 to_thread calls)
+1. The four queries still run via asyncio.to_thread but NEVER through
+   asyncio.gather (gather must not be part of the dispatch path at all)
 2. Result merging: direct membership + group access + public + org all contribute correct levels
 3. Superadmin short-circuit unchanged
 4. Empty vault_ids returns {}
@@ -12,6 +16,9 @@ Test cases:
 6. Normal user baseline level = 0
 7. Error propagation: if one query raises, the exception propagates
 8. Mixed visibility modes produce correct merged permissions
+
+The behavioral overlap pin and the AST source-shape census live in
+backend/tests/test_authz_policy_query_isolation.py (issue #1206 AC1/AC3).
 """
 
 import asyncio
@@ -25,7 +32,6 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from app.api.deps import (
-    _SQLITE_SERIALIZED,
     VAULT_PERMISSION_LEVELS,
     get_effective_vault_permissions,
 )
@@ -115,17 +121,19 @@ def db_conn():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test 1: asyncio.gather is called once with four asyncio.to_thread calls
+# Test 1: the four queries run via to_thread, never through asyncio.gather
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestConcurrency:
-    """Verify all four queries run concurrently via asyncio.gather."""
+    """Verify the four query closures are dispatched without asyncio.gather."""
 
     @pytest.mark.asyncio
-    async def test_four_queries_run_via_asyncio_gather(self, db_conn):
+    async def test_four_queries_run_via_to_thread_without_gather(self, db_conn):
         """
-        get_effective_vault_permissions calls asyncio.gather exactly once,
-        passing four asyncio.to_thread-wrapped query callables.
+        get_effective_vault_permissions wraps all four query closures in
+        asyncio.to_thread, and never dispatches them through asyncio.gather
+        (issue #1206: the gather form ran them concurrently on the caller's
+        single shared sqlite3.Connection and wedged under CI load).
         """
         user_principal = {"id": 1, "role": "member"}
 
@@ -148,18 +156,14 @@ class TestConcurrency:
              patch("asyncio.gather", tracking_gather):
             await get_effective_vault_permissions(db_conn, user_principal, [1, 2, 3])
 
-        # On SERIALIZED builds (sqlite3.threadsafety == 3), all four queries run
-        # concurrently via asyncio.gather. On non-SERIALIZED builds (e.g. Python
-        # 3.11 CI), sqlite3 objects are not thread-safe, so the sequential
-        # branch runs and gather is never called.
-        if _SQLITE_SERIALIZED:
-            assert len(gather_calls) == 1, f"Expected 1 gather call, got {len(gather_calls)}"
-            gathered_coros = gather_calls[0]
-            assert len(gathered_coros) == 4, f"Expected 4 coroutines in gather, got {len(gathered_coros)}"
-        else:
-            assert len(gather_calls) == 0, f"Expected 0 gather calls on non-SERIALIZED SQLite, got {len(gather_calls)}"
+        # Post-#1206 contract: gather is never called, on ANY SQLite build —
+        # the four queries run one at a time on the caller's connection.
+        assert len(gather_calls) == 0, (
+            f"get_effective_vault_permissions dispatched through asyncio.gather "
+            f"({len(gather_calls)} call(s)) — the #1206 wedge construct"
+        )
 
-        # All four queries were wrapped in to_thread regardless of threading mode
+        # All four queries are still wrapped in to_thread (off the event loop)
         assert len(to_thread_calls) == 4, f"Expected 4 to_thread calls, got {len(to_thread_calls)}"
 
 
@@ -378,25 +382,28 @@ class TestErrorPropagation:
                 await get_effective_vault_permissions(db_conn, {"id": 1, "role": "member"}, [1, 2, 3])
 
     @pytest.mark.asyncio
-    async def test_exception_propagates_from_gather(self, db_conn):
-        """If any awaitable in asyncio.gather raises, gather propagates that exception."""
+    async def test_raising_gather_patch_is_inert(self, db_conn):
+        """gather is no longer part of the dispatch path (issue #1206).
 
-        if not _SQLITE_SERIALIZED:
-            pytest.skip("asyncio.gather not used on non-SERIALIZED SQLite builds")
+        Replacing asyncio.gather with one that immediately raises must have
+        NO effect on get_effective_vault_permissions: the call completes and
+        returns the correct merged permissions, proving the four queries are
+        not bound through gather to the caller's shared connection anymore.
+        (The AST source-shape pin for the same contract is
+        test_authz_policy_query_isolation.py::test_no_shared_connection_gather.)
+        """
 
-        # Replace asyncio.gather with one that immediately raises. The four
-        # asyncio.to_thread(...) coroutines passed in were already CREATED at
-        # the call site; discard them explicitly (as a gather that fails
-        # before scheduling would own them) so they are not destroyed
-        # un-awaited (issue #565 gate).
         async def raising_gather(*coros):
             for coro in coros:
                 coro.close()
-            raise RuntimeError("simulated DB failure")
+            raise RuntimeError("simulated gather failure")
 
         with patch("asyncio.gather", raising_gather):
-            with pytest.raises(RuntimeError, match="simulated DB failure"):
-                await get_effective_vault_permissions(db_conn, {"id": 1, "role": "member"}, [1])
+            result = await get_effective_vault_permissions(
+                db_conn, {"id": 20, "role": "member"}, [1, 2]
+            )
+
+        assert result == {1: None, 2: "read"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

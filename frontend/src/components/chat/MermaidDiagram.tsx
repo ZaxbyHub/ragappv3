@@ -25,14 +25,20 @@ export const MermaidDiagramTestInternals = {
 
 const MermaidDiagram = memo(function MermaidDiagram({ chart }: MermaidDiagramProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [svg, setSvg] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const chartRef = useRef(chart);
-  chartRef.current = chart;
+  // Render output is tagged with the chart it was produced from (issue #836:
+  // stale mermaid diagram on chart change). While a redraw for a newly
+  // selected chart is pending, output tagged for a previous chart is never
+  // displayed, and a late out-of-order completion cannot present stale
+  // output for a chart that is no longer selected.
+  const [rendered, setRendered] = useState<{ chart: string; svg: string } | null>(null);
+  const [error, setError] = useState<{ chart: string; message: string } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     const id = nextMermaidId();
+    // The chart this draw belongs to, captured at draw start so the result is
+    // always tagged with the chart that was selected when it began.
+    const drawChart = chart;
 
     // Lazily import mermaid to avoid penalizing first paint
     import("mermaid").then((mermaidModule) => {
@@ -47,10 +53,10 @@ const MermaidDiagram = memo(function MermaidDiagram({ chart }: MermaidDiagramPro
       });
 
       mermaid
-        .render(id, chartRef.current)
+        .render(id, drawChart)
         .then(({ svg: renderedSvg }) => {
           if (!cancelled) {
-            setSvg(renderedSvg);
+            setRendered({ chart: drawChart, svg: renderedSvg });
             setError(null);
           }
         })
@@ -59,8 +65,8 @@ const MermaidDiagram = memo(function MermaidDiagram({ chart }: MermaidDiagramPro
           // mermaid.render throws on invalid syntax — show a clean fallback
           const message =
             err instanceof Error ? err.message : typeof err === "string" ? err : "Invalid diagram";
-          setError(message);
-          setSvg(null);
+          setError({ chart: drawChart, message });
+          setRendered(null);
         });
     })
     .catch((err: unknown) => {
@@ -70,8 +76,8 @@ const MermaidDiagram = memo(function MermaidDiagram({ chart }: MermaidDiagramPro
       // TQ-sibling-batch-01-06). Same fallback shape as a render failure.
       const message =
         err instanceof Error ? err.message : typeof err === "string" ? err : "Failed to load diagram renderer";
-      setError(message);
-      setSvg(null);
+      setError({ chart: drawChart, message });
+      setRendered(null);
     });
 
     return () => {
@@ -79,7 +85,13 @@ const MermaidDiagram = memo(function MermaidDiagram({ chart }: MermaidDiagramPro
     };
   }, [chart]);
 
-  if (error) {
+  // Only output produced for the currently selected chart is displayed.
+  const svg = rendered?.chart === chart ? rendered.svg : null;
+  // Gate on the tagged error itself, not on message truthiness, so a failure
+  // with an empty message still shows the fallback instead of the spinner.
+  const errorMessage = error?.chart === chart ? error.message : null;
+
+  if (errorMessage !== null) {
     return (
       <div
         className="my-3 rounded-sm border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive"
@@ -87,7 +99,7 @@ const MermaidDiagram = memo(function MermaidDiagram({ chart }: MermaidDiagramPro
         data-testid="mermaid-error"
       >
         <p className="font-semibold">Diagram rendering error</p>
-        <pre className="mt-1 overflow-x-auto text-xs whitespace-pre-wrap">{error}</pre>
+        <pre className="mt-1 overflow-x-auto text-xs whitespace-pre-wrap">{errorMessage}</pre>
       </div>
     );
   }

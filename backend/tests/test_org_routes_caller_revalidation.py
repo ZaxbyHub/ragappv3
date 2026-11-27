@@ -45,7 +45,6 @@ from pathlib import Path  # noqa: E402
 
 from fastapi import HTTPException  # noqa: E402
 
-from app.api.routes import organizations as org_mod  # noqa: E402
 from app.api.routes.organizations import (  # noqa: E402
     OrgInviteCreateRequest,
     OrgMemberRequest,
@@ -99,7 +98,12 @@ class _MultiConnPool:
 
 
 class _RaceEnv:
-    """Per-test world: fresh db, real pool, patched org-route pool binding."""
+    """Per-test world: fresh db, real pool, per-caller facade connections.
+
+    The org routes take a request-scoped ``db=`` connection (#798 AC4), so
+    direct handler calls check their connection out of the facade at the
+    call site — one fresh connection per simulated request, exactly as the
+    pre-migration handler checkout did."""
 
     def __init__(self, tmp_path: Path) -> None:
         _pool_cache.clear()
@@ -107,8 +111,6 @@ class _RaceEnv:
         init_db(self.db_path)
         self.pool = SQLiteConnectionPool(self.db_path, max_size=6)
         self.facade: object = _MultiConnPool(self.pool)
-        self._saved_get_pool = org_mod.get_pool
-        org_mod.get_pool = lambda _p: self.facade
 
     def seed_org(self, with_override: bool = False) -> None:
         """Users 1 (org owner), 2 (org admin — the stale caller), 4 (a plain
@@ -192,7 +194,6 @@ class _RaceEnv:
             check.close()
 
     def close(self) -> None:
-        org_mod.get_pool = self._saved_get_pool
         for conn in list(getattr(self.facade, "_out", [])):
             try:
                 self.pool.release_connection(conn)
@@ -227,36 +228,48 @@ def _stale_privilege_interleave(racing):  # noqa: ANN001
     return build, state
 
 
-def _racing_caller_demotion() -> object:
+def _racing_caller_demotion(env: "_RaceEnv") -> object:
     """The racing handler: the org owner demotes the stale caller (user 2)
-    from org admin to plain member after the caller's check has passed."""
+    from org admin to plain member after the caller's check has passed.
+    Runs on its own fresh facade connection (``db=`` at the call site)."""
 
     async def race() -> None:
-        await update_org_member_role(
-            ORG_ID,
-            2,
-            OrgMemberUpdateRequest(role="member"),
-            user=OWNER,
-            _csrf_token="t",
-        )
+        conn = await env.facade.get_connection_async()
+        try:
+            await update_org_member_role(
+                ORG_ID,
+                2,
+                OrgMemberUpdateRequest(role="member"),
+                user=OWNER,
+                _csrf_token="t",
+                db=conn,
+            )
+        finally:
+            env.facade.release_connection(conn)
 
     return race()
 
 
-def _drive_interleaved(build, drive_factory) -> dict:  # noqa: ANN001
-    """Run the driven handler with the wrapped asyncio.to_thread."""
+def _drive_interleaved(build, env, drive_factory) -> dict:  # noqa: ANN001
+    """Run the driven handler with the wrapped asyncio.to_thread.
+
+    ``drive_factory`` receives the request-scoped ``db=`` connection,
+    checked out of the env facade per simulated request and released by
+    this CALLER afterwards (the handler no longer releases db, #798 AC4)."""
     real_to_thread = asyncio.to_thread
     scripted = build(real_to_thread)
     outcome: dict = {}
 
     async def drive() -> None:
         asyncio.to_thread = scripted
+        conn = await env.facade.get_connection_async()
         try:
-            result = await drive_factory()
+            result = await drive_factory(conn)
             outcome["ok"] = str(result)
         except HTTPException as exc:
             outcome["refused_status"] = exc.status_code
         finally:
+            env.facade.release_connection(conn)
             asyncio.to_thread = real_to_thread
 
     asyncio.run(drive())
@@ -293,14 +306,18 @@ def test_add_org_member_stale_caller_is_refused(tmp_path: Path) -> None:
     env = _RaceEnv(tmp_path)
     try:
         env.seed_org()
-        build, state = _stale_privilege_interleave(_racing_caller_demotion)
+        build, state = _stale_privilege_interleave(
+            lambda: _racing_caller_demotion(env)
+        )
         outcome = _drive_interleaved(
             build,
-            lambda: add_org_member(
+            env,
+            lambda db: add_org_member(
                 ORG_ID,
                 OrgMemberRequest(user_id=4, role="member"),
                 user=STALE_CALLER,
                 _csrf_token="t",
+                db=db,
             ),
         )
         _assert_armed_then_refused(
@@ -324,14 +341,18 @@ def test_create_org_invite_stale_caller_is_refused(tmp_path: Path) -> None:
     env = _RaceEnv(tmp_path)
     try:
         env.seed_org()
-        build, state = _stale_privilege_interleave(_racing_caller_demotion)
+        build, state = _stale_privilege_interleave(
+            lambda: _racing_caller_demotion(env)
+        )
         outcome = _drive_interleaved(
             build,
-            lambda: create_org_invite(
+            env,
+            lambda db: create_org_invite(
                 ORG_ID,
                 OrgInviteCreateRequest(email="invitee4", role="member"),
                 user=STALE_CALLER,
                 _csrf_token="t",
+                db=db,
             ),
         )
         _assert_armed_then_refused(
@@ -359,11 +380,14 @@ def test_resend_org_invite_stale_caller_is_refused(tmp_path: Path) -> None:
     try:
         env.seed_org()
         invite_id = env.seed_pending_invite(RESEND_TOKEN_HASH)
-        build, state = _stale_privilege_interleave(_racing_caller_demotion)
+        build, state = _stale_privilege_interleave(
+            lambda: _racing_caller_demotion(env)
+        )
         outcome = _drive_interleaved(
             build,
-            lambda: resend_org_invite(
-                ORG_ID, invite_id, user=STALE_CALLER, _csrf_token="t"
+            env,
+            lambda db: resend_org_invite(
+                ORG_ID, invite_id, user=STALE_CALLER, _csrf_token="t", db=db
             ),
         )
         _assert_armed_then_refused(
@@ -390,11 +414,14 @@ def test_revoke_org_invite_stale_caller_is_refused(tmp_path: Path) -> None:
     try:
         env.seed_org()
         invite_id = env.seed_pending_invite(REVOKE_TOKEN_HASH)
-        build, state = _stale_privilege_interleave(_racing_caller_demotion)
+        build, state = _stale_privilege_interleave(
+            lambda: _racing_caller_demotion(env)
+        )
         outcome = _drive_interleaved(
             build,
-            lambda: revoke_org_invite(
-                ORG_ID, invite_id, user=STALE_CALLER, _csrf_token="t"
+            env,
+            lambda db: revoke_org_invite(
+                ORG_ID, invite_id, user=STALE_CALLER, _csrf_token="t", db=db
             ),
         )
         _assert_armed_then_refused(
@@ -420,14 +447,18 @@ def test_set_prompt_override_stale_caller_is_refused(tmp_path: Path) -> None:
     env = _RaceEnv(tmp_path)
     try:
         env.seed_org()
-        build, state = _stale_privilege_interleave(_racing_caller_demotion)
+        build, state = _stale_privilege_interleave(
+            lambda: _racing_caller_demotion(env)
+        )
         outcome = _drive_interleaved(
             build,
-            lambda: set_prompt_override(
+            env,
+            lambda db: set_prompt_override(
                 ORG_ID,
                 PromptOverrideSetRequest(version="v1"),
                 user=STALE_CALLER,
                 _csrf_token="t",
+                db=db,
             ),
         )
         _assert_armed_then_refused(
@@ -455,11 +486,14 @@ def test_clear_prompt_override_stale_caller_is_refused(tmp_path: Path) -> None:
     env = _RaceEnv(tmp_path)
     try:
         env.seed_org(with_override=True)
-        build, state = _stale_privilege_interleave(_racing_caller_demotion)
+        build, state = _stale_privilege_interleave(
+            lambda: _racing_caller_demotion(env)
+        )
         outcome = _drive_interleaved(
             build,
-            lambda: clear_prompt_override(
-                ORG_ID, user=STALE_CALLER, _csrf_token="t"
+            env,
+            lambda db: clear_prompt_override(
+                ORG_ID, user=STALE_CALLER, _csrf_token="t", db=db
             ),
         )
         _assert_armed_then_refused(
