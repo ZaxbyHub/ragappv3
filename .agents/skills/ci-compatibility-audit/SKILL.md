@@ -283,10 +283,11 @@ sloppy paths.
 ## Backend CI flake signature table (issue #1101)
 
 A red Backend job is not always a regression. Before touching code, match the
-failing log against the five documented ragappv3 Backend flake families below
+failing log against the six documented ragappv3 Backend flake families below
 (signatures quoted from the documented incidents — PR #642, the C32
-occurrences, issue #943, the 2026-10-23 freeze, and issue #1021 / PR #1095
-run 42448434901 — so classification no longer depends on out-of-repo memory).
+occurrences, issue #943, the 2026-10-23 freeze, issue #1021 / PR #1095
+run 42448434901, and PR #1193 run 44980853822 — so classification no longer
+depends on out-of-repo memory).
 
 | Family | Log signature | Diff-foreign discriminator |
 |---|---|---|
@@ -295,6 +296,7 @@ run 42448434901 — so classification no longer depends on out-of-repo memory).
 | secretscan rglob-during-coverage-walk (#943) | `scripts/check_secretscan.py` crashes with a `FileNotFoundError` traceback from inside its repo-wide `Path.rglob` walk — a transient directory (coverage artifacts written under the repo root mid-suite) vanished between the parent listing and the recursion. | The diff touches no secretscan/coverage wiring, and the crash coincides with a coverage step writing transient artifacts under the repo root. Known producers are already closed: vitest coverage confined via `--coverage.reportsDirectory` (`backend/tests/test_issue258_coverage_gate.py`) and the walks made vanish-tolerant (`backend/tests/test_943_secretscan_walk_robustness.py`). |
 | Backend whole-job freeze, empty live log | The job dies at exactly its `timeout-minutes: 60` with ALL xdist workers silent mid-suite (~14 min of green progress at 94-98% passed) and NO pytest-timeout markers in the log. Absent TIMEOUT markers are the tell: the wait is C-level (socket/DNS/pipe), uninterruptible by pytest-timeout. 2026-10-23 incident: master froze identically 4 minutes later on a tree without the PR. | `gh run view <master-run> --job <backend-job> --log` shows the same silent cutoff at the same wall-clock on master (compare last-PASSED timestamps and percentages across trees), and the local full suite with `--timeout-method=thread --no-cov` completes. |
 | #1021 hang-class canary timeout | The env-gated canary step (`RUN_CI_HANG_CANARY=1`) fails `backend/tests/test_ci_hang_canary.py::test_wedge_starved_pool_join_aborted_by_configured_timeout` with `Failed: Timeout (>30.0s) from pytest-timeout` and a crashed worker (PR #1095 feedback push, run 42448434901; cleared by `gh run rerun --failed` with zero code change). | The diff touches neither `backend/tests/test_ci_hang_canary.py` nor its canary step in `ci.yml`; the canary is a deliberately committed wedge whose timely abort depends on runner scheduling. |
+| admission-cleanup load sensitivity (PR #1193) | `backend/tests/test_c08_admission_rejected_cleanup.py` fails inside the full-suite xdist Backend job (run 44980853822 at head 6667069d, alongside a #1021-family canary timeout in the same job); the follow-up run 44984995043 at head 86142f8a was green with zero application-code change. Mechanism undiagnosed — classified diff-foreign per the protocol below, not by a reproduced mechanism. | The only delta between the failed and passed heads is `backend/tests/eval/test_live_eval_adapter.py` (an unrelated eval-adapter test file, not the failing surface, no shared fixtures), and the failure set did not repeat on the rerun. If a rerun at the SAME head reproduces it, treat as a regression and diagnose. |
 
 ### Classification protocol (runs before the rerun decision)
 
