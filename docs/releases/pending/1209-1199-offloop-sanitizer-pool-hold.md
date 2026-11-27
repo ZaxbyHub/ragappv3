@@ -53,7 +53,7 @@
   total, the ci.yml step included)
   (`AGENTS.md`, `docs/engineering/conventions.md`,
   `docs/engineering/testing.md`, `CONTRIBUTING.md`, the
-  `ci-compatibility-audit` and `ci-fix-monitor` skills); contract tests (24) in
+  `ci-compatibility-audit` and `ci-fix-monitor` skills); contract tests (26) in
   `backend/tests/test_double_hold_guardrail.py`.
 
 ## Why

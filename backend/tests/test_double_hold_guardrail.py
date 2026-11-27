@@ -395,3 +395,47 @@ def test_draft_room_exception_is_file_scoped():
     )
     violations = guard.scan_source("other.py", src)
     assert any("C-DBLHOLD-1" in v for v in violations), violations
+
+
+def test_draft_room_exception_matches_the_exact_function_name():
+    """Only the EXACT ``_commit_upload`` nested function is exempt.
+
+    Regression pin: loosening the name check to a prefix match
+    (``startswith("_commit")``) would silently exempt a sibling nested
+    function such as ``_commit_audit`` in the same handler.
+    """
+    src = (
+        "from fastapi import APIRouter, Depends\n"
+        "router = APIRouter()\n"
+        "\n"
+        "@router.post('/x')\n"
+        "async def upload_draft_input(user=Depends(require_role('admin'))):\n"
+        "    async def _commit_upload():\n"
+        "        async with db_pool.connection_async() as conn:\n"
+        "            pass\n"
+        "    async def _commit_audit():\n"
+        "        async with db_pool.connection_async() as conn:\n"
+        "            pass\n"
+        "    return 1\n"
+    )
+    violations = guard.scan_source("draft_room.py", src)
+    assert any("C-DBLHOLD-1" in v for v in violations), violations
+
+
+def test_bare_attribute_decorator_form_is_scanned():
+    """The scanner accepts the bare-attribute decorator form too.
+
+    Regression pin: the bare-attribute branch of the decorator check had no
+    test, so it could be deleted without any test failing.
+    """
+    src = (
+        "from fastapi import APIRouter, Depends\n"
+        "router = APIRouter()\n"
+        "\n"
+        "@router.get\n"
+        "async def h(user=Depends(require_role('admin'))):\n"
+        "    conn = await pool.get_connection_async()\n"
+        "    return 1\n"
+    )
+    violations = guard.scan_source("synthetic.py", src)
+    assert any("C-DBLHOLD-1" in v for v in violations), violations
