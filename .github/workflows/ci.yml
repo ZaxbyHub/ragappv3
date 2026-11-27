@@ -243,8 +243,8 @@ jobs:
 
       # Issues #854/#799: the shutdown envelope's ONE derivation — every
       # force-kill limit (the compose grace and both native stop waits) must
-      # sit strictly above the 135 s natural worst case, and every surface
-      # must quote that same total.
+      # sit strictly above the 135 s composed envelope, and every surface
+      # must quote that same derivation verbatim.
       - name: Shutdown envelope derivation check
         run: python scripts/check_p03_shutdown_envelope.py
 

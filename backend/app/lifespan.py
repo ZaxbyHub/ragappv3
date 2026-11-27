@@ -61,15 +61,18 @@ logger = logging.getLogger(__name__)  # noqa: E402
 #
 # The process envelope's ONE derivation, quoted VERBATIM by
 # docker-compose.yml, both .ps1 scripts, the release fragment and the PR
-# body:
-#   20 s (uvicorn request drain) + 65 s (lifespan aggregate) + 15 s (turn-finalizer drain) + 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 135 s
+# body. The three ENFORCED terms are bounded by the code that implements
+# them; the two ALLOWANCE terms (the executor-join tail and the
+# interpreter teardown) are bounded by NO code:
+#   enforced: 20 s (uvicorn request drain) + 65 s (lifespan aggregate) + 15 s (turn-finalizer drain) = 100 s; allowance: 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 35 s; total 135 s
 # (the 65 s is this 60 s budget plus the 5 s outer cap on the processor
 # stop; the 15 s is the turn-finalizer drain's 5 s producer retirement plus
-# its 10 s drain.) The 135 s natural worst case sits below the 140 s native
-# stop wait and the 150 s compose grace.
+# its 10 s drain.) The 135 s composed envelope sits below the 140 s native
+# stop wait and the 150 s compose grace, so a shutdown that stays inside
+# the enforced 100 s is never force-killed mid-flight.
 # scripts/check_p03_shutdown_envelope.py owns that arithmetic: it reads
-# every component from the code that enforces it and fails when a surface
-# stops quoting this line.
+# every enforced term from the code that enforces it and fails when a
+# surface stops quoting this line.
 _SHUTDOWN_BUDGET_SECONDS = 60.0
 
 # The extra cap the lifespan puts on the background processor's stop: the
@@ -1362,10 +1365,31 @@ async def lifespan(app: FastAPI):
                     e,
                 )
         if pending_settle:
+            # PROCESS-LEVEL INVARIANT (disclosed, #799/#854): the shutdown
+            # SEQUENCE stays bounded — this settle ended on its own budget
+            # and the stages below keep running. The PROCESS EXIT is
+            # bounded by two mechanisms, and this warning names the one
+            # that applies:
+            #   * State A — the bounded tail exit fires (the registry is
+            #     empty, the finalizers drained, the pool closed) and
+            #     os._exit ends the process, so a detached task never
+            #     delays the exit;
+            #   * State B — the tail exit declines (a critical workflow is
+            #     still in flight, so the pool is deliberately left open),
+            #     the event loop's teardown then waits for this task, and
+            #     the PROCESS-LEVEL FORCE BOUNDARY ends the process: the
+            #     compose stop grace (150 s) or the native stop wait
+            #     (140 s), both above the composed envelope.
+            # A task that ignores cancellation can therefore delay the
+            # exit in State B up to that force boundary — it cannot make
+            # the shutdown sequence itself unbounded, and it cannot make
+            # the process outlive the force limits in the shipped launch
+            # configurations.
             logger.warning(
                 "%d residency task(s) did not settle within the aggregate "
                 "shutdown budget; continuing shutdown (they were asked to "
-                "cancel and are detached)",
+                "cancel and are detached; the process-level force boundary "
+                "ends the exit if the bounded tail exit declines)",
                 len(pending_settle),
             )
 

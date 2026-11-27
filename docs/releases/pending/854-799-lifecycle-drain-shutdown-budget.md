@@ -29,24 +29,38 @@ retirement + 10 s drain, `TURN_PRODUCER_SHUTDOWN_TIMEOUT_SECONDS` /
 `TURN_FINALIZE_DRAIN_TIMEOUT_SECONDS`).
 
 ONE derivation, quoted VERBATIM by docker-compose.yml, both .ps1 scripts,
-the lifespan module and the PR body — the natural worst case is:
+the lifespan module and the PR body — the composed shutdown envelope is:
 
-    20 s (uvicorn request drain) + 65 s (lifespan aggregate) + 15 s (turn-finalizer drain) + 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 135 s
+    enforced: 20 s (uvicorn request drain) + 65 s (lifespan aggregate) + 15 s (turn-finalizer drain) = 100 s; allowance: 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 35 s; total 135 s
 
 (the 65 s is the 60 s lifespan aggregate plus the 5 s outer cap on the
 processor stop; the 15 s is the turn-finalizer drain's 5 s producer
 retirement plus its 10 s drain.)
 
 `scripts/check_p03_shutdown_envelope.py` owns that arithmetic: it reads
-every component from the code that enforces it (the Dockerfile's uvicorn
-grace, the lifespan module's shutdown budget and processor-stop cap, the
-turn-finalizer drain's own constants and the SQLite busy timeout that
-bounds the executor-join tail), requires every force-kill limit to sit
-strictly above the total, and fails when a surface stops quoting the
-derivation verbatim.
+every ENFORCED term from the code that enforces it (the Dockerfile CMD's
+uvicorn grace, the lifespan module's shutdown budget and processor-stop
+cap, and the turn-finalizer drain's own constants), requires every
+force-kill limit to sit strictly above the total, and fails when a surface
+stops quoting the derivation verbatim. The two ALLOWANCE terms are declared
+in that script as policy: no code bounds the executor-join tail (the
+abandoned-parse worker keeps running) or the interpreter teardown.
 
 The compose grace is 150 s and the native stop wait is 140 s — both strictly
-above 135 s, so a healthy shutdown is never force-killed mid-flight.
+above the 135 s composed envelope, so a shutdown that stays inside the
+enforced 100 s is never force-killed mid-flight.
+
+**The residency settle ends on its bound, not on a task's cooperation.**
+Awaiting a residency task DIRECTLY forwards the enclosing scope's
+cancellation into it, so a task that suppresses that cancellation never
+completes and the whole shutdown hangs until the outer force boundary. The
+settle now waits with `asyncio.wait`, which returns the still-pending set
+instead of forwarding the wait, so a task that refuses to die costs the
+settle its budget and nothing more. The shutdown SEQUENCE is therefore
+always bounded (the enforced 100 s); the PROCESS EXIT is bounded by the
+bounded tail exit in State A (`os._exit`, so a detached task never delays
+it) and by the process-level force boundary in State B (the compose grace
+150 s / native stop wait 140 s). The settle's own warning names that.
 
 **A bounded tail exit.** After every recovery-critical workflow completes
 (deny-by-default `critical_shutdown_work` registry EMPTY, turn finalizers
@@ -141,7 +155,7 @@ restarts working.
 - backend/tests/test_p03_lifecycle_behavioral.py (C13/C14/C15/C16 behavioral)
 - backend/tests/test_p03_shutdown_ownership.py (registry, tail-gate matrices, executor recreation, env pop pin)
 - scripts/check_p03_graceful_shutdown.py (C5 structural; wired into the CI Quality contracts job by this PR)
-- scripts/check_p03_shutdown_envelope.py (new in this PR; wired into the CI Quality contracts job — it owns the ONE envelope derivation and fails if the compose grace, either native stop wait, or any surface's quoted total drifts from the 135 s natural worst case)
+- scripts/check_p03_shutdown_envelope.py (new in this PR; wired into the CI Quality contracts job — it owns the ONE envelope derivation: it reads every ENFORCED term from the code that enforces it, declares the two ALLOWANCE terms explicitly, and fails if the compose grace, either native stop wait, or any surface's quoted derivation drifts from the 135 s composed envelope)
 
 UX note: stop-services.ps1 now waits up to 15 s for non-backend ports
 (frontend/Ollama) before force-stopping, instead of force-killing

@@ -25,8 +25,13 @@ BUDGET_SECONDS = 1.0
 STALL_SECONDS = 3.0
 # Guard on the shutdown phase for the residency test. A mutant that drops
 # the settle's timeout wrapper hangs the shutdown; the guard ends it. The
-# bound assertion below is what the shipped code satisfies.
+# bound assertion below is what the shipped code satisfies. The guard is
+# measured from the START of the shutdown phase, so a slow startup cannot
+# shorten it.
 SHUTDOWN_GUARD_SECONDS = 45.0
+# A separate, generous bound on reaching the shutdown phase at all (a
+# startup that never completes would otherwise hang the test).
+STARTUP_GUARD_SECONDS = 120.0
 
 
 class _Stall:
@@ -175,6 +180,7 @@ class TestLifespanAggregateBudget(unittest.IsolatedAsyncioTestCase):
         tmp = Path(tempfile.mkdtemp())
         restore = _pin_lifespan_settings(tmp, editorial=True)
         task_still_running = None
+        startup_deadline = time.monotonic() + STARTUP_GUARD_SECONDS
         try:
             with patch.object(
                 lifespan_mod, "_SHUTDOWN_BUDGET_SECONDS", BUDGET_SECONDS
@@ -194,16 +200,39 @@ class TestLifespanAggregateBudget(unittest.IsolatedAsyncioTestCase):
                 # supposed to catch. asyncio.wait returns when its timeout
                 # expires, whatever the task is doing.
                 scenario_task = asyncio.create_task(scenario())
-                await asyncio.wait(
-                    {scenario_task},
-                    timeout=BUDGET_SECONDS + SHUTDOWN_GUARD_SECONDS,
-                )
-                if not scenario_task.done():
-                    self.fail(
-                        f"the residency settle did not finish within "
-                        f"{BUDGET_SECONDS + SHUTDOWN_GUARD_SECONDS:g}s — it "
-                        "is waiting on the residency task's cooperation "
-                        "instead of ending on its own bound"
+                # The guard covers the SHUTDOWN phase only: the scenario
+                # records the moment the shutdown starts (the end of the
+                # lifespan body), and the guard's deadline is measured
+                # from THAT moment — so a slow startup cannot shorten the
+                # window in which the mutant hangs.
+                shutdown_deadline = None
+                while not scenario_task.done():
+                    now = time.monotonic()
+                    if shutdown_deadline is None:
+                        if "start" not in timings:
+                            if now > startup_deadline:
+                                self.fail(
+                                    "the lifespan never reached the shutdown "
+                                    f"phase within {STARTUP_GUARD_SECONDS:g}s"
+                                )
+                            await asyncio.wait({scenario_task}, timeout=0.2)
+                            continue
+                        shutdown_deadline = (
+                            timings["start"]
+                            + BUDGET_SECONDS
+                            + SHUTDOWN_GUARD_SECONDS
+                        )
+                    remaining = shutdown_deadline - time.monotonic()
+                    if remaining <= 0:
+                        self.fail(
+                            "the residency settle did not finish within "
+                            f"{BUDGET_SECONDS + SHUTDOWN_GUARD_SECONDS:g}s of "
+                            "the shutdown phase — it is waiting on the "
+                            "residency task's cooperation instead of ending "
+                            "on its own bound"
+                        )
+                    await asyncio.wait(
+                        {scenario_task}, timeout=min(remaining, 0.2)
                     )
                 scenario_task.result()
                 # The prime ignores cancellation, so it is still running
