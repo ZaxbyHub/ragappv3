@@ -17,9 +17,10 @@ the caller's single `sqlite3.Connection`. The module-level
 `_SQLITE_SERIALIZED` flag and the `_warn_fallback_threading()` helper are
 preserved for non-SERIALIZED builds, but the flag now only gates the
 once-per-process diagnostic warning — the dispatch shape is identical in both
-modes. The warning (logged only on non-SERIALIZED builds) now says SQLite
-does not mutex connections there, so a request connection must never be
-used by two threads at once.
+modes. The warning (logged only on non-SERIALIZED builds) now reports the
+`sqlite3.threadsafety` level and says level 1 needs a request connection
+never used by two threads at once, while level 0 is unsafe for any
+multi-threaded use.
 
 The no-concurrent-dispatch contract is pinned twice in the new
 `backend/tests/test_authz_policy_query_isolation.py`:
