@@ -616,9 +616,12 @@ describe('AdminUsersPage error handling', () => {
     // Fill form - use id selectors to avoid ambiguity
     const usernameInput = document.getElementById('create-username')!;
     const passwordInput = document.getElementById('create-password')!;
+    // #1189: the create dialog requires the password to be entered twice.
+    const confirmInput = document.getElementById('create-confirm-password')!;
     await act(async () => {
       fireEvent.change(usernameInput, { target: { value: 'newuser' } });
       fireEvent.change(passwordInput, { target: { value: 'Password123!' } });
+      fireEvent.change(confirmInput, { target: { value: 'Password123!' } });
     });
 
     // Submit via form submit button inside dialog
@@ -648,9 +651,12 @@ describe('AdminUsersPage error handling', () => {
 
     const usernameInput = document.getElementById('create-username')!;
     const passwordInput = document.getElementById('create-password')!;
+    // #1189: the create dialog requires the password to be entered twice.
+    const confirmInput = document.getElementById('create-confirm-password')!;
     await act(async () => {
       fireEvent.change(usernameInput, { target: { value: 'newuser' } });
       fireEvent.change(passwordInput, { target: { value: 'Password123!' } });
+      fireEvent.change(confirmInput, { target: { value: 'Password123!' } });
     });
 
     const dialogEl = screen.getByTestId('dialog');

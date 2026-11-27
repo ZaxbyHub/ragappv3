@@ -39,6 +39,7 @@ export function CreateUserDialog({
   const [username, setUsername] = useState("");
   const [fullName, setFullName] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [role, setRole] = useState<UserRole>("member");
   const [isCreating, setIsCreating] = useState(false);
 
@@ -64,12 +65,17 @@ export function CreateUserDialog({
       toast.error("Password cannot be only whitespace");
       return;
     }
+    if (password !== confirmPassword) {
+      toast.error("Passwords do not match");
+      return;
+    }
     setIsCreating(true);
     try {
       await onCreate(username.trim(), fullName.trim(), password, role);
       setUsername("");
       setFullName("");
       setPassword("");
+      setConfirmPassword("");
       setRole("member");
     } finally {
       setIsCreating(false);
@@ -81,6 +87,7 @@ export function CreateUserDialog({
       setUsername("");
       setFullName("");
       setPassword("");
+      setConfirmPassword("");
       setRole("member");
     }
     onOpenChange(open);
@@ -149,9 +156,28 @@ export function CreateUserDialog({
                 disabled={isCreating}
                 required
                 minLength={8}
-                aria-describedby="password-requirements"
+                aria-describedby="password-requirements first-signin-note"
               />
               <PasswordRequirements id="password-requirements" />
+              <p id="first-signin-note" className="text-sm text-muted-foreground">
+                The user must change this password at their first sign-in.
+              </p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="create-confirm-password">
+                Confirm Password
+                <span className="text-destructive">*</span>
+              </Label>
+              <Input
+                id="create-confirm-password"
+                type="password"
+                placeholder="Re-enter password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                disabled={isCreating}
+                required
+                aria-describedby="first-signin-note"
+              />
             </div>
             <div className="space-y-2">
               <Label htmlFor="create-role">Role</Label>
