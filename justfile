@@ -131,6 +131,7 @@ quality-contracts:
     python scripts/check_l09_index_assets.py
     python scripts/check_l09_memory_response_fields.py
     python scripts/check_n05_draftclaim_nullable.py
+    python scripts/check_p03_graceful_shutdown.py
 
 # SAST job (CI installs backend/requirements-dev.txt first)
 sast:
