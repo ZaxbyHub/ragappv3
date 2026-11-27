@@ -54,7 +54,9 @@ reading the dependency sources):
     acquire-and-release-inside-the-dependency), require_model_ready /
     require_ingest_ready (deps.py:199/:228, get_vector_store only),
     require_kms_enabled (kms.py:29, no deps), require_health_probe_auth /
-    require_deep_health_probe_auth (deps.py:722/:778, headers only).
+    require_deep_health_probe_auth (deps.py:722/:778 — they acquire and
+    release a connection inside the dependency on the user path, so they
+    hold nothing across the handler).
 
 Documented exception (independent-lifetime ownership, NOT a migration site):
   - draft_room.py ``upload_draft_input``: its detached commit task
@@ -234,8 +236,19 @@ def main() -> int:
     routes_dir = (
         Path(__file__).resolve().parents[1] / "backend" / "app" / "api" / "routes"
     )
+    scanned = sorted(routes_dir.glob("*.py"))
+    if not scanned:
+        # Fail closed: a relocated or empty routes directory must not look
+        # like a clean scan (the gate's whole value is that "0 findings"
+        # means "scanned and clean", not "scanned nothing").
+        print(
+            "check_double_hold_routes: FAIL - no route modules found at "
+            f"{routes_dir}; refusing to report a clean scan",
+            file=sys.stderr,
+        )
+        return 2
     violations: list[str] = []
-    for path in sorted(routes_dir.glob("*.py")):
+    for path in scanned:
         violations.extend(scan_file(path))
     for line in violations:
         print(line)

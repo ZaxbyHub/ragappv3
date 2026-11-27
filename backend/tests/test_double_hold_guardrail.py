@@ -439,3 +439,55 @@ def test_bare_attribute_decorator_form_is_scanned():
     )
     violations = guard.scan_source("synthetic.py", src)
     assert any("C-DBLHOLD-1" in v for v in violations), violations
+
+
+def test_main_scans_the_live_routes_tree(tmp_path, monkeypatch, capsys):
+    """The gate's own entry point must scan the LIVE tree, not nothing.
+
+    Regression pin: ``main()`` used to report a clean scan (exit 0) when
+    the routes directory yielded no files, so a relocated or empty routes
+    tree would look like a passing gate. This drives ``main()`` against the
+    real repository and asserts it scanned the route modules - including
+    organizations.py - and reported zero violations.
+    """
+    seen: list[str] = []
+    real_scan_file = guard.scan_file
+
+    def recording_scan_file(path):
+        seen.append(path.name)
+        return real_scan_file(path)
+
+    monkeypatch.setattr(guard, "scan_file", recording_scan_file)
+    exit_code = guard.main()
+    out = capsys.readouterr().out
+    assert exit_code == 0, (exit_code, out)
+    assert seen, "main() scanned no route modules"
+    assert "organizations.py" in seen, sorted(seen)[:10]
+    assert "chat.py" in seen, sorted(seen)[:10]
+    assert out.strip().splitlines()[-1] == "0", out
+
+
+def test_main_fails_closed_when_no_route_modules_are_found(tmp_path, monkeypatch, capsys):
+    """An empty routes tree must FAIL, not report a clean scan."""
+
+    class _FakePath:
+        """Stands in for pathlib.Path inside the guard module only.
+
+        ``resolve()`` returns a real (nonexistent) path under tmp_path, so
+        the guard's own ``parents``/``__truediv__``/``glob`` calls operate
+        on real pathlib semantics: the routes directory it derives does
+        not exist, and globbing it yields no modules - the empty-scan
+        condition the guard must refuse.
+        """
+
+        def __init__(self, *args, **kwargs):
+            self._args = args
+
+        def resolve(self):
+            return tmp_path / "nowhere"
+
+    monkeypatch.setattr(guard, "Path", _FakePath)
+    exit_code = guard.main()
+    err = capsys.readouterr().err
+    assert exit_code == 2, (exit_code, err)
+    assert "no route modules found" in err, err

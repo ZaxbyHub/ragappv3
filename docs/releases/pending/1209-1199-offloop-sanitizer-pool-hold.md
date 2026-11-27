@@ -4,7 +4,9 @@
 
 - **#1209** — `backend/app/services/llm_client.py` (note: the sanitizer
   now runs on the asyncio DEFAULT thread pool, which it shares with
-  handler SQL dispatch; pool CHECKOUTS stay on their dedicated executor;
+  handler SQL dispatch; checkouts never use that default pool
+  (`get_connection_async` uses the dedicated checkout executor, while
+  `get_db`'s synchronous checkout runs on anyio's worker pool);
   executor-occupancy isolation is routed to #1215 alongside the loop-stall
   bound, and cancellation abandons the worker — the pass runs to
   completion): both completion paths
@@ -53,7 +55,7 @@
   total, the ci.yml step included)
   (`AGENTS.md`, `docs/engineering/conventions.md`,
   `docs/engineering/testing.md`, `CONTRIBUTING.md`, the
-  `ci-compatibility-audit` and `ci-fix-monitor` skills); contract tests (26) in
+  `ci-compatibility-audit` and `ci-fix-monitor` skills); contract tests (28) in
   `backend/tests/test_double_hold_guardrail.py`.
 
 ## Why
@@ -84,8 +86,9 @@ guardrail).
   `Depends(require_*...)`/`Depends(get_current*...)` defaults): a new
   auth dependency declared there must be classified in the script's
   holding/non-holding sets. Router-level `APIRouter(dependencies=[...])`,
-  `Annotated`-style params, `head`/`options` decorators, and acquisitions
-  extracted into module-level helpers are outside the scan (documented in
-  the script). The helper-extraction lane has a LIVE instance, tracked in
-  #1217; the remaining lanes are known limitations with no live instance and
-  no tracker.
+  `Annotated`-style params, alias-imported names, `head`/`options`/`trace`/
+  `api_route` decorators, and non-prefixed holding-dependency names are
+  outside the scan, as are acquisitions extracted into module-level helpers
+  (documented in the script). The helper-extraction lane has a LIVE instance
+  and is tracked in #1217; the remaining lanes are known limitations with no
+  live instance and no tracker.
