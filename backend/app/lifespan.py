@@ -1477,9 +1477,7 @@ async def lifespan(app: FastAPI):
         if remaining_budget > 0:
             await _stop_stage(
                 "background processor stop",
-                lambda: app.state.background_processor.stop(
-                    timeout=remaining_budget
-                ),
+                lambda: app.state.background_processor.stop(timeout=remaining_budget),
                 timeout=remaining_budget + _PROCESSOR_STOP_CAP_SECONDS,
             )
         else:
