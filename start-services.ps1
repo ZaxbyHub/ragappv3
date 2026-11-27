@@ -78,7 +78,7 @@ function Stop-BackendProcessGracefully {
         # console, attaches to the backend's, sends the targeted CTRL_BREAK,
         # and exits — the parent script's console is never touched.
         $Sender = Join-Path $RepoRoot "scripts\win_send_ctrl_break.py"
-        $SenderVenvPy = Join-Path $RepoRoot "backendenv\Scripts\python.exe"
+        $SenderVenvPy = Join-Path $RepoRoot "backend\venv\Scripts\python.exe"
         $SenderPy = if ($env:BACKEND_PYTHON) { $env:BACKEND_PYTHON } elseif (Test-Path $SenderVenvPy) { $SenderVenvPy } else { "python" }
         Start-Process $SenderPy -ArgumentList ($Sender, "$($Proc.Id)") -WindowStyle Hidden | Out-Null
         Write-Output "  ${Label}: sent graceful CTRL_BREAK to grouped backend (PID $($Proc.Id)); waiting..."
