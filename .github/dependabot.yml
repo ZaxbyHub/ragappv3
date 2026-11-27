@@ -17,6 +17,17 @@ updates:
       - dependency-name: "numpy"
         update-types:
           - "version-update:semver-minor"
+      # torch pins its Linux CUDA wheels exactly (torch 2.15.0:
+      # cuda-toolkit==13.2.2, nvidia-cudnn-cu13==9.26.0.51, ...), so a
+      # standalone bump of any of these transitive pins is unsatisfiable
+      # (PR #1195). They move only when torch moves; lift with torch.
+      - dependency-name: "cuda-toolkit"
+      - dependency-name: "nvidia-*"
+      # sympy 1.14.0 (via torch) requires mpmath<1.4 (PR #1195). Lift this
+      # when a sympy release allows mpmath 1.4.
+      - dependency-name: "mpmath"
+        versions:
+          - ">=1.4"
     groups:
       python-minor-patch:
         update-types:
