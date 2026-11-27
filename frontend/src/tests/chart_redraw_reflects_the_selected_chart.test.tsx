@@ -168,4 +168,51 @@ describe("Issue #836 AC1: chart redraw reflects the selected chart", () => {
     expect(screen.queryByTestId("mermaid-loading")).toBeNull();
     expect(screen.queryByTestId("mermaid-error")).toBeNull();
   });
+
+  it("A→B→A with B pending: chart A's held output is shown for the reselected chart while A redraws", async () => {
+    const drawA1 = deferredRender();
+    mockMermaid.render.mockReturnValueOnce(drawA1.promise);
+    const { rerender } = render(<MermaidDiagram chart={CHART_A} />);
+    await settle();
+    await act(async () => {
+      drawA1.resolve({ svg: SVG_A });
+    });
+
+    const drawB = deferredRender();
+    mockMermaid.render.mockReturnValueOnce(drawB.promise);
+    rerender(<MermaidDiagram chart={CHART_B} />);
+    await settle();
+    expect(screen.queryByTestId("mermaid-diagram")).toBeNull();
+
+    // Reselect A before B completes: the held output is tagged for chart A,
+    // the selected chart, so it is displayed (not stale) and a redraw runs.
+    const drawA2 = deferredRender();
+    mockMermaid.render.mockReturnValueOnce(drawA2.promise);
+    rerender(<MermaidDiagram chart={CHART_A} />);
+    await settle();
+    expect(mockMermaid.render).toHaveBeenCalledTimes(3);
+    expect(mockMermaid.render).toHaveBeenLastCalledWith(expect.any(String), CHART_A);
+    const held = screen.getByTestId("mermaid-diagram");
+    expect(held.innerHTML).toContain('data-chart="chart-a"');
+    expect(held).toHaveAttribute("aria-label", `Mermaid diagram: ${CHART_A}`);
+
+    // The cancelled B draw completing late cannot replace chart A's output.
+    await act(async () => {
+      drawB.resolve({ svg: SVG_B });
+    });
+    expect(screen.getByTestId("mermaid-diagram").innerHTML).toContain('data-chart="chart-a"');
+  });
+
+  it("a render failure with an empty message shows the error fallback, not a permanent spinner", async () => {
+    const draw = deferredRender();
+    mockMermaid.render.mockReturnValueOnce(draw.promise);
+    render(<MermaidDiagram chart={CHART_A} />);
+    await settle();
+
+    await act(async () => {
+      draw.reject(new Error(""));
+    });
+    expect(screen.getByTestId("mermaid-error")).toBeInTheDocument();
+    expect(screen.queryByTestId("mermaid-loading")).toBeNull();
+  });
 });

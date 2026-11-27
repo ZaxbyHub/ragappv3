@@ -87,9 +87,11 @@ const MermaidDiagram = memo(function MermaidDiagram({ chart }: MermaidDiagramPro
 
   // Only output produced for the currently selected chart is displayed.
   const svg = rendered?.chart === chart ? rendered.svg : null;
+  // Gate on the tagged error itself, not on message truthiness, so a failure
+  // with an empty message still shows the fallback instead of the spinner.
   const errorMessage = error?.chart === chart ? error.message : null;
 
-  if (errorMessage) {
+  if (errorMessage !== null) {
     return (
       <div
         className="my-3 rounded-sm border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive"
