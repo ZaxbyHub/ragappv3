@@ -106,6 +106,27 @@ updates:
     cooldown:
       default-days: 14
 
+  # Docker Compose image pins (issue #750, T1-04-K-05): the digest pins in
+  # docker-compose.yml (harrier-embed, reranker, redis) are only updated by
+  # this ecosystem — the `docker` entries above scan Dockerfiles and never
+  # touch compose files, while docker-compose.yml's own comments promise
+  # dependabot digest PRs. Same semver-major ignore + 14-day cooldown
+  # posture as the `docker` entries. NOTE: check_runtime_contract only gates
+  # the Dockerfile FROM pins (DOCKERFILE_SURFACES / ALLOWED_DIGESTS); no CI
+  # gate pins or checks the freshness of these compose `image:` digest values
+  # (test_i03_compose_contracts only asserts harrier-embed stays
+  # digest-pinned), so this entry is their only automated freshness guard.
+  - package-ecosystem: "docker-compose"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+    cooldown:
+      default-days: 14
+
   # GitHub Actions workflow pins
   - package-ecosystem: "github-actions"
     directory: "/"
