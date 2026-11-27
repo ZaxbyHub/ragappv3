@@ -3404,9 +3404,13 @@ class BackgroundProcessor:
         cancellations, the lease-release and retry-reset maintenance calls,
         and the trailing optimize — runs with the REMAINING budget, so the
         composed worst case is the deadline itself, not a per-phase multiple
-        of it. A stage whose budget slice expires logs its existing-shaped
-        warning and the sequence proceeds; janitor/startup-recovery
-        backstops own anything left un-finished.
+        of it. The ONE exception is the maintenance block: it reserves a
+        single shared slice (min(5 s, timeout)) when it starts, so the
+        lease hand-back still happens when the drain phases consumed the
+        whole budget — the composed worst case is therefore the deadline
+        PLUS that one slice. A stage whose budget slice expires logs its
+        existing-shaped warning and the sequence proceeds; janitor/
+        startup-recovery backstops own anything left un-finished.
 
         Args:
             timeout: Aggregate shutdown budget (default: 60 seconds)

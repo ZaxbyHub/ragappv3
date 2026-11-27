@@ -807,7 +807,7 @@ async def lifespan(app: FastAPI):
         logger.info("Checking for upload migration...")
         _migration_started = time.monotonic()
         await asyncio.to_thread(migrate_uploads, False)
-        # Record the outcome for readiness (#799 AC7): healthz reads this
+        # Record the outcome for readiness (#799 AC6): healthz reads this
         # attribute and reports degraded (503) when a migration FAILED while
         # the app deliberately continued ("continuing anyway" must stay
         # observable to the health probe that exists to surface exactly
@@ -1587,7 +1587,8 @@ async def _finalize_turns_and_close_pool(app, remaining=None) -> tuple[bool, boo
                 # The close did not complete inside the aggregate budget; the
                 # pool is NOT marked closed, so the bounded tail exit cannot
                 # fire. close_all is idempotent-safe for a later retry by
-                # the interpreter teardown (a second close finds an empty
+                # the pool's own connections are reclaimed when the process
+            # exits (a second close finds an empty
                 # pool).
                 logger.warning(
                     "Pool close exceeded the aggregate shutdown budget; "
@@ -1601,7 +1602,8 @@ async def _finalize_turns_and_close_pool(app, remaining=None) -> tuple[bool, boo
             # event loop here (that would hold the shutdown past the
             # envelope and keep the tail gate unreachable). The pool is
             # left open and NOT marked closed — the gate declines to fire,
-            # and the interpreter's own teardown closes it.
+            # pool); the gate declines to fire rather than claim a close
+            # that did not happen.
             logger.warning(
                 "Pool close skipped: the aggregate shutdown budget is "
                 "exhausted; the pool is left for interpreter teardown "

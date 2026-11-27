@@ -79,7 +79,7 @@ logger.info(
     app.root_path,
 )
 
-# Security check: the well-known bootstrap admin token (#799 AC9, matrix-
+# Security check: the well-known bootstrap admin token (#799 AC8, matrix-
 # aware). Reachability matrix per Settings.reject_insecure_defaults: in
 # single-admin mode (USERS_ENABLED=False) an empty token and the published
 # literal both REFUSE TO START, so nothing can be warned about at runtime
@@ -146,7 +146,7 @@ app.add_middleware(
 
 # Security: warn if CORS origins contain wildcard when credentials are enabled
 if "*" in settings.backend_cors_origins:
-    # (#799 AC9, truthful wording): with allow_credentials=True Starlette
+    # (#799 AC8, truthful wording): with allow_credentials=True Starlette
     # REFLECTS the request Origin on wildcard configurations, so any origin
     # can read credential-bearing responses — the exposure is real, but it
     # is reflection, not browser-side rejection (the old claim was false).

@@ -9,18 +9,27 @@ PR 6 of 6 — lifecycle drain and readiness; its audit provenance absorbs #854).
 `BackgroundProcessor.stop(timeout)` now computes a single deadline and grants
 every awaited stage only the REMAINING budget — the pre-drain task gathers,
 the four drain phases (queue, enrichment, atoms, lease settle), the
-worker/sweep cancellations, the four lease-release/retry-reset maintenance
+worker/sweep cancellations, the three lease-release/retry-reset maintenance
 calls, and the trailing vector-store optimize (kept on the MAIN loop under
 `wait_for`; a timed-out LanceDB optimize continues only on LanceDB's native
 async runtime, which is never joined by CPython's interpreter-exit). The
-composed worst case is the deadline itself, not a per-phase multiple of it.
+composed worst case is the deadline itself, not a per-phase multiple of it;
+the ONE exception is the maintenance block, which reserves a single shared
+slice (min(5 s, timeout)) when it starts so the lease hand-back still
+happens after the drain phases consumed the budget — the composed worst
+case is therefore the deadline PLUS that one slice.
 The lifespan wraps its whole shutdown sequence (email, residency tasks, file
 watcher, the four processor stops, admission, store/pool closes, the
-upload-commit and turn-finalizer gates) in a 60 s aggregate budget
+upload-commit drain) in a 60 s aggregate budget
 (`_SHUTDOWN_BUDGET_SECONDS`); only `BackgroundProcessor.stop` takes a timeout
 argument — every no-argument stage runs through a bounded `_stop_stage`
 helper, and the two synchronous closes run via `to_thread` under the same
-budget.
+budget. The turn-finalizer drain keeps its OWN enforced budget (5 s producer
+retirement + 10 s drain, `TURN_PRODUCER_SHUTDOWN_TIMEOUT_SECONDS` /
+`TURN_FINALIZE_DRAIN_TIMEOUT_SECONDS`), so the process-level envelope is
+60 s (lifespan stages) + 15 s (finalizer drain) + 30 s (SQLite-family
+executor-join tail) + 5 s (teardown) = 115 s natural worst case, inside the
+125 s native stop wait and the 130 s compose grace.
 
 **A bounded tail exit.** After every recovery-critical workflow completes
 (deny-by-default `critical_shutdown_work` registry EMPTY, turn finalizers
@@ -37,11 +46,15 @@ PRR-020's startup-recovery contract) the gate never fires and those
 deliberate recovery contracts govern — disclosed as the data-safety
 preference over a hard exit.
 
-**Seven durability protocols registered.** user-delete (settlement,
-rollback/restore AND both committed-finalization paths), document-upload
-artifact cleanup and post-registration compensation, vault rollback/restore,
-draft-promotion shielded compensation, memory-transaction commit/rollback,
-turn finalization, and upload commits run inside the registry while active.
+**Thirteen registration arms across seven files.** user-delete (settlement,
+rollback/restore AND both committed-finalization paths — 1 arm), document-upload
+artifact cleanup and post-registration compensation (4 arms), vault
+rollback/restore (3 recovery arms) plus the vault post-commit audit tail
+(1 arm), draft-promotion shielded compensation, memory-transaction
+commit/rollback, turn finalization, and upload commits run inside the registry
+while active. The arm counts are pinned by
+`backend/tests/test_p03_shutdown_ownership.py::TestRegistrationMapPin`, so a
+deleted or added arm fails CI.
 
 **Container/native envelope (#799 AC5/#854).** Dockerfile CMD gains
 `--timeout-graceful-shutdown 20` (integer seconds — uvicorn rejects unit
