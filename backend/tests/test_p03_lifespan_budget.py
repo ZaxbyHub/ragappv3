@@ -53,26 +53,52 @@ class _SwallowsCancellation:
     ``started`` is an Event the test waits on: a residency task cancelled
     before its first step never exercises the settle's bound, so the test
     must not assert until the prime is actually running.
+
+    The prime swallows REPEATEDLY-cancelled requests (up to
+    ``MAX_SWALLOWS``) and only then dies, so the test process can always
+    tear the event loop down. Swallowing more than one is the point: a
+    settle that awaits the task DIRECTLY forwards the enclosing scope's
+    cancellation into it, so a task that ignores the FIRST cancellation
+    but dies on the second would hide that hang.
     """
+
+    MAX_SWALLOWS = 2
 
     def __init__(self):
         self.started = asyncio.Event()
+        self.task: asyncio.Task | None = None
 
     async def prime_residency(self):
+        self.task = asyncio.current_task()
         self.started.set()
-        # Swallow ONE cancellation and keep running. A mutant that drops the
-        # settle's wait_for wrapper then HANGS the settle (the task never
-        # dies on its own), which the test's shutdown-phase guard ends — so
-        # the kill does not depend on a timing race. (A task that ignored
-        # cancellation ENTIRELY would be more decisive but cannot exist in a
-        # test process: the event loop's own shutdown would hang on it.)
-        try:
-            await asyncio.sleep(3600)
-        except asyncio.CancelledError:
-            await asyncio.sleep(3600)
+        swallowed = 0
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                swallowed += 1
+                if swallowed > self.MAX_SWALLOWS:
+                    raise
 
     async def close(self):
         return None
+
+
+async def _force_kill(task: asyncio.Task | None) -> None:
+    """Make a cancellation-ignoring task die so the loop can tear down.
+
+    The prime deliberately ignores cancellation, so the test has to end it
+    explicitly; otherwise the event loop's own shutdown would wait for it.
+    """
+    if task is None or task.done():
+        return
+    for _ in range(_SwallowsCancellation.MAX_SWALLOWS + 3):
+        if task.done():
+            return
+        task.cancel()
+        # Give the task a step to observe the cancellation.
+        await asyncio.sleep(0.02)
+
 
 
 class TestLifespanAggregateBudget(unittest.IsolatedAsyncioTestCase):
@@ -148,6 +174,7 @@ class TestLifespanAggregateBudget(unittest.IsolatedAsyncioTestCase):
 
         tmp = Path(tempfile.mkdtemp())
         restore = _pin_lifespan_settings(tmp, editorial=True)
+        task_still_running = None
         try:
             with patch.object(
                 lifespan_mod, "_SHUTDOWN_BUDGET_SECONDS", BUDGET_SECONDS
@@ -158,11 +185,39 @@ class TestLifespanAggregateBudget(unittest.IsolatedAsyncioTestCase):
                 # The guard covers the SHUTDOWN phase only: the startup
                 # delay is measured separately, so a slow host cannot
                 # shorten the window in which the mutant hangs.
-                await asyncio.wait_for(
-                    scenario(), timeout=BUDGET_SECONDS + SHUTDOWN_GUARD_SECONDS
+                #
+                # asyncio.wait (not wait_for) is the guard: wait_for
+                # CANCELS the task it waits on and then waits for that
+                # cancellation to land — and a settle that awaits the
+                # residency task directly forwards the cancellation INTO
+                # it, so wait_for would hang on the very defect it is
+                # supposed to catch. asyncio.wait returns when its timeout
+                # expires, whatever the task is doing.
+                scenario_task = asyncio.create_task(scenario())
+                await asyncio.wait(
+                    {scenario_task},
+                    timeout=BUDGET_SECONDS + SHUTDOWN_GUARD_SECONDS,
+                )
+                if not scenario_task.done():
+                    self.fail(
+                        f"the residency settle did not finish within "
+                        f"{BUDGET_SECONDS + SHUTDOWN_GUARD_SECONDS:g}s — it "
+                        "is waiting on the residency task's cooperation "
+                        "instead of ending on its own bound"
+                    )
+                scenario_task.result()
+                # The prime ignores cancellation, so it is still running
+                # when the shutdown returned: the settle ended on its
+                # BOUND, not on the task's death.
+                task_still_running = (
+                    fake.task is not None and not fake.task.done()
                 )
         finally:
             restore()
+            # The prime ignores cancellation on purpose: end it so the
+            # event loop can shut down (the settle's bound is what the
+            # assertions below measure, not the prime's death).
+            await _force_kill(fake.task)
 
         elapsed = time.monotonic() - timings["start"]
         self.assertLessEqual(
@@ -171,5 +226,9 @@ class TestLifespanAggregateBudget(unittest.IsolatedAsyncioTestCase):
             f"the residency settle ran {elapsed:.2f}s — it must be bounded "
             f"by the remaining budget plus its documented 5 s slack",
         )
-        # (The elapsed bound is the secondary assertion: a mutant that drops
-        # the wrapper hangs the settle and fails on the guard above.)
+        self.assertTrue(
+            task_still_running,
+            "the residency task had already died when the shutdown returned "
+            "— the settle must end on its own bound, not on the task's "
+            "cooperation",
+        )

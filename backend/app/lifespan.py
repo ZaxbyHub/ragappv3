@@ -57,13 +57,28 @@ logger = logging.getLogger(__name__)  # noqa: E402
 # Aggregate process-shutdown budget (#799/#854, plan rev 7-10): one deadline
 # covering every lifespan shutdown stage (email, residency, watcher, the
 # four processor stops, admission, store/pool closes, the upload-commit and
-# turn-finalizer gates). Sizing lives in docker-compose.yml's derivation
-# comment, which is the ONE source for the envelope: 20 s uvicorn request
-# drain + 65 s lifespan aggregate (this 60 s budget plus the 5 s outer cap
-# on the processor stop) + 15 s turn-finalizer drain + 30 s SQLite-family
-# join tail + 5 s teardown = 135 s natural worst, below the 140 s native
+# turn-finalizer gates).
+#
+# The process envelope's ONE derivation, quoted VERBATIM by
+# docker-compose.yml, both .ps1 scripts, the release fragment and the PR
+# body:
+#   20 s (uvicorn request drain) + 65 s (lifespan aggregate) + 15 s (turn-finalizer drain) + 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 135 s
+# (the 65 s is this 60 s budget plus the 5 s outer cap on the processor
+# stop; the 15 s is the turn-finalizer drain's 5 s producer retirement plus
+# its 10 s drain.) The 135 s natural worst case sits below the 140 s native
 # stop wait and the 150 s compose grace.
+# scripts/check_p03_shutdown_envelope.py owns that arithmetic: it reads
+# every component from the code that enforces it and fails when a surface
+# stops quoting this line.
 _SHUTDOWN_BUDGET_SECONDS = 60.0
+
+# The extra cap the lifespan puts on the background processor's stop: the
+# processor's own aggregate drain is given the REMAINING budget plus this
+# slack, so the composed process envelope stays inside one derivable
+# worst case. Named (not inlined) so the envelope contract gate
+# (scripts/check_p03_shutdown_envelope.py) reads this number from the code
+# that enforces it instead of restating it.
+_PROCESSOR_STOP_CAP_SECONDS = 5.0
 
 
 # ── Persisted-settings replay decoding (issue #494 CONFIG-003) ──────────────
@@ -1296,41 +1311,62 @@ async def lifespan(app: FastAPI):
         await _stop_stage("email stop_polling", app.state.email_service.stop_polling)
     async def _settle_residency_tasks() -> None:
         # One aggregate-bounded settle (#799 AC2 + #854): the whole loop runs
-        # under asyncio.timeout with the remaining process budget, and each
-        # task's await keeps its absorbing handlers — a task that DIED with
-        # a natural exception is contained (the processor stops, admission
-        # release, store/pool closes below stay reachable) instead of
-        # skipping the whole shutdown chain.
+        # under ONE budget (the remaining process budget plus its documented
+        # 5 s slack), and each task's outcome is absorbed — a task that DIED
+        # with a natural exception is contained (the processor stops,
+        # admission release, store/pool closes below stay reachable) instead
+        # of skipping the whole shutdown chain.
         #
-        # The whole settle runs under ONE aggregate timeout, and the
-        # per-task CancelledError handler must NOT swallow the SCOPE's own
-        # cancellation: rt.cancel() cancels the RESIDENCY task (expected —
-        # that is what we asked for), while the timeout cancels THIS task
-        # (the bound expiring — that must propagate so the timeout can
-        # convert it and the shutdown can continue). asyncio counts the
-        # cancellations requested on the current task, so cancelling() tells
-        # the two apart; without that distinction a residency task that
-        # ignores its cancellation would hang the whole shutdown.
-        try:
-            async with asyncio.timeout(_remaining() + 5.0):
-                for rt in residency_tasks:
-                    rt.cancel()
-                    try:
-                        await rt
-                    except asyncio.CancelledError:
-                        current = asyncio.current_task()
-                        if current is not None and current.cancelling():
-                            raise
-                    except Exception as e:  # noqa: BLE001 — AC2 absorb
-                        logger.warning(
-                            "Residency task ended with exception at shutdown "
-                            "(continuing): %s",
-                            e,
-                        )
-        except TimeoutError:
+        # The bound must NOT depend on the residency tasks' COOPERATION.
+        # Awaiting a task DIRECTLY makes the current task's cancellation
+        # FORWARD into it: when the enclosing budget expires,
+        # task.cancel() cancels the residency task, and a task that
+        # suppresses that cancellation never completes — the await never
+        # returns, the enclosing scope never regains control, and the whole
+        # shutdown hangs until the outer force boundary. asyncio.wait()
+        # waits for the set with a timeout and returns the still-pending
+        # set instead, so a task that refuses to die costs the settle its
+        # budget and nothing more.
+        pending_settle: set[asyncio.Task] = set(residency_tasks)
+        for rt in pending_settle:
+            rt.cancel()
+        if not pending_settle:
+            return
+        settle_budget = _remaining() + 5.0
+        # An external cancellation of THIS task propagates out of the wait
+        # (it is not our own budget expiring): swallowing it would strand
+        # the shutdown.
+        settled, pending_settle = await asyncio.wait(
+            pending_settle, timeout=settle_budget
+        )
+        for rt in settled:
+            # Retrieve each settled task's outcome: a task that DIED with a
+            # natural exception must be absorbed here (AC2) so the rest of
+            # the shutdown chain stays reachable.
+            try:
+                await rt
+            except asyncio.CancelledError:
+                # The task ended CANCELLED (we asked for that). This is NOT
+                # the current task's own cancellation, so it is absorbed —
+                # unless the enclosing scope is being cancelled, which must
+                # propagate so the shutdown can continue. asyncio counts the
+                # cancellations requested on the current task, so
+                # cancelling() tells the two apart.
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+            except Exception as e:  # noqa: BLE001 — AC2 absorb
+                logger.warning(
+                    "Residency task ended with exception at shutdown "
+                    "(continuing): %s",
+                    e,
+                )
+        if pending_settle:
             logger.warning(
-                "Residency tasks did not settle within the aggregate "
-                "shutdown budget; continuing shutdown"
+                "%d residency task(s) did not settle within the aggregate "
+                "shutdown budget; continuing shutdown (they were asked to "
+                "cancel and are detached)",
+                len(pending_settle),
             )
 
     await _settle_residency_tasks()
@@ -1365,7 +1401,7 @@ async def lifespan(app: FastAPI):
             try:
                 await asyncio.wait_for(
                     app.state.background_processor.stop(timeout=remaining_budget),
-                    timeout=remaining_budget + 5,
+                    timeout=remaining_budget + _PROCESSOR_STOP_CAP_SECONDS,
                 )
             except asyncio.TimeoutError:
                 logger.warning(

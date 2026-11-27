@@ -125,9 +125,15 @@ services:
     # drain keeps its OWN enforced budget (5 s producer retirement + 10 s
     # drain) OUTSIDE that 60 s.
     #
-    # ONE derivation, used verbatim by both .ps1 scripts, the release
-    # fragment and the PR body — natural worst case:
-    #   20 s (uvicorn request drain) + 65 s (lifespan aggregate: the 60 s budget plus the 5 s outer cap on the processor stop) + 15 s (turn-finalizer drain: 5 s producer retirement + 10 s drain) + 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 135 s.
+    # ONE derivation, quoted VERBATIM by both .ps1 scripts, the lifespan
+    # module, the release fragment and the PR body — natural worst case:
+    #   20 s (uvicorn request drain) + 65 s (lifespan aggregate) + 15 s (turn-finalizer drain) + 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 135 s
+    # (the 65 s is the 60 s lifespan aggregate plus the 5 s outer cap on
+    # the processor stop; the 15 s is the turn-finalizer drain's 5 s
+    # producer retirement plus its 10 s drain.)
+    # scripts/check_p03_shutdown_envelope.py owns this arithmetic: it reads
+    # every component from the code that enforces it and fails when a
+    # surface stops quoting this line.
     # This 150 s grace and the 140 s native stop wait are both strictly
     # above that worst case, so a healthy shutdown is never force-killed
     # mid-flight. State B — a critical-incomplete shutdown (live-turn

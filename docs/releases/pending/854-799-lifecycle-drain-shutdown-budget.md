@@ -28,13 +28,22 @@ budget. The turn-finalizer drain keeps its OWN enforced budget (5 s producer
 retirement + 10 s drain, `TURN_PRODUCER_SHUTDOWN_TIMEOUT_SECONDS` /
 `TURN_FINALIZE_DRAIN_TIMEOUT_SECONDS`).
 
-ONE derivation, used verbatim by docker-compose.yml, both .ps1 scripts and
-the PR body — the natural worst case is:
+ONE derivation, quoted VERBATIM by docker-compose.yml, both .ps1 scripts,
+the lifespan module and the PR body — the natural worst case is:
 
-    20 s (uvicorn request drain) + 65 s (lifespan aggregate: the 60 s
-    budget plus the 5 s outer cap on the processor stop) + 15 s
-    (turn-finalizer drain) + 30 s (SQLite-family executor-join tail) + 5 s
-    (teardown) = 135 s
+    20 s (uvicorn request drain) + 65 s (lifespan aggregate) + 15 s (turn-finalizer drain) + 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 135 s
+
+(the 65 s is the 60 s lifespan aggregate plus the 5 s outer cap on the
+processor stop; the 15 s is the turn-finalizer drain's 5 s producer
+retirement plus its 10 s drain.)
+
+`scripts/check_p03_shutdown_envelope.py` owns that arithmetic: it reads
+every component from the code that enforces it (the Dockerfile's uvicorn
+grace, the lifespan module's shutdown budget and processor-stop cap, the
+turn-finalizer drain's own constants and the SQLite busy timeout that
+bounds the executor-join tail), requires every force-kill limit to sit
+strictly above the total, and fails when a surface stops quoting the
+derivation verbatim.
 
 The compose grace is 150 s and the native stop wait is 140 s — both strictly
 above 135 s, so a healthy shutdown is never force-killed mid-flight.

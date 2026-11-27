@@ -55,11 +55,12 @@ function Stop-BackendProcessGracefully {
         $SenderPy = if ($env:BACKEND_PYTHON) { $env:BACKEND_PYTHON } elseif (Test-Path $SenderVenvPy) { $SenderVenvPy } else { "python" }
         Start-Process $SenderPy -ArgumentList ($Sender, "$($Proc.Id)") -WindowStyle Hidden | Out-Null
         Write-Output "  ${Label}: sent graceful CTRL_BREAK to grouped backend (PID $($Proc.Id)); waiting..."
-        # 140 s > the 135 s natural worst case of the shutdown envelope
-        # (20 request drain + 65 lifespan aggregate + 15 turn-finalizer drain
-        # + 30 SQLite-family join tail + 5 teardown; docker-compose.yml
-        # carries the same derivation) so the force fallback never fires
-        # before a healthy graceful shutdown completes.
+        # 140 s > the natural worst case of the shutdown envelope, so the
+        # force fallback never fires before a healthy graceful shutdown
+        # completes. The derivation, quoted VERBATIM by docker-compose.yml,
+        # the lifespan module, the release fragment and start-services.ps1:
+        #   20 s (uvicorn request drain) + 65 s (lifespan aggregate) + 15 s (turn-finalizer drain) + 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 135 s
+        # scripts/check_p03_shutdown_envelope.py owns that arithmetic.
         if (-not $Proc.WaitForExit(140000)) {
             Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
             Write-Output "  ${Label}: graceful window expired; force-stopped (PID $($Proc.Id))"
