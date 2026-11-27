@@ -66,8 +66,9 @@ class TestTailGatePredicate(unittest.IsolatedAsyncioTestCase):
     """Drive the REAL gate (app.lifespan._bounded_tail_exit) with os._exit
     patched — no re-implementation. The gate fires os._exit(0) only when
     RAGAPP_BOUNDED_EXIT=1 AND the registry is empty AND turn finalizers
-    drained AND pool closed AND the upload registry is empty (read at gate
-    time). Each test flips one input.
+    drained AND the upload registry is empty (read at gate time). The pool
+    state is a resource-cleanup outcome, NOT a durability precondition
+    (plan rev 11). Each test flips one input.
     """
 
     async def _gate(self, *, env, drained, pool_closed, uploads, use_registry=True):
@@ -118,12 +119,26 @@ class TestTailGatePredicate(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(shutdown_gate.critical_work_active())
 
-    async def test_never_fires_with_incomplete_finalizers_or_open_pool(self):
+    async def test_never_fires_with_incomplete_finalizers(self):
+        # The #1202 contract: a live turn's finalizer must be able to
+        # finish, so the gate stays closed while the drain did not
+        # complete -- with the pool closed OR open.
         self.assertFalse(
             await self._gate(env="1", drained=False, pool_closed=True,
                              uploads=False, use_registry=False)
         )
         self.assertFalse(
+            await self._gate(env="1", drained=False, pool_closed=False,
+                             uploads=False, use_registry=False)
+        )
+
+    async def test_fires_with_an_open_pool_when_the_durability_conditions_hold(self):
+        # Plan rev 11: the pool state is a RESOURCE-CLEANUP outcome, not a
+        # durability precondition. The exhausted-budget path (the #854
+        # stall scenario) leaves the pool open; the gate must still fire so
+        # the process exits BEFORE Compose force-terminates it (frozen
+        # AC12). Process exit reclaims the pool's connections.
+        self.assertTrue(
             await self._gate(env="1", drained=True, pool_closed=False,
                              uploads=False, use_registry=False)
         )
@@ -280,6 +295,172 @@ class TestSharedMaintenanceSlice(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(proc._running)
 
 
+
+class TestExhaustedBudgetTailExit(unittest.IsolatedAsyncioTestCase):
+    """AC12's process-exit clause, proven on the REAL functions.
+
+    The #854 stall scenario exhausts the aggregate budget: the pool close
+    is skipped, so `pool_closed` is False. The tail gate must still fire
+    then -- otherwise the process's exit falls through to the unbounded
+    executor joins and Compose's force kill ends it, which frozen AC12
+    forbids ("in either case the process exits before Compose
+    force-terminates it").
+    """
+
+    async def test_exhausted_budget_still_fires_the_tail_exit(self):
+        from app.lifespan import _bounded_tail_exit, _finalize_turns_and_close_pool
+
+        calls = []
+
+        class _Pool:
+            def close_all(self):
+                calls.append("closed")
+
+        class _State:
+            db_pool = _Pool()
+
+        class _App:
+            state = _State()
+
+        exits = []
+        with unittest.mock.patch.dict(
+            os.environ, {"RAGAPP_BOUNDED_EXIT": "1"}
+        ), unittest.mock.patch(
+            "app.api.routes.chat.shutdown_turn_finalizers",
+            new=unittest.mock.AsyncMock(return_value=True),
+        ), unittest.mock.patch.object(
+            os, "_exit", side_effect=lambda c: exits.append(c)
+        ):
+            drained, pool_closed = await _finalize_turns_and_close_pool(
+                _App(), remaining=lambda: 0.0
+            )
+            self.assertEqual(
+                (drained, pool_closed),
+                (True, False),
+                "the exhausted-budget path must drain the finalizers and "
+                "leave the pool open",
+            )
+            fired = _bounded_tail_exit(drained, pool_closed)
+
+        self.assertEqual(
+            calls, [], "the exhausted budget must not close the pool at all"
+        )
+        self.assertTrue(
+            fired or exits,
+            "the tail exit must fire with the pool open: the process must "
+            "exit before Compose force-terminates it (frozen AC12)",
+        )
+
+    async def test_incomplete_finalizers_never_fire_the_tail_exit(self):
+        from app.lifespan import _bounded_tail_exit, _finalize_turns_and_close_pool
+
+        class _Pool:
+            def close_all(self):
+                raise AssertionError("the pool must not be closed")
+
+        class _State:
+            db_pool = _Pool()
+
+        class _App:
+            state = _State()
+
+        exits = []
+        with unittest.mock.patch.dict(
+            os.environ, {"RAGAPP_BOUNDED_EXIT": "1"}
+        ), unittest.mock.patch(
+            "app.api.routes.chat.shutdown_turn_finalizers",
+            new=unittest.mock.AsyncMock(return_value=False),
+        ), unittest.mock.patch.object(
+            os, "_exit", side_effect=lambda c: exits.append(c)
+        ):
+            drained, pool_closed = await _finalize_turns_and_close_pool(
+                _App(), remaining=lambda: 0.0
+            )
+            self.assertFalse(drained, "the finalizer drain must have failed")
+            fired = _bounded_tail_exit(drained, pool_closed)
+
+        self.assertFalse(
+            fired or exits,
+            "an incomplete turn-finalizer drain must never be cut (the "
+            "#1202 durability contract)",
+        )
+
+
+class TestExhaustedBudgetProcessExit(unittest.TestCase):
+    """A child-process proof: the exhausted-budget path ends the PROCESS.
+
+    A live non-critical worker thread (60 s) stands in for the executor
+    joins the tail exit skips. Without os._exit the child would wait for
+    that thread at interpreter exit; with it the child leaves promptly.
+    """
+
+    CHILD = """
+import asyncio, os, sys, threading, time
+from types import SimpleNamespace
+from unittest import mock
+
+sys.path.insert(0, {backend!r})
+os.environ["RAGAPP_BOUNDED_EXIT"] = "1"
+
+import app.lifespan as lifespan_mod
+import app.api.routes.chat as chat_mod
+
+
+class _Pool:
+    def close_all(self):
+        raise AssertionError("the pool must not be closed")
+
+
+async def main():
+    app = SimpleNamespace(state=SimpleNamespace(db_pool=_Pool()))
+    with mock.patch.object(
+        chat_mod, "shutdown_turn_finalizers",
+        new=mock.AsyncMock(return_value=True),
+    ):
+        drained, pool_closed = await lifespan_mod._finalize_turns_and_close_pool(
+            app, remaining=lambda: 0.0
+        )
+    assert (drained, pool_closed) == (True, False), (drained, pool_closed)
+
+    # A live non-critical worker: a NON-daemon thread, so an ordinary
+    # interpreter exit would wait for it.
+    worker = threading.Thread(target=time.sleep, args=(60,))
+    worker.start()
+    time.sleep(0.2)
+    lifespan_mod._bounded_tail_exit(drained, pool_closed)
+    raise SystemExit("the tail exit did not exit the process")
+
+
+asyncio.run(main())
+"""
+
+    def test_child_process_exits_promptly_through_the_tail_exit(self):
+        import subprocess
+
+        backend = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        script = self.CHILD.format(backend=backend)
+        started = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=backend,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(
+            proc.returncode,
+            0,
+            f"the child must exit through the tail exit; stderr={proc.stderr[-2000:]}",
+        )
+        self.assertLess(
+            elapsed,
+            30.0,
+            f"the child took {elapsed:.1f}s to exit: it must not have "
+            "joined the non-critical worker (60 s) at interpreter exit",
+        )
+
+
 class TestExecutorRecreateOnDemand(unittest.IsolatedAsyncioTestCase):
     async def test_curator_executor_recreates_after_shutdown(self):
         from app.services import wiki_compiler
@@ -401,9 +582,12 @@ class TestZeroBudgetPoolClose(unittest.IsolatedAsyncioTestCase):
     """A supplied ZERO budget must never close the pool on the event loop.
 
     `close_all()` takes the pool lock and can block, so an exhausted
-    aggregate budget must SKIP the close (leaving `pool_closed` False so
-    the bounded tail exit declines to fire) rather than call it
-    synchronously.
+    aggregate budget must SKIP the close (leaving `pool_closed` False)
+    rather than call it synchronously. `pool_closed` False is a
+    resource-cleanup outcome, not a durability precondition (plan rev 11):
+    the tail exit still fires on that state, so the process exits before
+    Compose force-terminates it (frozen AC12) -- see
+    TestExhaustedBudgetTailExit.
     """
 
     async def test_zero_budget_skips_the_close_and_leaves_pool_open(self):

@@ -106,6 +106,65 @@ async def _force_kill(task: asyncio.Task | None) -> None:
 
 
 
+class _StageIgnoringCancellation:
+    """A shutdown stage whose stop() ignores cancellation (M3's shape).
+
+    ``stop_polling`` is the first lifespan shutdown stage, so a stage that
+    refuses to die is the cheapest way to hold the whole shutdown
+    sequence. It swallows a bounded number of cancellations and then
+    dies, so the test process can still tear the loop down.
+    """
+
+    MAX_SWALLOWS = 2
+
+    def __init__(self, name, log):
+        self.name = name
+        self.log = log
+        self.task: asyncio.Task | None = None
+        self._swallowed = 0
+
+    async def stop_polling(self):
+        self.task = asyncio.current_task()
+        self.log.append(self.name)
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                self._swallowed += 1
+                if self._swallowed > self.MAX_SWALLOWS:
+                    raise
+
+    async def close(self):
+        return None
+
+
+class _ProcessorIgnoringCancellation:
+    """A background processor whose stop() ignores cancellation.
+
+    AC12's own component: the processor holds the drain phases, and the
+    lifespan's OUTER invocation used to be an ``asyncio.wait_for`` (which
+    forwards the timeout's cancellation into the stop coroutine and then
+    waits for it). A processor that refuses to die must not stop the
+    lifespan from reaching its tail.
+    """
+
+    MAX_SWALLOWS = 2
+
+    def __init__(self):
+        self.task: asyncio.Task | None = None
+        self._swallowed = 0
+
+    async def stop(self, timeout=None):
+        self.task = asyncio.current_task()
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                self._swallowed += 1
+                if self._swallowed > self.MAX_SWALLOWS:
+                    raise
+
+
 class TestLifespanAggregateBudget(unittest.IsolatedAsyncioTestCase):
     async def test_shutdown_stages_share_one_budget(self):
         """Two or more stalling stages must cost ONE budget, not one each.
@@ -260,4 +319,105 @@ class TestLifespanAggregateBudget(unittest.IsolatedAsyncioTestCase):
             "the residency task had already died when the shutdown returned "
             "— the settle must end on its own bound, not on the task's "
             "cooperation",
+        )
+
+    async def test_shutdown_stage_ignoring_cancellation_is_bounded(self):
+        """A shutdown stage that ignores cancellation must not hold the
+        aggregate sequence past its budget.
+
+        ``asyncio.wait_for`` (the shape this replaced) forwards the
+        timeout's cancellation into the stage and then WAITS for that
+        cancellation to land, so a stage that suppresses it holds the
+        whole shutdown. The stage is waited for with ``asyncio.wait``
+        instead: the stage is asked to stop and the sequence continues.
+        """
+        from fastapi import FastAPI
+        from test_p03_lifecycle_behavioral import _pin_lifespan_settings
+
+        import app.lifespan as lifespan_mod
+
+        entered: list[str] = []
+        timings: dict[str, float] = {}
+
+        stage = _StageIgnoringCancellation("email", entered)
+
+        async def scenario():
+            app = FastAPI()
+            async with lifespan_mod.lifespan(app):
+                app.state.email_service = stage
+                timings["start"] = time.monotonic()
+
+        tmp = Path(tempfile.mkdtemp())
+        restore = _pin_lifespan_settings(tmp, editorial=False)
+        try:
+            with patch.object(
+                lifespan_mod, "_SHUTDOWN_BUDGET_SECONDS", BUDGET_SECONDS
+            ):
+                await asyncio.wait_for(
+                    scenario(), timeout=BUDGET_SECONDS + SHUTDOWN_GUARD_SECONDS
+                )
+        finally:
+            restore()
+            await _force_kill(stage.task)
+
+        elapsed = time.monotonic() - timings["start"]
+        self.assertLessEqual(
+            elapsed,
+            BUDGET_SECONDS + 7.0,
+            f"the shutdown took {elapsed:.2f}s — a stage that ignores "
+            f"cancellation must not hold the sequence past its "
+            f"{BUDGET_SECONDS}s budget",
+        )
+        self.assertEqual(
+            entered,
+            ["email"],
+            "the stalling stage must have RUN (the budget must be spent "
+            "on it, not skipped)",
+        )
+
+    async def test_background_processor_ignoring_cancellation_is_bounded(self):
+        """A processor stop that ignores cancellation must not stop the
+        lifespan from reaching its tail.
+
+        The lifespan's outer invocation of the processor's stop was an
+        ``asyncio.wait_for``, which forwards the timeout's cancellation
+        into the stop coroutine and then waits for that cancellation to
+        land; a processor that suppresses it held the whole shutdown. The
+        invocation now goes through the same task-plus-``asyncio.wait``
+        treatment as every other stage.
+        """
+        from fastapi import FastAPI
+        from test_p03_lifecycle_behavioral import _pin_lifespan_settings
+
+        import app.lifespan as lifespan_mod
+
+        timings: dict[str, float] = {}
+        processor = _ProcessorIgnoringCancellation()
+
+        async def scenario():
+            app = FastAPI()
+            async with lifespan_mod.lifespan(app):
+                app.state.background_processor = processor
+                timings["start"] = time.monotonic()
+
+        tmp = Path(tempfile.mkdtemp())
+        restore = _pin_lifespan_settings(tmp, editorial=False)
+        try:
+            with patch.object(
+                lifespan_mod, "_SHUTDOWN_BUDGET_SECONDS", BUDGET_SECONDS
+            ):
+                await asyncio.wait_for(
+                    scenario(), timeout=BUDGET_SECONDS + SHUTDOWN_GUARD_SECONDS
+                )
+        finally:
+            restore()
+            await _force_kill(processor.task)
+
+        elapsed = time.monotonic() - timings["start"]
+        self.assertLessEqual(
+            elapsed,
+            BUDGET_SECONDS + 7.0,
+            f"the shutdown took {elapsed:.2f}s — a processor stop that "
+            f"ignores cancellation must not hold the sequence past its "
+            f"{BUDGET_SECONDS}s budget",
         )

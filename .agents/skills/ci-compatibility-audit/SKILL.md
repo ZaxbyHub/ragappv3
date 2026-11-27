@@ -137,8 +137,10 @@ Repository contract job:
   `stop_grace_period` is not strictly greater than it (issues #854/#799).
 - `python scripts/check_p03_shutdown_envelope.py` — fails if the shutdown
   envelope's ONE derivation drifts: the compose `stop_grace_period` or either
-  native stop wait is not strictly above the computed 135 s natural worst
-  case, or a surface stops quoting that total (issues #854/#799).
+  native stop wait is not strictly above the computed 135 s composed envelope
+  (100 s enforced + 35 s allowance), an enforced component drifts in the code
+  that enforces it, or a surface stops quoting that derivation verbatim
+  (issues #854/#799).
 
 SAST job:
 

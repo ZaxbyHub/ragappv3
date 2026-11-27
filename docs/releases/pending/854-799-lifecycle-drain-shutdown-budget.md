@@ -56,7 +56,12 @@ cancellation into it, so a task that suppresses that cancellation never
 completes and the whole shutdown hangs until the outer force boundary. The
 settle now waits with `asyncio.wait`, which returns the still-pending set
 instead of forwarding the wait, so a task that refuses to die costs the
-settle its budget and nothing more. The shutdown SEQUENCE is therefore
+settle its budget and nothing more. The same shape applies to every
+lifespan shutdown STAGE: `asyncio.wait_for` forwards the timeout's
+cancellation into the stage and then waits for that cancellation to land,
+so a stage that suppresses it would hold the sequence past the aggregate
+budget; the stages are now waited for with `asyncio.wait` and a stage that
+overruns is cancelled and left detached. The shutdown SEQUENCE is therefore
 always bounded (the enforced 100 s); the PROCESS EXIT is bounded by the
 bounded tail exit in State A (`os._exit`, so a detached task never delays
 it) and by the process-level force boundary in State B (the compose grace
@@ -87,14 +92,36 @@ while active. The arm counts are pinned by
 `backend/tests/test_p03_shutdown_ownership.py::TestRegistrationMapPin`, so a
 deleted or added arm fails CI.
 
+**AC12 conformance — resource-stall/State-A path.** Under the shipped
+launchers, when drain or shutdown stages exhaust their budgets, the
+bounded lifespan sequence continues to the tail gate. With
+`RAGAPP_BOUNDED_EXIT=1`, an empty deny-by-default critical-work
+registry, an empty upload-commit registry, and
+`turn_finalizers_drained=True`, the gate invokes `os._exit(0)` regardless
+of `pool_closed`; process exit reclaims open pool connections and skips
+executor and interpreter joins. The enforced horizon to the gate is 100
+seconds from stop delivery — 20 seconds request drain, 65 seconds
+lifespan/processor envelope, and 15 seconds turn-finalizer drainage —
+before Compose's 150-second stop grace and the native 140-second force
+wait. `pool_closed` is logged as a resource-cleanup outcome, not a
+durability precondition. Committed SQLite WAL transactions survive
+process-crash recovery; uncommitted transactions are abandoned. **State B
+remains an explicit exception:** incomplete turn finalization, upload
+compensation, or other registered recovery-critical work prevents the
+tail exit and may be force-terminated by the outer boundary under the
+disclosed durability preference. No universal pre-force-exit claim is
+made for State B or for direct uvicorn runs without the bounded-exit
+opt-in.
+
 **Container/native envelope (#799 AC5/#854).** Dockerfile CMD gains
 `--timeout-graceful-shutdown 20` (integer seconds — uvicorn rejects unit
 suffixes) and `RAGAPP_BOUNDED_EXIT=1`; docker-compose moves to
-`stop_grace_period: 150s` with the derivation comment (the natural worst
-case is 135 s — 20 request drain + 65 lifespan aggregate + 15 turn-finalizer
-drain + 30 SQLite-family join tail + 5 teardown — and the native stop wait
-is 140 s; both limits sit strictly above the worst case, and the State-B
-critical-incomplete path is named as the deliberate exception).
+`stop_grace_period: 150s` with the derivation comment (the composed
+envelope is 135 s — enforced 100 s (20 request drain + 65 lifespan
+aggregate + 15 turn-finalizer drain) plus 35 s of allowance (30 SQLite-family
+join tail + 5 teardown) — and the native stop wait is 140 s; both limits sit
+strictly above the composed envelope, and the State-B critical-incomplete
+path is named as the deliberate exception).
 
 **Windows graceful stop (#799 AC4).** start-services.ps1 launches the
 backend through `scripts/win_grouped_backend.py` (CREATE_NEW_PROCESS_GROUP

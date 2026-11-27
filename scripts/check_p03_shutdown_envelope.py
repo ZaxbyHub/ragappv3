@@ -126,8 +126,16 @@ def _normalize(text: str) -> str:
 def _uvicorn_grace_seconds() -> float:
     """The uvicorn grace from the Dockerfile's OPERATIVE CMD line.
 
-    The Dockerfile also mentions the flag in a COMMENT above the CMD; the
-    comment is not what uvicorn reads, so only the CMD line is parsed.
+    Two things make the naive search wrong:
+
+    * the Dockerfile also mentions the flag in a COMMENT above the CMD,
+      and the comment is not what uvicorn reads;
+    * Docker uses the LAST CMD instruction (of the final stage), so an
+      earlier CMD carrying the flag does not decide the runtime value.
+
+    So: take the LAST CMD line in the file and read the flag from THAT
+    line. If the operative CMD carries no flag, the runtime has no bound
+    and the gate fails closed.
     """
     dockerfile = _read(_DOCKERFILE)
     cmd_lines = [
@@ -135,13 +143,14 @@ def _uvicorn_grace_seconds() -> float:
     ]
     if not cmd_lines:
         raise ValueError("Dockerfile has no CMD line")
-    for line in cmd_lines:
-        grace = _UVICORN_GRACE_RE.search(line)
-        if grace is not None:
-            return float(grace.group(1))
-    raise ValueError(
-        "Dockerfile's CMD carries no --timeout-graceful-shutdown integer flag"
-    )
+    operative = cmd_lines[-1]
+    grace = _UVICORN_GRACE_RE.search(operative)
+    if grace is None:
+        raise ValueError(
+            "Dockerfile's operative CMD carries no --timeout-graceful-shutdown "
+            "integer flag"
+        )
+    return float(grace.group(1))
 
 
 def _enforced_components() -> list[tuple[str, float]]:

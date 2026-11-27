@@ -1284,13 +1284,32 @@ async def lifespan(app: FastAPI):
     def _remaining() -> float:
         return max(0.0, _shutdown_deadline - time.monotonic())
 
-    async def _stop_stage(name: str, factory):
+    # Abandoned shutdown stages are RETAINED until they finish: an
+    # unreferenced task can be garbage-collected while it is still running,
+    # so a strong reference keeps it alive until its done callback drops
+    # it. The set lives in this lifespan's scope, so it dies with it.
+    _detached_stages: set[asyncio.Task] = set()
+
+    async def _stop_stage(name: str, factory, timeout: float | None = None):
         """Await one shutdown stage under the remaining process budget.
 
         ``factory`` is a zero-arg callable returning the awaitable, so the
-        coroutine is only created when the stage actually runs.
+        coroutine is only created when the stage actually runs. ``timeout``
+        overrides the budget (the background processor's stop gets the
+        remaining budget plus its own documented cap).
+
+        The bound does NOT depend on the stage's cooperation. The stage
+        runs as a task and is waited for with ``asyncio.wait``, which
+        returns the still-pending set instead of forwarding the wait;
+        ``asyncio.wait_for`` forwards the timeout's cancellation INTO the
+        stage and then WAITS for that cancellation to land, so a stage
+        that suppresses or delays its cancellation would hold the whole
+        shutdown past the aggregate budget (the same defect class the
+        residency settle had). A stage that overruns is CANCELLED — asked
+        to stop — and left detached: the shutdown continues without it,
+        and its late outcome is logged rather than awaited.
         """
-        budget = _remaining()
+        budget = _remaining() if timeout is None else timeout
         if budget <= 0:
             logger.warning(
                 "Shutdown stage '%s' skipped: aggregate budget exhausted",
@@ -1298,13 +1317,47 @@ async def lifespan(app: FastAPI):
             )
             return None
         try:
-            return await asyncio.wait_for(factory(), timeout=budget)
-        except asyncio.TimeoutError:
+            task = asyncio.ensure_future(factory())
+        except Exception:  # noqa: BLE001 — a stage that cannot even start never skips the rest
+            logger.warning("Shutdown stage '%s' failed", name, exc_info=True)
+            return None
+
+        try:
+            done, pending = await asyncio.wait({task}, timeout=budget)
+        except asyncio.CancelledError:
+            # THIS task was cancelled (an external cancel, not the
+            # budget expiring): the stage is asked to stop and the
+            # cancellation propagates.
+            task.cancel()
+            raise
+        if pending:
+            # The stage overran: ask it to stop, keep a strong reference
+            # until it finishes, and report a late failure instead of
+            # letting it surface as an unretrieved-exception warning.
+            task.cancel()
+            _detached_stages.add(task)
+            task.add_done_callback(_detached_stages.discard)
+            task.add_done_callback(
+                lambda finished, stage_name=name: _log_detached_failure(
+                    stage_name, finished
+                )
+            )
             logger.warning(
                 "Shutdown stage '%s' exceeded the aggregate shutdown budget; "
-                "continuing shutdown",
+                "continuing shutdown (it was asked to stop and is detached)",
                 name,
             )
+            return None
+        try:
+            return task.result()
+        except asyncio.CancelledError:
+            # The stage itself was cancelled (and honoured it): that is
+            # not THIS task's cancellation, so it is absorbed — unless the
+            # enclosing scope is being cancelled, which must propagate.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            return None
         except Exception:  # noqa: BLE001 — one stage's failure never skips the rest
             logger.warning("Shutdown stage '%s' failed", name, exc_info=True)
         return None
@@ -1422,16 +1475,13 @@ async def lifespan(app: FastAPI):
         # whole composed drain sequence inside the slice it is given (#854).
         remaining_budget = _remaining()
         if remaining_budget > 0:
-            try:
-                await asyncio.wait_for(
-                    app.state.background_processor.stop(timeout=remaining_budget),
-                    timeout=remaining_budget + _PROCESSOR_STOP_CAP_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Background processor stop exceeded the aggregate shutdown "
-                    "budget; continuing shutdown"
-                )
+            await _stop_stage(
+                "background processor stop",
+                lambda: app.state.background_processor.stop(
+                    timeout=remaining_budget
+                ),
+                timeout=remaining_budget + _PROCESSOR_STOP_CAP_SECONDS,
+            )
         else:
             logger.warning(
                 "Shutdown stage 'background processor stop' skipped: aggregate "
@@ -1544,16 +1594,52 @@ async def lifespan(app: FastAPI):
     _bounded_tail_exit(turn_finalizers_drained, pool_closed)
 
 
+
+def _log_detached_failure(stage_name: str, finished: asyncio.Future) -> None:
+    """Report a detached shutdown stage's late failure.
+
+    Registered only for a stage that was ABANDONED on timeout: its
+    exception would otherwise surface as an "exception was never
+    retrieved" warning at collection time, with no stage name.
+    """
+    if finished.cancelled():
+        return
+    exc = finished.exception()
+    if exc is not None:
+        logger.warning(
+            "Shutdown stage '%s' failed after the budget expired",
+            stage_name,
+            exc_info=exc,
+        )
+
 def _bounded_tail_exit(turn_finalizers_drained: bool, pool_closed: bool) -> bool:
     """Run the bounded tail-exit gate; returns True iff os._exit fired.
 
     Fires only when RAGAPP_BOUNDED_EXIT=1 AND the deny-by-default critical
-    registry is empty AND turn finalizers drained AND the pool closed AND
-    the upload-commit registry is empty (read at gate time). Unreadable
-    state counts as pending (never exit on unknown). os._exit skips
-    executor joins and interpreter teardown; there are no app-level atexit
-    registrations. Tests/embedded lifespans never set the env (conftest
-    pops it) and take the normal path.
+    registry is empty AND turn finalizers drained AND the upload-commit
+    registry is empty (read at gate time). Unreadable state counts as
+    pending (never exit on unknown). os._exit skips executor joins and
+    interpreter teardown; there are no app-level atexit registrations.
+    Tests/embedded lifespans never set the env (conftest pops it) and take
+    the normal path.
+
+    ``pool_closed`` is NOT a firing precondition (plan rev 11): it is a
+    RESOURCE-CLEANUP outcome, not a durability condition. The durability
+    conditions are the three registries/states above -- the turn
+    finalizers (the #1202 contract: a live turn's finalizer must be able to
+    finish, which is why the pool is deliberately left open when it did
+    not drain), the upload-commit registry, and the deny-by-default
+    critical-work registry. Exiting with the pool open is safe: the
+    process exit reclaims the connections, SQLite abandons uncommitted
+    work, and committed WAL transactions survive a process crash and are
+    recovered on reopen. Requiring the close would have made the
+    EXHAUSTED-BUDGET path (the #854 stall scenario) fall through to the
+    unbounded executor joins -- and Compose's force kill would then end
+    the process, which frozen AC12 forbids ("in either case the process
+    exits before Compose force-terminates it").
+
+    The pool state is still LOGGED on both the firing and the non-firing
+    paths, so a cleanup that did not complete is visible.
     """
     if os.environ.get("RAGAPP_BOUNDED_EXIT") != "1":
         return False
@@ -1566,7 +1652,6 @@ def _bounded_tail_exit(turn_finalizers_drained: bool, pool_closed: bool) -> bool
         uploads_pending = True
     critical_complete = (
         turn_finalizers_drained
-        and pool_closed
         and not uploads_pending
         and not critical_work_active()
     )
@@ -1575,8 +1660,9 @@ def _bounded_tail_exit(turn_finalizers_drained: bool, pool_closed: bool) -> bool
             handler.flush()
     if critical_complete:
         logging.getLogger().info(
-            "ragapp: bounded tail exit — critical shutdown complete; "
-            "skipping non-critical executor joins"
+            "ragapp: bounded tail exit — critical shutdown complete "
+            "(pool_closed=%s); skipping non-critical executor joins",
+            pool_closed,
         )
         for handler in logging.getLogger().handlers:
             with contextlib_suppress(Exception):
