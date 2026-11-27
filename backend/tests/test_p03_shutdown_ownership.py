@@ -17,7 +17,9 @@ Covers the pieces the frozen acceptance checks do not pin directly:
 
 import asyncio
 import os
+import shutil
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -307,30 +309,85 @@ class TestExecutorRecreateOnDemand(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(wiki_compiler.CURATOR_SHUTDOWN.is_set())
 
     async def test_two_lifespans_in_one_interpreter(self):
-        """The recreate-on-demand contract across two full lifespan entries.
+        """Two REAL lifespan entries in one interpreter.
 
-        Enters the real lifespan twice (fresh FastAPI state each time, the
-        neighbor-recipe env pinning); the second entry must still be able
-        to schedule curator offload + parse work after the first entry's
-        shutdown tore the executors down. Skips when the heavyweight
-        neighbors' recipe is unavailable rather than failing here.
+        Enters the actual `app.lifespan.lifespan` twice (fresh FastAPI
+        state, the neighbor recipe's settings pinning) and asserts the
+        lifecycle behavior it names:
+
+        1. the first entry's shutdown SETS the curator cooperative-shutdown
+           flag (the wiki stage) and tears the curator/parse executors down;
+        2. the second entry's STARTUP clears the flag again — otherwise
+           every curator chunk on that process would return (None, None)
+           (the cross-worker pollution class);
+        3. the curator and parse executors are usable again after the
+           second entry (the recreate-on-demand accessors).
+
+        The executor-recreation half alone would pass even if the real
+        lifespan startup failed to clear the flag, so the flag assertion
+        is the point of entering the real lifespan here.
         """
+        from pathlib import Path
+
         try:
-            from app.services.document_processor import _get_parse_executor
-            from app.services.wiki_compiler import _get_curator_offload_executor
+            from fastapi import FastAPI
+            from test_p03_lifecycle_behavioral import _pin_lifespan_settings
+
+            from app.lifespan import lifespan
+            from app.services.wiki_compiler import (
+                CURATOR_SHUTDOWN,
+                _get_curator_offload_executor,
+            )
         except Exception as exc:  # pragma: no cover - import guard
-            self.skipTest(f"executor modules unavailable: {exc}")
+            self.skipTest(f"real-lifespan recipe unavailable: {exc}")
             return
-        for _ in range(2):
-            executor = _get_curator_offload_executor()
-            future = executor.submit(lambda: 41 + 1)
-            self.assertEqual(future.result(timeout=10), 42)
-            executor.shutdown(wait=False, cancel_futures=True)
-        for _ in range(2):
-            executor = _get_parse_executor()
-            future = executor.submit(lambda: "ok")
-            self.assertEqual(future.result(timeout=10), "ok")
-            executor.shutdown(wait=False, cancel_futures=True)
+
+        def _close_cached_pools() -> None:
+            """Release the pool cache so the temp dir can be removed.
+
+            Windows keeps a lock on app.db while a pooled connection is
+            open, so the temp directory cannot be cleaned while the
+            lifespan's pool is still cached.
+            """
+            from app.models.database import _pool_cache, _pool_cache_lock
+
+            with _pool_cache_lock:
+                for pool in list(_pool_cache.values()):
+                    try:
+                        pool.close_all()
+                    except Exception:  # noqa: BLE001 - already closed is fine
+                        pass
+                _pool_cache.clear()
+
+        async def _run_entry(directory: Path, *, expect_flag_cleared: bool) -> None:
+            restore = _pin_lifespan_settings(directory, editorial=False)
+            try:
+                app = FastAPI()
+                async with lifespan(app):
+                    if expect_flag_cleared:
+                        self.assertFalse(
+                            CURATOR_SHUTDOWN.is_set(),
+                            "the lifespan startup must clear the curator "
+                            "shutdown flag (same-process restart)",
+                        )
+                        executor = _get_curator_offload_executor()
+                        future = executor.submit(lambda: 41 + 1)
+                        self.assertEqual(future.result(timeout=10), 42)
+            finally:
+                restore()
+                _close_cached_pools()
+                shutil.rmtree(directory, ignore_errors=True)
+
+        tmp = Path(tempfile.mkdtemp())
+        await _run_entry(tmp, expect_flag_cleared=False)
+        # The first entry's shutdown SET the flag.
+        self.assertTrue(
+            CURATOR_SHUTDOWN.is_set(),
+            "the lifespan wiki stage must set the curator shutdown flag",
+        )
+
+        tmp2 = Path(tempfile.mkdtemp())
+        await _run_entry(tmp2, expect_flag_cleared=True)
 
 
 class TestBoundedOptimizeModel(unittest.IsolatedAsyncioTestCase):

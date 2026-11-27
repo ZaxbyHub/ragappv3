@@ -1570,25 +1570,41 @@ async def _finalize_turns_and_close_pool(app, remaining=None) -> tuple[bool, boo
             "Durable turn finalizer shutdown check failed: %s", type(exc).__name__
         )
     if turn_finalizers_drained:
-        try:
-            close_budget = remaining() if remaining is not None else None
-            if close_budget is not None and close_budget > 0:
+        close_budget = remaining() if remaining is not None else None
+        if close_budget is None:
+            # No budget supplied (a direct caller with no envelope): the
+            # historical synchronous close.
+            app.state.db_pool.close_all()
+            pool_closed = True
+        elif close_budget > 0:
+            try:
                 await asyncio.wait_for(
                     asyncio.to_thread(app.state.db_pool.close_all),
                     timeout=close_budget,
                 )
-            else:
-                app.state.db_pool.close_all()
-            pool_closed = True
-        except asyncio.TimeoutError:
-            # The close did not complete inside the aggregate budget; the
-            # pool is NOT marked closed, so the bounded tail exit cannot
-            # fire. close_all is idempotent-safe for a later retry by the
-            # interpreter teardown (a second close finds an empty pool).
+                pool_closed = True
+            except asyncio.TimeoutError:
+                # The close did not complete inside the aggregate budget; the
+                # pool is NOT marked closed, so the bounded tail exit cannot
+                # fire. close_all is idempotent-safe for a later retry by
+                # the interpreter teardown (a second close finds an empty
+                # pool).
+                logger.warning(
+                    "Pool close exceeded the aggregate shutdown budget; "
+                    "continuing shutdown (pool not marked closed)"
+                )
+            except Exception:
+                logger.warning("Pool close failed during shutdown", exc_info=True)
+        else:
+            # The aggregate budget is EXHAUSTED: close_all() takes the pool
+            # lock and can block, so it must never run synchronously on the
+            # event loop here (that would hold the shutdown past the
+            # envelope and keep the tail gate unreachable). The pool is
+            # left open and NOT marked closed — the gate declines to fire,
+            # and the interpreter's own teardown closes it.
             logger.warning(
-                "Pool close exceeded the aggregate shutdown budget; "
-                "continuing shutdown (pool not marked closed)"
+                "Pool close skipped: the aggregate shutdown budget is "
+                "exhausted; the pool is left for interpreter teardown "
+                "(not marked closed)"
             )
-        except Exception:
-            logger.warning("Pool close failed during shutdown", exc_info=True)
     return turn_finalizers_drained, pool_closed
