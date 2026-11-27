@@ -1698,8 +1698,12 @@ async def _finalize_turns_and_close_pool(app, remaining=None) -> tuple[bool, boo
     in-flight checkout. It runs on a worker under the remaining aggregate
     budget — an unbounded call here would be the one stage that can hold
     the shutdown past the envelope and keep the tail gate unreachable. A
-    timed-out close leaves ``pool_closed`` False, so the gate never fires
-    on a pool that was not actually closed.
+    timed-out or skipped close leaves ``pool_closed`` False, which is a
+    RESOURCE-CLEANUP outcome, NOT a firing condition: the tail gate decides
+    on the durability conditions alone (the turn finalizers, the
+    upload-commit registry and the critical-work registry — see
+    ``_bounded_tail_exit``), and the process exit reclaims an unclosed
+    pool's connections.
     """
     turn_finalizers_drained = False
     pool_closed = False
@@ -1759,9 +1763,10 @@ async def _finalize_turns_and_close_pool(app, remaining=None) -> tuple[bool, boo
             # lock and can block, so it must never run synchronously on the
             # event loop here (that would hold the shutdown past the
             # envelope and keep the tail gate unreachable). The pool is
-            # left open and NOT marked closed — the gate declines to fire
-            # rather than claim a close that did not happen, and the
-            # process's own exit reclaims the connections.
+            # left open and NOT marked closed — the gate's DECISION does
+            # not depend on it (the durability conditions decide; the
+            # process's own exit reclaims the connections), but the state
+            # is logged so a cleanup that did not complete is visible.
             logger.warning(
                 "Pool close skipped: the aggregate shutdown budget is "
                 "exhausted; the pool is left open for the process exit "

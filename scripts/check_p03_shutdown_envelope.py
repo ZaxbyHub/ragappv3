@@ -144,13 +144,17 @@ def _uvicorn_grace_seconds() -> float:
     if not cmd_lines:
         raise ValueError("Dockerfile has no CMD line")
     operative = cmd_lines[-1]
-    grace = _UVICORN_GRACE_RE.search(operative)
-    if grace is None:
+    flags = _UVICORN_GRACE_RE.findall(operative)
+    if not flags:
         raise ValueError(
             "Dockerfile's operative CMD carries no --timeout-graceful-shutdown "
             "integer flag"
         )
-    return float(grace.group(1))
+    # argparse resolves a repeated option by letting the LAST occurrence
+    # win, so that is the value uvicorn actually receives; the gate must
+    # read the same one (the first occurrence would be a value the runtime
+    # never uses).
+    return float(flags[-1])
 
 
 def _enforced_components() -> list[tuple[str, float]]:

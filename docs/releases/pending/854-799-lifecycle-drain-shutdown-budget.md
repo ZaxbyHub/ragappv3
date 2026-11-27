@@ -69,7 +69,8 @@ it) and by the process-level force boundary in State B (the compose grace
 
 **A bounded tail exit.** After every recovery-critical workflow completes
 (deny-by-default `critical_shutdown_work` registry EMPTY, turn finalizers
-drained, DB pool closed, upload-commit registry empty — read at gate time)
+drained, upload-commit registry empty — read at gate time; the DB pool
+state is a logged cleanup outcome, not a firing condition)
 and logging is flushed, the lifespan's final step exits immediately instead
 of joining whatever non-critical worker threads are alive (abandoned parses
 past their enforced 300 s await, a curator call past its between-calls
