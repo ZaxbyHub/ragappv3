@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -334,6 +335,7 @@ class TestExecutorRecreateOnDemand(unittest.IsolatedAsyncioTestCase):
             from test_p03_lifecycle_behavioral import _pin_lifespan_settings
 
             from app.lifespan import lifespan
+            from app.services.document_processor import _get_parse_executor
             from app.services.wiki_compiler import (
                 CURATOR_SHUTDOWN,
                 _get_curator_offload_executor,
@@ -373,6 +375,11 @@ class TestExecutorRecreateOnDemand(unittest.IsolatedAsyncioTestCase):
                         executor = _get_curator_offload_executor()
                         future = executor.submit(lambda: 41 + 1)
                         self.assertEqual(future.result(timeout=10), 42)
+                        # The parse executor has the same lifecycle
+                        # (shut down at shutdown, recreated on demand).
+                        parse_executor = _get_parse_executor()
+                        parse_future = parse_executor.submit(lambda: "ok")
+                        self.assertEqual(parse_future.result(timeout=10), "ok")
             finally:
                 restore()
                 _close_cached_pools()
@@ -388,6 +395,67 @@ class TestExecutorRecreateOnDemand(unittest.IsolatedAsyncioTestCase):
 
         tmp2 = Path(tempfile.mkdtemp())
         await _run_entry(tmp2, expect_flag_cleared=True)
+
+
+class TestZeroBudgetPoolClose(unittest.IsolatedAsyncioTestCase):
+    """A supplied ZERO budget must never close the pool on the event loop.
+
+    `close_all()` takes the pool lock and can block, so an exhausted
+    aggregate budget must SKIP the close (leaving `pool_closed` False so
+    the bounded tail exit declines to fire) rather than call it
+    synchronously.
+    """
+
+    async def test_zero_budget_skips_the_close_and_leaves_pool_open(self):
+        from app.lifespan import _finalize_turns_and_close_pool
+
+        calls = []
+
+        class _Pool:
+            def close_all(self):
+                calls.append("closed")
+
+        class _State:
+            db_pool = _Pool()
+
+        class _App:
+            state = _State()
+
+        drained, pool_closed = await _finalize_turns_and_close_pool(
+            _App(), remaining=lambda: 0.0
+        )
+        self.assertEqual(
+            calls, [], "an exhausted budget must not close the pool at all"
+        )
+        self.assertFalse(pool_closed, "the pool must not be marked closed")
+
+    async def test_positive_budget_closes_the_pool_and_marks_it(self):
+        from app.lifespan import _finalize_turns_and_close_pool
+
+        calls = []
+
+        class _Pool:
+            def close_all(self):
+                calls.append("closed")
+
+        class _State:
+            db_pool = _Pool()
+
+        class _App:
+            state = _State()
+
+        # The finalizer drain is what gates the close; force its result by
+        # patching the drain helper the function calls.
+        with unittest.mock.patch(
+            "app.api.routes.chat.shutdown_turn_finalizers",
+            new=unittest.mock.AsyncMock(return_value=True),
+        ):
+            drained, pool_closed = await _finalize_turns_and_close_pool(
+                _App(), remaining=lambda: 5.0
+            )
+        self.assertTrue(drained)
+        self.assertTrue(pool_closed)
+        self.assertEqual(calls, ["closed"])
 
 
 class TestBoundedOptimizeModel(unittest.IsolatedAsyncioTestCase):
