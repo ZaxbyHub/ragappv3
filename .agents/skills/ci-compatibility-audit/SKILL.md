@@ -135,6 +135,10 @@ Repository contract job:
   CMD or start-services.ps1 loses the integer
   `--timeout-graceful-shutdown` bound, or docker-compose's
   `stop_grace_period` is not strictly greater than it (issues #854/#799).
+- `python scripts/check_p03_shutdown_envelope.py` — fails if the shutdown
+  envelope's ONE derivation drifts: the compose `stop_grace_period` or either
+  native stop wait is not strictly above the computed 135 s natural worst
+  case, or a surface stops quoting that total (issues #854/#799).
 
 SAST job:
 
@@ -214,6 +218,7 @@ python scripts/check_l09_index_assets.py
 python scripts/check_l09_memory_response_fields.py
 python scripts/check_n05_draftclaim_nullable.py
 python scripts/check_p03_graceful_shutdown.py
+python scripts/check_p03_shutdown_envelope.py
 python scripts/run_bandit.py
 ```
 

@@ -241,6 +241,13 @@ jobs:
       - name: Graceful shutdown envelope check
         run: python scripts/check_p03_graceful_shutdown.py
 
+      # Issues #854/#799: the shutdown envelope's ONE derivation — every
+      # force-kill limit (the compose grace and both native stop waits) must
+      # sit strictly above the 135 s natural worst case, and every surface
+      # must quote that same total.
+      - name: Shutdown envelope derivation check
+        run: python scripts/check_p03_shutdown_envelope.py
+
   # Issue #778 (Workstream L PR 7): the route x viewport accessibility gate.
   # Separate from the e2e smoke job — the matrix is 141 serial tests and
   # must not share the smoke budget — and wired by

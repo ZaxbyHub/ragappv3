@@ -23,6 +23,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 BUDGET_SECONDS = 1.0
 STALL_SECONDS = 3.0
+# Guard on the shutdown phase for the residency test. A mutant that drops
+# the settle's timeout wrapper hangs the shutdown; the guard ends it. The
+# bound assertion below is what the shipped code satisfies.
+SHUTDOWN_GUARD_SECONDS = 45.0
 
 
 class _Stall:
@@ -56,11 +60,12 @@ class _SwallowsCancellation:
 
     async def prime_residency(self):
         self.started.set()
-        # Swallow ONE cancellation and keep running: the settle must be
-        # bounded by its timeout wrapper, not by rt.cancel() alone.
-        # (Measured: the shipped settle completes at ~6.2 s against a 1 s
-        # budget + 5 s slack; a mutant that drops the wrapper takes ~8.7 s.
-        # The bound below sits between the two.)
+        # Swallow ONE cancellation and keep running. A mutant that drops the
+        # settle's wait_for wrapper then HANGS the settle (the task never
+        # dies on its own), which the test's shutdown-phase guard ends — so
+        # the kill does not depend on a timing race. (A task that ignored
+        # cancellation ENTIRELY would be more decisive but cannot exist in a
+        # test process: the event loop's own shutdown would hang on it.)
         try:
             await asyncio.sleep(3600)
         except asyncio.CancelledError:
@@ -150,7 +155,12 @@ class TestLifespanAggregateBudget(unittest.IsolatedAsyncioTestCase):
                 "app.services.llm_client.create_editorial_client",
                 return_value=fake,
             ):
-                await asyncio.wait_for(scenario(), timeout=BUDGET_SECONDS + 12)
+                # The guard covers the SHUTDOWN phase only: the startup
+                # delay is measured separately, so a slow host cannot
+                # shorten the window in which the mutant hangs.
+                await asyncio.wait_for(
+                    scenario(), timeout=BUDGET_SECONDS + SHUTDOWN_GUARD_SECONDS
+                )
         finally:
             restore()
 
@@ -161,3 +171,5 @@ class TestLifespanAggregateBudget(unittest.IsolatedAsyncioTestCase):
             f"the residency settle ran {elapsed:.2f}s — it must be bounded "
             f"by the remaining budget plus its documented 5 s slack",
         )
+        # (The elapsed bound is the secondary assertion: a mutant that drops
+        # the wrapper hangs the settle and fails on the guard above.)

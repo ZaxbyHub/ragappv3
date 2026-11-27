@@ -195,7 +195,7 @@ class TestRegistrationMapPin(unittest.TestCase):
 class TestSharedMaintenanceSlice(unittest.IsolatedAsyncioTestCase):
     """The maintenance slice is ONE shared budget, not one per call (#854).
 
-    The four shutdown-critical maintenance calls (ingest lease release,
+    The three shutdown-critical maintenance calls (ingest lease release,
     reindex lease release, parked-retry reset) each get the shared slice
     computed once at stop() entry: three simultaneously-slow calls must
     cost ONE slice (worst case timeout + slice), not three. A per-call

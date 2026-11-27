@@ -123,15 +123,19 @@ services:
     # upload-commit drain), and the bounded tail exit ends the process at
     # completion, skipping the non-critical executor joins. The turn-finalizer
     # drain keeps its OWN enforced budget (5 s producer retirement + 10 s
-    # drain) OUTSIDE that 60 s. Natural worst case 20 (request drain) + 60
-    # (lifespan stages) + 15 (finalizer drain) + 30 (SQLite-family join tail,
-    # State-B paths aside) + 5 (teardown) = 130 s; the 130 s grace matches it
-    # and the 125 s native wait sits inside it. State B — a critical-incomplete shutdown (live-turn
+    # drain) OUTSIDE that 60 s.
+    #
+    # ONE derivation, used verbatim by both .ps1 scripts, the release
+    # fragment and the PR body — natural worst case:
+    #   20 s (uvicorn request drain) + 65 s (lifespan aggregate: the 60 s budget plus the 5 s outer cap on the processor stop) + 15 s (turn-finalizer drain: 5 s producer retirement + 10 s drain) + 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 135 s.
+    # This 150 s grace and the 140 s native stop wait are both strictly
+    # above that worst case, so a healthy shutdown is never force-killed
+    # mid-flight. State B — a critical-incomplete shutdown (live-turn
     # finalizer timeout with the pool deliberately open per #1202, or upload
     # compensation still in flight per PRR-020) — intentionally continues
     # past this envelope until the critical work finishes or this grace
     # force-cuts it: the deliberate data-safety preference over a hard exit.
-    stop_grace_period: 130s
+    stop_grace_period: 150s
     ports:
       - "${PORT:-9090}:9090"
     volumes:

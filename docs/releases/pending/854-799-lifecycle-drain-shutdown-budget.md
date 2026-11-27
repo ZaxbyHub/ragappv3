@@ -26,10 +26,18 @@ argument — every no-argument stage runs through a bounded `_stop_stage`
 helper, and the two synchronous closes run via `to_thread` under the same
 budget. The turn-finalizer drain keeps its OWN enforced budget (5 s producer
 retirement + 10 s drain, `TURN_PRODUCER_SHUTDOWN_TIMEOUT_SECONDS` /
-`TURN_FINALIZE_DRAIN_TIMEOUT_SECONDS`), so the process-level envelope is
-60 s (lifespan stages) + 15 s (finalizer drain) + 30 s (SQLite-family
-executor-join tail) + 5 s (teardown) = 115 s natural worst case, inside the
-125 s native stop wait and the 130 s compose grace.
+`TURN_FINALIZE_DRAIN_TIMEOUT_SECONDS`).
+
+ONE derivation, used verbatim by docker-compose.yml, both .ps1 scripts and
+the PR body — the natural worst case is:
+
+    20 s (uvicorn request drain) + 65 s (lifespan aggregate: the 60 s
+    budget plus the 5 s outer cap on the processor stop) + 15 s
+    (turn-finalizer drain) + 30 s (SQLite-family executor-join tail) + 5 s
+    (teardown) = 135 s
+
+The compose grace is 150 s and the native stop wait is 140 s — both strictly
+above 135 s, so a healthy shutdown is never force-killed mid-flight.
 
 **A bounded tail exit.** After every recovery-critical workflow completes
 (deny-by-default `critical_shutdown_work` registry EMPTY, turn finalizers
@@ -59,9 +67,10 @@ deleted or added arm fails CI.
 **Container/native envelope (#799 AC5/#854).** Dockerfile CMD gains
 `--timeout-graceful-shutdown 20` (integer seconds — uvicorn rejects unit
 suffixes) and `RAGAPP_BOUNDED_EXIT=1`; docker-compose moves to
-`stop_grace_period: 130s` with the derivation comment (20 request drain +
-60 lifespan aggregate + 30 SQLite-family join tail + 5 teardown = 115 s
-natural worst < 125 s native stop wait < 130 s grace; the State-B
+`stop_grace_period: 150s` with the derivation comment (the natural worst
+case is 135 s — 20 request drain + 65 lifespan aggregate + 15 turn-finalizer
+drain + 30 SQLite-family join tail + 5 teardown — and the native stop wait
+is 140 s; both limits sit strictly above the worst case, and the State-B
 critical-incomplete path is named as the deliberate exception).
 
 **Windows graceful stop (#799 AC4).** start-services.ps1 launches the
@@ -72,7 +81,8 @@ Stop-ProcessOnPort) verify the marker (pid AND start time — a reused PID
 fails the gate to the ungrouped fallback), then
 `scripts/win_send_ctrl_break.py` — a sacrificial sender that detaches its
 own console, attaches to the backend's, and delivers a TARGETED CTRL_BREAK
-to the nonzero group — waits up to 125 s, and only then force-stops.
+to the nonzero group — waits up to 140 s (above the 135 s natural worst
+case), and only then force-stops.
 CPython maps CTRL_BREAK to SIGBREAK; uvicorn handles SIGBREAK. Host-verified
 end to end: graceful exit in 0.4 s with the full lifespan shutdown sequence
 (including the bounded tail exit) in the backend log; the sender and the
@@ -122,6 +132,7 @@ restarts working.
 - backend/tests/test_p03_lifecycle_behavioral.py (C13/C14/C15/C16 behavioral)
 - backend/tests/test_p03_shutdown_ownership.py (registry, tail-gate matrices, executor recreation, env pop pin)
 - scripts/check_p03_graceful_shutdown.py (C5 structural; wired into the CI Quality contracts job by this PR)
+- scripts/check_p03_shutdown_envelope.py (new in this PR; wired into the CI Quality contracts job — it owns the ONE envelope derivation and fails if the compose grace, either native stop wait, or any surface's quoted total drifts from the 135 s natural worst case)
 
 UX note: stop-services.ps1 now waits up to 15 s for non-backend ports
 (frontend/Ollama) before force-stopping, instead of force-killing

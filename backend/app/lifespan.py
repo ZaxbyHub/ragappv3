@@ -58,9 +58,11 @@ logger = logging.getLogger(__name__)  # noqa: E402
 # covering every lifespan shutdown stage (email, residency, watcher, the
 # four processor stops, admission, store/pool closes, the upload-commit and
 # turn-finalizer gates). Sizing lives in docker-compose.yml's derivation
-# comment: 20 s uvicorn request drain + this 60 s aggregate + 30 s
-# SQLite-family join tail + 5 s teardown = 115 s natural worst, inside the
-# 125 s native stop wait and the 130 s compose grace.
+# comment, which is the ONE source for the envelope: 20 s uvicorn request
+# drain + 65 s lifespan aggregate (this 60 s budget plus the 5 s outer cap
+# on the processor stop) + 15 s turn-finalizer drain + 30 s SQLite-family
+# join tail + 5 s teardown = 135 s natural worst, below the 140 s native
+# stop wait and the 150 s compose grace.
 _SHUTDOWN_BUDGET_SECONDS = 60.0
 
 
@@ -1299,6 +1301,16 @@ async def lifespan(app: FastAPI):
         # a natural exception is contained (the processor stops, admission
         # release, store/pool closes below stay reachable) instead of
         # skipping the whole shutdown chain.
+        #
+        # The whole settle runs under ONE aggregate timeout, and the
+        # per-task CancelledError handler must NOT swallow the SCOPE's own
+        # cancellation: rt.cancel() cancels the RESIDENCY task (expected —
+        # that is what we asked for), while the timeout cancels THIS task
+        # (the bound expiring — that must propagate so the timeout can
+        # convert it and the shutdown can continue). asyncio counts the
+        # cancellations requested on the current task, so cancelling() tells
+        # the two apart; without that distinction a residency task that
+        # ignores its cancellation would hang the whole shutdown.
         try:
             async with asyncio.timeout(_remaining() + 5.0):
                 for rt in residency_tasks:
@@ -1306,7 +1318,9 @@ async def lifespan(app: FastAPI):
                     try:
                         await rt
                     except asyncio.CancelledError:
-                        pass
+                        current = asyncio.current_task()
+                        if current is not None and current.cancelling():
+                            raise
                     except Exception as e:  # noqa: BLE001 — AC2 absorb
                         logger.warning(
                             "Residency task ended with exception at shutdown "
@@ -1586,10 +1600,8 @@ async def _finalize_turns_and_close_pool(app, remaining=None) -> tuple[bool, boo
             except asyncio.TimeoutError:
                 # The close did not complete inside the aggregate budget; the
                 # pool is NOT marked closed, so the bounded tail exit cannot
-                # fire. close_all is idempotent-safe for a later retry by
-                # the pool's own connections are reclaimed when the process
-            # exits (a second close finds an empty
-                # pool).
+                # fire. close_all is idempotent-safe for a later retry (a
+                # second close finds an empty pool).
                 logger.warning(
                     "Pool close exceeded the aggregate shutdown budget; "
                     "continuing shutdown (pool not marked closed)"
@@ -1601,12 +1613,12 @@ async def _finalize_turns_and_close_pool(app, remaining=None) -> tuple[bool, boo
             # lock and can block, so it must never run synchronously on the
             # event loop here (that would hold the shutdown past the
             # envelope and keep the tail gate unreachable). The pool is
-            # left open and NOT marked closed — the gate declines to fire,
-            # pool); the gate declines to fire rather than claim a close
-            # that did not happen.
+            # left open and NOT marked closed — the gate declines to fire
+            # rather than claim a close that did not happen, and the
+            # process's own exit reclaims the connections.
             logger.warning(
                 "Pool close skipped: the aggregate shutdown budget is "
-                "exhausted; the pool is left for interpreter teardown "
+                "exhausted; the pool is left open for the process exit "
                 "(not marked closed)"
             )
     return turn_finalizers_drained, pool_closed
