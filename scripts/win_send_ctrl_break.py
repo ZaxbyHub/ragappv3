@@ -16,7 +16,7 @@ event failed; prints a diagnostic line either way.
 import ctypes
 import sys
 
-kernel32 = ctypes.windll.kernel32
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 CTRL_BREAK_EVENT = 1
 ATTACH_PARENT_PROCESS = ctypes.c_uint(-1).value  # noqa: F841 — documented constant
@@ -30,7 +30,7 @@ def main() -> int:
 
     kernel32.FreeConsole()
     if not kernel32.AttachConsole(pid):
-        err = ctypes.get_last_error()
+        err = ctypes.get_last_error()  # use_last_error=True binding
         print(f"win_send_ctrl_break: AttachConsole({pid}) failed err={err}")
         return 3
     try:

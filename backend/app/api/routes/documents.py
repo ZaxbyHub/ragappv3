@@ -3027,7 +3027,10 @@ async def _do_upload(
             # Remove both the temp sibling and the reserved placeholder /
             # placed bytes — matching the pre-#786 single-path cleanup, where
             # temp and final were the same path.
-            await _discard_upload_artifacts(file_path, temp_file_path)
+            from app.services.shutdown_gate import critical_shutdown_work
+
+            async with critical_shutdown_work("document-upload-artifact-cleanup"):
+                await _discard_upload_artifacts(file_path, temp_file_path)
         else:
             file_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail="Upload failed")

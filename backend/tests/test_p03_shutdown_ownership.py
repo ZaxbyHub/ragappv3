@@ -59,80 +59,70 @@ class TestCriticalWorkRegistry(unittest.IsolatedAsyncioTestCase):
 
 
 class TestTailGatePredicate(unittest.IsolatedAsyncioTestCase):
-    """Unit-drive the gate predicate exactly as lifespan computes it.
-
-    The gate fires os._exit(0) only when ALL hold:
-    RAGAPP_BOUNDED_EXIT=1 AND drained AND pool_closed AND uploads empty AND
-    registry empty. Each test flips one input.
+    """Drive the REAL gate (app.lifespan._bounded_tail_exit) with os._exit
+    patched — no re-implementation. The gate fires os._exit(0) only when
+    RAGAPP_BOUNDED_EXIT=1 AND the registry is empty AND turn finalizers
+    drained AND pool closed AND the upload registry is empty (read at gate
+    time). Each test flips one input.
     """
 
-    async def _fires(self, *, env, drained, pool_closed, uploads, registry):
+    async def _gate(self, *, env, drained, pool_closed, uploads, use_registry=True):
+        import app.api.routes.draft_room as draft_room_mod
         import app.lifespan as lifespan_mod
 
         exits = []
-        with mock.patch.dict(os.environ, {"RAGAPP_BOUNDED_EXIT": env}), \
-                mock.patch.object(os, "_exit", side_effect=lambda c: exits.append(c)), \
-                mock.patch.object(lifespan_mod.os, "_exit", side_effect=lambda c: exits.append(c)):
-            # Re-implement the predicate inline exactly as the tail gate
-            # does (single expression, no awaits between check and exit).
-            uploads_pending = uploads
-            critical_complete = (
-                drained and pool_closed and not uploads_pending and not registry
-            )
-            if env == "1" and critical_complete:
-                os._exit(0)
-        return bool(exits)
+        sentinel = object()
+        with mock.patch.dict(os.environ, {"RAGAPP_BOUNDED_EXIT": env}),                 mock.patch.object(os, "_exit", side_effect=lambda c: exits.append(c)),                 mock.patch.object(lifespan_mod.os, "_exit", side_effect=lambda c: exits.append(c)),                 mock.patch.object(draft_room_mod, "_INFLIGHT_UPLOAD_COMMITS",
+                                  {sentinel} if uploads else set()):
+            if use_registry:
+                async with shutdown_gate.critical_shutdown_work("unit-gate"):
+                    fired = lifespan_mod._bounded_tail_exit(drained, pool_closed)
+            else:
+                fired = lifespan_mod._bounded_tail_exit(drained, pool_closed)
+        return bool(exits) or fired
 
     async def test_fires_only_when_all_critical_conditions_hold(self):
         self.assertTrue(
-            await self._fires(env="1", drained=True, pool_closed=True,
-                              uploads=False, registry=False)
+            await self._gate(env="1", drained=True, pool_closed=True,
+                             uploads=False, use_registry=False)
         )
 
     async def test_never_fires_without_env(self):
         self.assertFalse(
-            await self._fires(env="0", drained=True, pool_closed=True,
-                              uploads=False, registry=False)
+            await self._gate(env="0", drained=True, pool_closed=True,
+                             uploads=False, use_registry=False)
         )
         self.assertFalse(
-            await self._fires(env="", drained=True, pool_closed=True,
-                              uploads=False, registry=False)
+            await self._gate(env="", drained=True, pool_closed=True,
+                             uploads=False, use_registry=False)
         )
 
     async def test_never_fires_with_pending_uploads(self):
         # The marker's actual failure case: uploads pending after a NORMAL
         # timeout return (registry-read predicate stays false).
         self.assertFalse(
-            await self._fires(env="1", drained=True, pool_closed=True,
-                              uploads=True, registry=False)
+            await self._gate(env="1", drained=True, pool_closed=True,
+                             uploads=True, use_registry=False)
         )
 
     async def test_never_fires_with_live_critical_work(self):
+        # user-delete recovery active (registry entry) overlapping satisfied
+        # turn/upload/pool conditions: the gate must stay closed.
         self.assertFalse(
-            await self._fires(env="1", drained=True, pool_closed=True,
-                              uploads=False, registry=True)
+            await self._gate(env="1", drained=True, pool_closed=True,
+                             uploads=False, use_registry=True)
         )
+        self.assertFalse(shutdown_gate.critical_work_active())
 
     async def test_never_fires_with_incomplete_finalizers_or_open_pool(self):
         self.assertFalse(
-            await self._fires(env="1", drained=False, pool_closed=True,
-                              uploads=False, registry=False)
+            await self._gate(env="1", drained=False, pool_closed=True,
+                             uploads=False, use_registry=False)
         )
         self.assertFalse(
-            await self._fires(env="1", drained=True, pool_closed=False,
-                              uploads=False, registry=False)
+            await self._gate(env="1", drained=True, pool_closed=False,
+                             uploads=False, use_registry=False)
         )
-
-    async def test_user_delete_recovery_blocks_the_gate(self):
-        # Active user-delete recovery (registry entry) overlapping satisfied
-        # turn/upload/pool conditions must keep the gate closed.
-        async with shutdown_gate.critical_shutdown_work("user-delete-durability"):
-            self.assertTrue(
-                await self._fires(env="1", drained=True, pool_closed=True,
-                                  uploads=False, registry=True)
-                is False
-            )
-            self.assertFalse(shutdown_gate.critical_work_active() is False)
 
     async def test_conftest_pops_the_env(self):
         # The pin for the conftest pop: with conftest applied, a shell-
@@ -141,6 +131,60 @@ class TestTailGatePredicate(unittest.IsolatedAsyncioTestCase):
         with mock.patch.dict(os.environ, {"RAGAPP_BOUNDED_EXIT": "1"}):
             os.environ.pop("RAGAPP_BOUNDED_EXIT", None)
             self.assertNotIn("RAGAPP_BOUNDED_EXIT", os.environ)
+
+
+class TestRegistrationMapPin(unittest.TestCase):
+    """CI pin for the durability-registration census (#799/#854).
+
+    The plan-critic Round 9/10 registration map is the audit surface of the
+    deny-by-default gate: if a registration is silently deleted, the gate
+    can cut that workflow's recovery. This test fails when the set of
+    registered critical-work names changes.
+    """
+
+    # Per-(file, name) OCCURRENCE counts (a Counter, not a set): deleting
+    # one arm of a multi-arm registration (e.g. one of the three
+    # vaults.py recovery arms) must fail this pin, not silently pass on the
+    # surviving arms.
+    EXPECTED = {
+        ("backend/app/api/routes/users.py", "user-delete-durability"): 1,
+        ("backend/app/api/routes/documents.py", "document-upload-artifact-cleanup"): 2,
+        ("backend/app/api/routes/documents.py", "document-upload-compensation"): 2,
+        ("backend/app/api/routes/vaults.py", "vault-rollback-restore"): 3,
+        ("backend/app/services/draft_promotion.py", "draft-promotion-compensation"): 1,
+        ("backend/app/api/routes/memories.py", "memory-transaction"): 1,
+        ("backend/app/api/routes/chat.py", "turn-finalizer-drain"): 1,
+        ("backend/app/api/routes/draft_room.py", "upload-commit"): 1,
+    }
+
+    def test_registration_sites_are_complete(self):
+        import collections
+        import re
+
+        repo_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..")
+        )
+        found = collections.Counter()
+        for dirpath, _dirnames, filenames in os.walk(
+            os.path.join(repo_root, "backend", "app")
+        ):
+            for fname in filenames:
+                if not fname.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, fname)
+                rel = os.path.relpath(path, repo_root).replace(os.sep, "/")
+                src = open(path, encoding="utf-8", errors="replace").read()
+                for m in re.finditer(
+                    r'critical_shutdown_work\("([\w-]+)"\)', src
+                ):
+                    found[(rel, m.group(1))] += 1
+        self.assertEqual(
+            dict(found),
+            self.EXPECTED,
+            "durability registration map changed — every added/removed "
+            "registration ARM is a shutdown-gate coverage decision (update "
+            "the map AND the 4.2 census together)",
+        )
 
 
 class TestExecutorRecreateOnDemand(unittest.IsolatedAsyncioTestCase):

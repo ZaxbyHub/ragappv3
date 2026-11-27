@@ -1317,9 +1317,12 @@ async def delete_vault(
         if commit_error is not None:
             raise commit_error
     except HTTPException:
-        await _drained_vault_recovery(
-            conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
-        )
+        from app.services.shutdown_gate import critical_shutdown_work
+
+        async with critical_shutdown_work("vault-rollback-restore"):
+            await _drained_vault_recovery(
+                conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
+            )
         if commit_cancelled:
             # Review PRR-004: an absorbed cancellation wins even when the
             # arm was entered by a failure — the mandatory recovery above
@@ -1327,9 +1330,12 @@ async def delete_vault(
             raise asyncio.CancelledError
         raise
     except (sqlite3.Error, OSError, RuntimeError):
-        await _drained_vault_recovery(
-            conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
-        )
+        from app.services.shutdown_gate import critical_shutdown_work
+
+        async with critical_shutdown_work("vault-rollback-restore"):
+            await _drained_vault_recovery(
+                conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
+            )
         if commit_cancelled:
             raise asyncio.CancelledError
         logger.exception("Error deleting vault %d", vault_id)

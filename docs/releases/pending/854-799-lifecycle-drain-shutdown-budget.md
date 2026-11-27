@@ -108,4 +108,8 @@ restarts working.
 - backend/tests/test_lifecycle_drain_budget.py (C12 composed/drains/optimize/maintenance/fast)
 - backend/tests/test_p03_lifecycle_behavioral.py (C13/C14/C15/C16 behavioral)
 - backend/tests/test_p03_shutdown_ownership.py (registry, tail-gate matrices, executor recreation, env pop pin)
-- scripts/check_p03_graceful_shutdown.py (C5 structural; wired into the quality-contracts family via this PR's CI list only if maintainers adopt it — runnable standalone)
+- scripts/check_p03_graceful_shutdown.py (C5 structural; wired into the CI Quality contracts job by this PR)
+
+UX note: stop-services.ps1 now waits up to 15 s for non-backend ports
+(frontend/Ollama) before force-stopping, instead of force-killing
+immediately — a deliberate trade for the graceful-backend default.

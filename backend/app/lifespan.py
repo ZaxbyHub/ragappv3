@@ -1292,20 +1292,34 @@ async def lifespan(app: FastAPI):
     # Stop email ingestion service
     if app.state.email_service:
         await _stop_stage("email stop_polling", app.state.email_service.stop_polling)
-    for rt in residency_tasks:
-        rt.cancel()
+    async def _settle_residency_tasks() -> None:
+        # One aggregate-bounded settle (#799 AC2 + #854): the whole loop runs
+        # under asyncio.timeout with the remaining process budget, and each
+        # task's await keeps its absorbing handlers — a task that DIED with
+        # a natural exception is contained (the processor stops, admission
+        # release, store/pool closes below stay reachable) instead of
+        # skipping the whole shutdown chain.
         try:
-            await rt
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:  # noqa: BLE001 — #799 AC2: a task that DIED with
-            # a natural exception re-raises here; absorbing it keeps the
-            # processor stops, admission release, store/pool closes below
-            # reachable instead of skipping the whole shutdown chain.
+            async with asyncio.timeout(_remaining() + 5.0):
+                for rt in residency_tasks:
+                    rt.cancel()
+                    try:
+                        await rt
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:  # noqa: BLE001 — AC2 absorb
+                        logger.warning(
+                            "Residency task ended with exception at shutdown "
+                            "(continuing): %s",
+                            e,
+                        )
+        except TimeoutError:
             logger.warning(
-                "Residency task ended with exception at shutdown (continuing): %s",
-                e,
+                "Residency tasks did not settle within the aggregate "
+                "shutdown budget; continuing shutdown"
             )
+
+    await _settle_residency_tasks()
     # Cancel the periodic memory eviction background task.
     if memory_eviction_task:
         memory_eviction_task.cancel()
@@ -1448,51 +1462,63 @@ async def lifespan(app: FastAPI):
     # production launch surface opted in, every recovery-critical workflow
     # has completed (deny-by-default registry empty, turn finalizers
     # drained, pool closed, upload registry empty), and logging is flushed,
-    # exit NOW instead of joining whatever non-critical worker threads
-    # (abandoned parses, curator tail, file-watcher scans) happen to be
-    # alive — the interpreter-exit join is the only unbounded natural-exit
-    # contributor and nothing administrates it otherwise. os._exit skips
-    # executor joins and interpreter teardown; there are no app-level
-    # atexit registrations. Tests/embedded lifespans never set the env
-    # (conftest pops it) and take the normal path.
-    if os.environ.get("RAGAPP_BOUNDED_EXIT") == "1":
-        try:
-            from app.api.routes.draft_room import _INFLIGHT_UPLOAD_COMMITS
-            from app.services.shutdown_gate import critical_work_active
+    # exit NOW instead of joining whatever non-critical worker threads are
+    # alive. The decision lives in _bounded_tail_exit so tests drive the
+    # REAL gate (os._exit patched) instead of a re-implementation.
+    _bounded_tail_exit(turn_finalizers_drained, pool_closed)
 
-            uploads_pending = bool(_INFLIGHT_UPLOAD_COMMITS)
-        except Exception:  # noqa: BLE001 — unreadable state = do not exit
-            uploads_pending = True
-        critical_complete = (
-            turn_finalizers_drained
-            and pool_closed
-            and not uploads_pending
-            and not critical_work_active()
+
+def _bounded_tail_exit(turn_finalizers_drained: bool, pool_closed: bool) -> bool:
+    """Run the bounded tail-exit gate; returns True iff os._exit fired.
+
+    Fires only when RAGAPP_BOUNDED_EXIT=1 AND the deny-by-default critical
+    registry is empty AND turn finalizers drained AND the pool closed AND
+    the upload-commit registry is empty (read at gate time). Unreadable
+    state counts as pending (never exit on unknown). os._exit skips
+    executor joins and interpreter teardown; there are no app-level atexit
+    registrations. Tests/embedded lifespans never set the env (conftest
+    pops it) and take the normal path.
+    """
+    if os.environ.get("RAGAPP_BOUNDED_EXIT") != "1":
+        return False
+    try:
+        from app.api.routes.draft_room import _INFLIGHT_UPLOAD_COMMITS
+        from app.services.shutdown_gate import critical_work_active
+
+        uploads_pending = bool(_INFLIGHT_UPLOAD_COMMITS)
+    except Exception:  # noqa: BLE001 — unreadable state = do not exit
+        uploads_pending = True
+    critical_complete = (
+        turn_finalizers_drained
+        and pool_closed
+        and not uploads_pending
+        and not critical_work_active()
+    )
+    for handler in logging.getLogger().handlers:
+        with contextlib_suppress(Exception):
+            handler.flush()
+    if critical_complete:
+        logging.getLogger().info(
+            "ragapp: bounded tail exit — critical shutdown complete; "
+            "skipping non-critical executor joins"
         )
         for handler in logging.getLogger().handlers:
             with contextlib_suppress(Exception):
                 handler.flush()
-        if critical_complete:
-            logging.getLogger().info(
-                "ragapp: bounded tail exit — critical shutdown complete; "
-                "skipping non-critical executor joins"
-            )
-            for handler in logging.getLogger().handlers:
-                with contextlib_suppress(Exception):
-                    handler.flush()
-            os._exit(0)
-        else:
-            logging.getLogger().info(
-                "ragapp: critical work incomplete at the tail (finalizers=%s "
-                "pool_closed=%s uploads_pending=%s) — normal exit; recovery "
-                "contracts govern",
-                turn_finalizers_drained,
-                pool_closed,
-                uploads_pending,
-            )
-            for handler in logging.getLogger().handlers:
-                with contextlib_suppress(Exception):
-                    handler.flush()
+        os._exit(0)
+        return True  # pragma: no cover — os._exit does not return
+    logging.getLogger().info(
+        "ragapp: critical work incomplete at the tail (finalizers=%s "
+        "pool_closed=%s uploads_pending=%s) — normal exit; recovery "
+        "contracts govern",
+        turn_finalizers_drained,
+        pool_closed,
+        uploads_pending,
+    )
+    for handler in logging.getLogger().handlers:
+        with contextlib_suppress(Exception):
+            handler.flush()
+    return False
 
 
 async def _finalize_turns_and_close_pool(app) -> tuple[bool, bool]:

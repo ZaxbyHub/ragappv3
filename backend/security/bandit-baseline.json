@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 53,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 105205,
+      "loc": 105234,
       "nosec": 0,
       "skipped_tests": 73
     },
@@ -140,7 +140,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 14,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3081,
+      "loc": 3083,
       "nosec": 0,
       "skipped_tests": 4
     },
@@ -413,7 +413,7 @@
       "SEVERITY.LOW": 4,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1334,
+      "loc": 1338,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -452,7 +452,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1108,
+      "loc": 1131,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3318,7 +3318,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1771                 group_rows = conn.execute(\n1772                     f\"\"\"\n1773                     SELECT id, org_id FROM groups\n1774                     WHERE id IN ({placeholders})\n1775                     \"\"\",\n1776                     tuple(group_ids),\n",
+      "code": "1777                 group_rows = conn.execute(\n1778                     f\"\"\"\n1779                     SELECT id, org_id FROM groups\n1780                     WHERE id IN ({placeholders})\n1781                     \"\"\",\n1782                     tuple(group_ids),\n",
       "col_offset": 20,
       "end_col_offset": 23,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3329,19 +3329,19 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1772,
+      "line_number": 1778,
       "line_range": [
-        1772,
-        1773,
-        1774,
-        1775
+        1778,
+        1779,
+        1780,
+        1781
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1433         _auth_executor.shutdown(wait=False)\n1434     except Exception:\n1435         pass\n1436     with contextlib_suppress(Exception):\n",
+      "code": "1447         _auth_executor.shutdown(wait=False)\n1448     except Exception:\n1449         pass\n1450     with contextlib_suppress(Exception):\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3352,10 +3352,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1434,
+      "line_number": 1448,
       "line_range": [
-        1434,
-        1435
+        1448,
+        1449
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
