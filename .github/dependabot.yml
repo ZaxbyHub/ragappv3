@@ -17,12 +17,26 @@ updates:
       - dependency-name: "numpy"
         update-types:
           - "version-update:semver-minor"
-      # torch pins its Linux CUDA wheels exactly (torch 2.15.0:
-      # cuda-toolkit==13.2.2, nvidia-cudnn-cu13==9.26.0.51, ...), so a
-      # standalone bump of any of these transitive pins is unsatisfiable
-      # (PR #1195). They move only when torch moves; lift with torch.
+      # torch pins these Linux CUDA wheels exactly, directly or through
+      # cuda-toolkit's extras (torch 2.15.0: cuda-toolkit==13.2.2,
+      # nvidia-cudnn-cu13==9.26.0.51, ...), so a standalone bump of any of
+      # them is unsatisfiable (PR #1195). They move only when torch moves;
+      # revisit on each torch bump. nvidia-nvjitlink / nvidia-cuda-cccl are
+      # range-constrained, so they are deliberately NOT listed.
       - dependency-name: "cuda-toolkit"
-      - dependency-name: "nvidia-*"
+      - dependency-name: "nvidia-cublas"
+      - dependency-name: "nvidia-cuda-cupti"
+      - dependency-name: "nvidia-cuda-nvrtc"
+      - dependency-name: "nvidia-cuda-runtime"
+      - dependency-name: "nvidia-cudnn-cu13"
+      - dependency-name: "nvidia-cufft"
+      - dependency-name: "nvidia-cufile"
+      - dependency-name: "nvidia-cusolver"
+      - dependency-name: "nvidia-cusparse"
+      - dependency-name: "nvidia-cusparselt-cu13"
+      - dependency-name: "nvidia-nccl-cu13"
+      - dependency-name: "nvidia-nvshmem-cu13"
+      - dependency-name: "nvidia-nvtx"
       # sympy 1.14.0 (via torch) requires mpmath<1.4 (PR #1195). Lift this
       # when a sympy release allows mpmath 1.4.
       - dependency-name: "mpmath"
