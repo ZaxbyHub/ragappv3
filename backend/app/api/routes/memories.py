@@ -304,16 +304,22 @@ async def _atomic_memory_write(conn: sqlite3.Connection):
     if conn.in_transaction:
         await asyncio.to_thread(conn.rollback)
     await asyncio.to_thread(conn.execute, "BEGIN IMMEDIATE")
-    try:
-        yield
-    except BaseException:
+    # Recovery-critical (#799/#854 shutdown gate): the commit/rollback arms
+    # are a durability decision that absorbs cancellation — while this
+    # transaction is open, the bounded tail exit must not fire.
+    from app.services.shutdown_gate import critical_shutdown_work
+
+    async with critical_shutdown_work("memory-transaction"):
         try:
-            await asyncio.to_thread(conn.rollback)
-        except sqlite3.Error:
-            logger.exception("Rollback failed after memory write error")
-        raise
-    else:
-        await asyncio.to_thread(conn.commit)
+            yield
+        except BaseException:
+            try:
+                await asyncio.to_thread(conn.rollback)
+            except sqlite3.Error:
+                logger.exception("Rollback failed after memory write error")
+            raise
+        else:
+            await asyncio.to_thread(conn.commit)
 
 
 def _get_backfill_lock(memory_store: MemoryStore) -> asyncio.Lock:

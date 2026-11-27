@@ -461,6 +461,13 @@ async def healthz(request: Request):
         issues.append("db_pool not initialized")
     if getattr(state, "migrations_ok", None) is False:
         issues.append("database migration failed at startup")
+    # Upload-migration outcome (#799 AC7): the lifespan records the outcome of
+    # the "continuing anyway" upload migration; a FAILED migration must
+    # surface as degraded readiness instead of staying invisible. Absent
+    # attribute (older state / un-run migration path) stays inert, mirroring
+    # migrations_ok's getattr-None contract.
+    if getattr(state, "upload_migration_ok", None) is False:
+        issues.append("upload migration failed at startup")
     vector_store = getattr(state, "vector_store", None)
     if not vector_store:
         issues.append("vector_store not initialized")

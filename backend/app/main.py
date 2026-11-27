@@ -79,21 +79,19 @@ logger.info(
     app.root_path,
 )
 
-# Security check: warn if admin_secret_token is not set or using default value
-if settings.admin_secret_token in ("", "admin-secret-token"):
-    logger.critical(
-        "SECURITY WARNING: admin_secret_token is not set or is using the default value. "
-        "All API routes are effectively unauthenticated."
-    )
-
-# Security check: warn if JWT secret key is using the default value
-if (
-    settings.users_enabled
-    and settings.jwt_secret_key == "change-me-to-a-random-64-char-string"
-):
+# Security check: the well-known bootstrap admin token (#799 AC9, matrix-
+# aware). Reachability matrix per Settings.reject_insecure_defaults: in
+# single-admin mode (USERS_ENABLED=False) an empty token and the published
+# literal both REFUSE TO START, so nothing can be warned about at runtime
+# there. Under USERS_ENABLED=True the published literal is deliberately
+# permitted as the required bootstrap/first-admin credential (config.py
+# decision record, issue #1001 Item A) — that is the one reachable corner,
+# and the warning below targets exactly it.
+if settings.users_enabled and settings.admin_secret_token == "admin-secret-token":
     logger.warning(
-        "SECURITY WARNING: jwt_secret_key is using the default value. "
-        'Generate a secure key with: python -c "import secrets; print(secrets.token_urlsafe(48))"'
+        "SECURITY WARNING: admin_secret_token is still the published "
+        "bootstrap credential. It is a public value; rotate it after "
+        'first-admin setup with: python -c "import secrets; print(secrets.token_urlsafe(48))"'
     )
 
 # Middleware is applied in reverse order of add_middleware calls:
@@ -148,10 +146,16 @@ app.add_middleware(
 
 # Security: warn if CORS origins contain wildcard when credentials are enabled
 if "*" in settings.backend_cors_origins:
+    # (#799 AC9, truthful wording): with allow_credentials=True Starlette
+    # REFLECTS the request Origin on wildcard configurations, so any origin
+    # can read credential-bearing responses — the exposure is real, but it
+    # is reflection, not browser-side rejection (the old claim was false).
     logger.warning(
-        "SECURITY WARNING: CORS origins contain wildcard ('*') with allow_credentials=True. "
-        "This configuration is insecure and will be rejected by browsers. "
-        "Set BACKEND_CORS_ORIGINS to specific origins (e.g., http://localhost:5173)."
+        "SECURITY WARNING: CORS origins contain wildcard ('*') with "
+        "allow_credentials=True. Starlette reflects the request Origin on "
+        "this configuration, so any origin can read credential-bearing "
+        "responses. Set BACKEND_CORS_ORIGINS to specific origins "
+        "(e.g., http://localhost:5173)."
     )
 
 # Host-header validation (defense-in-depth for reverse-proxy deployments).

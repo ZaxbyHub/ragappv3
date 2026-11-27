@@ -1345,9 +1345,12 @@ async def delete_vault(
         # by the startup reconcile. The gate is evaluated BEFORE the drained
         # unit starts, so the unit itself never runs post-commit.
         if conn.in_transaction:
-            await _drained_vault_recovery(
-                conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
-            )
+            from app.services.shutdown_gate import critical_shutdown_work
+
+            async with critical_shutdown_work("vault-rollback-restore"):
+                await _drained_vault_recovery(
+                    conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
+                )
         if commit_cancelled:
             raise asyncio.CancelledError
         raise

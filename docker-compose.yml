@@ -113,14 +113,23 @@ services:
         VITE_API_URL: ${VITE_API_URL:-}
     container_name: knowledgevault
     restart: unless-stopped
-    # Shutdown budget (issue #700, T1-04-S2-02): BackgroundProcessor.stop()
-    # applies its 60 s timeout PER DRAIN PHASE (queues, enrichment, atoms,
-    # lease settle) and the final optimize is unbounded, so the composed
-    # worst case exceeds 4x60 s. 90 s covers the common single-phase drain;
-    # a busy multi-phase shutdown can still be SIGKILLed (tracked follow-up
-    # for a composed stop() budget). Keep this >= stop()'s per-phase timeout
-    # when changing either.
-    stop_grace_period: 90s
+    # Shutdown budget (issues #700/#854/#799 — derivation, keep in sync with
+    # Dockerfile CMD and lifespan._SHUTDOWN_BUDGET_SECONDS): uvicorn drains
+    # in-flight requests for 20 s (--timeout-graceful-shutdown), the lifespan
+    # then runs its whole shutdown sequence under ONE 60 s aggregate budget
+    # (_SHUTDOWN_BUDGET_SECONDS: email, residency, watcher, four processor
+    # stops — stop() itself aggregates its drain phases inside its slice —
+    # admission, store/pool closes, upload-commit and turn-finalizer gates),
+    # and the bounded tail exit ends the process at completion, skipping the
+    # non-critical executor joins. Natural worst case 20 + 60 + 30 (SQLite-
+    # family join tail, State-B paths aside) + 5 (teardown) = 115 s; 130 s
+    # keeps the force boundary strictly beyond it (125 s native wait sits
+    # between). State B — a critical-incomplete shutdown (live-turn
+    # finalizer timeout with the pool deliberately open per #1202, or upload
+    # compensation still in flight per PRR-020) — intentionally continues
+    # past this envelope until the critical work finishes or this grace
+    # force-cuts it: the deliberate data-safety preference over a hard exit.
+    stop_grace_period: 130s
     ports:
       - "${PORT:-9090}:9090"
     volumes:

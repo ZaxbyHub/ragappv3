@@ -125,30 +125,41 @@ async def shutdown_turn_finalizers(producers, producer_timeout, drain_timeout) -
     The outer timeout covers executor queue time as well as the drain's own
     wait. A timeout is never reported as a successful drain.
     """
-    try:
-        async with asyncio.timeout(producer_timeout + drain_timeout):
-            pending = await _retire_turn_producers(producers, producer_timeout)
-            if pending:
-                logger.warning(
-                    "Durable turn producers still active at shutdown; leaving "
-                    "executor and DB pool open for their finalizers"
+    # Recovery-critical registration (#799/#854 shutdown gate): the drain
+    # result stays the authoritative completion signal; this registration is
+    # belt-and-suspenders so the registry is also non-empty while the
+    # retirement/drain is in flight.
+    from app.services.shutdown_gate import critical_shutdown_work
+
+    async with critical_shutdown_work("turn-finalizer-drain"):
+        try:
+            async with asyncio.timeout(producer_timeout + drain_timeout):
+                pending = await _retire_turn_producers(
+                    producers, producer_timeout
                 )
-                return False
-            drained = await asyncio.to_thread(
-                _drain_turn_finalize_executor, drain_timeout
+                if pending:
+                    logger.warning(
+                        "Durable turn producers still active at shutdown; "
+                        "leaving executor and DB pool open for their "
+                        "finalizers"
+                    )
+                    return False
+                drained = await asyncio.to_thread(
+                    _drain_turn_finalize_executor, drain_timeout
+                )
+                if not drained:
+                    logger.warning(
+                        "Durable finalize drain timed out; leaving DB pool "
+                        "open so queued finalizers can finish before "
+                        "interpreter exit"
+                    )
+                return drained
+        except TimeoutError:
+            logger.warning(
+                "Durable finalize shutdown exceeded its total budget; leaving "
+                "executor and DB pool open"
             )
-            if not drained:
-                logger.warning(
-                    "Durable finalize drain timed out; leaving DB pool open so "
-                    "queued finalizers can finish before interpreter exit"
-                )
-            return drained
-    except TimeoutError:
-        logger.warning(
-            "Durable finalize shutdown exceeded its total budget; leaving "
-            "executor and DB pool open"
-        )
-        return False
+            return False
 
 
 def _drain_turn_finalize_executor(timeout=None) -> bool:

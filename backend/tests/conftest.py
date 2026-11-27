@@ -482,6 +482,12 @@ def pytest_configure(config):
     # timeout. This matches CI, which sets REDIS_URL="" with no Redis service.
     os.environ["REDIS_URL"] = ""
 
+    # The lifespan's bounded tail exit (#799/#854) must NEVER fire inside a
+    # test process even if a developer shell exports the flag: pop it so
+    # embedded/TestClient lifespans take the normal exit path. A companion
+    # test (test_p03_shutdown_ownership) pins this pop.
+    os.environ.pop("RAGAPP_BOUNDED_EXIT", None)
+
     # A test must never connect to a Redis instance it did not start.
     # Guard redis.from_url for the whole session; opt out explicitly
     # with TEST_ALLOW_REAL_REDIS=1 only when a fixture has started a

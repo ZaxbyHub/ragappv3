@@ -2843,7 +2843,10 @@ async def _do_upload(
             # bypasses `except Exception` below — removes both the reserved
             # placeholder and the temp sibling (best-effort; a leftover
             # canonical .part is watcher-skipped).
-            await _discard_upload_artifacts(file_path, temp_file_path)
+            from app.services.shutdown_gate import critical_shutdown_work
+
+            async with critical_shutdown_work("document-upload-artifact-cleanup"):
+                await _discard_upload_artifacts(file_path, temp_file_path)
             raise
 
         # Async ingestion: register the file row synchronously (so duplicate
@@ -2987,9 +2990,12 @@ async def _do_upload(
             # 'pending' row pointing at a missing file — compensate the
             # row/file pair, then answer with an operational status the
             # client can retry against.
-            await _compensate_failed_registration(
-                db_pool, file_path, file_id, row_created_by_request
-            )
+            from app.services.shutdown_gate import critical_shutdown_work
+
+            async with critical_shutdown_work("document-upload-compensation"):
+                await _compensate_failed_registration(
+                    db_pool, file_path, file_id, row_created_by_request
+                )
             logger.exception(
                 "Document processing error for file (name_len=%d)", len(file_name)
             )
@@ -3000,9 +3006,12 @@ async def _do_upload(
         except Exception:
             # W19 (C14): same compensation for any other post-registration
             # failure (enqueue failure, queueing error, ...).
-            await _compensate_failed_registration(
-                db_pool, file_path, file_id, row_created_by_request
-            )
+            from app.services.shutdown_gate import critical_shutdown_work
+
+            async with critical_shutdown_work("document-upload-compensation"):
+                await _compensate_failed_registration(
+                    db_pool, file_path, file_id, row_created_by_request
+                )
             logger.exception(
                 "Unexpected error registering file (name_len=%d)", len(file_name)
             )

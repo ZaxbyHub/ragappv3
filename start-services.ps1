@@ -44,13 +44,68 @@ function Test-LocalPort {
     return [bool](Get-NetTCPConnection -LocalPort ([int]$Port) -ErrorAction SilentlyContinue)
 }
 
+# Graceful stop (#799 AC4/#854): taskkill-without-/F and Stop-Process-without-
+# -Force do NOT deliver a Python signal for console apps (CTRL_CLOSE_EVENT is
+# unmapped by CPython), so the only sound native mechanism is a targeted
+# CTRL_BREAK to the backend's process GROUP (created at launch with
+# CREATE_NEW_PROCESS_GROUP): CPython maps it to SIGBREAK, uvicorn handles
+# SIGBREAK, and the lifespan shutdown sequence runs. The signal dance runs in
+# a SACRIFICIAL CHILD powershell (FreeConsole before AttachConsole, so the
+# parent's console is never touched and there is nothing to restore) and only
+# when the pid marker proves the owner is our grouped backend (pid + start
+# time); anything else takes the bounded wait + force fallback.
+function Stop-BackendProcessGracefully {
+    param($Proc, [string]$Label)
+    $markerPath = Join-Path $RepoRoot ".cache\backend.pid"
+    $grouped = $false
+    if (Test-Path -LiteralPath $markerPath) {
+        try {
+            $parts = (Get-Content -LiteralPath $markerPath -ErrorAction Stop) -split '\s+'
+            $markedPid = [int]$parts[0]
+            $markedTicks = [math]::Floor([double]$parts[1])
+            if ($markedPid -eq $Proc.Id -and $null -ne $Proc.StartTime) {
+                # .NET FILETIME tolerance: the wrapper stamps wall-clock at
+                # spawn; allow 60 s of skew. A reused PID is minutes apart.
+                $liveTicks = [math]::Floor($Proc.StartTime.ToFileTime())
+                if ([math]::Abs($liveTicks - $markedTicks) -lt 600000000) {
+                    $grouped = $true
+                }
+            }
+        } catch { $grouped = $false }
+    }
+    if ($grouped) {
+        # Sacrificial sender: scripts/win_send_ctrl_break.py detaches ITS OWN
+        # console, attaches to the backend's, sends the targeted CTRL_BREAK,
+        # and exits — the parent script's console is never touched.
+        $Sender = Join-Path $RepoRoot "scripts\win_send_ctrl_break.py"
+        $SenderPy = if ($env:BACKEND_PYTHON) { $env:BACKEND_PYTHON } elseif (Test-Path (Join-Path $BackendDir "venv\Scripts\python.exe")) { Join-Path $BackendDir "venv\Scripts\python.exe" } else { "python" }
+        Start-Process $SenderPy -ArgumentList ($Sender, "$($Proc.Id)") -WindowStyle Hidden | Out-Null
+        Write-Output "  ${Label}: sent graceful CTRL_BREAK to grouped backend (PID $($Proc.Id)); waiting..."
+        if (-not $Proc.WaitForExit(125000)) {
+            Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
+            Write-Output "  ${Label}: graceful window expired; force-stopped (PID $($Proc.Id))"
+        } else {
+            Write-Output "  ${Label}: stopped gracefully (PID $($Proc.Id))"
+        }
+    } else {
+        Write-Output "  ${Label}: no grouped-backend marker match (PID $($Proc.Id)); bounded wait + force"
+        if (-not $Proc.WaitForExit(15000)) {
+            Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
+            Write-Output "  ${Label}: force-stopped (PID $($Proc.Id))"
+        }
+    }
+}
+
 function Stop-ProcessOnPort {
     param([string]$Port)
     $connections = Get-NetTCPConnection -LocalPort ([int]$Port) -ErrorAction SilentlyContinue
+    $seen = @{}
     foreach ($connection in $connections) {
         $proc = Get-Process -Id $connection.OwningProcess -ErrorAction SilentlyContinue
         if ($proc) {
-            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            if ($seen.ContainsKey($proc.Id)) { continue }
+            $seen[$proc.Id] = $true
+            Stop-BackendProcessGracefully $proc "port $Port"
         }
     }
 }
@@ -138,10 +193,27 @@ if (-not $SkipEmbedding) {
     }
 }
 
+# Backend launch (#799 AC4/AC5, #854 envelope): the uvicorn args carry the
+# integer request-drain bound (keep in sync with Dockerfile CMD and
+# docker-compose.yml's derivation), and the process is started through the
+# scripts/win_grouped_backend.py wrapper that spawns the backend with CREATE_NEW_PROCESS_GROUP so
+# the uvicorn python becomes a process-GROUP leader (pgid == pid) sharing the
+# wrapper's console — stop-services.ps1 then delivers a TARGETED
+# CTRL_BREAK to that nonzero group id for a graceful native stop. The
+# wrapper records the child pid + an approximate .NET FILETIME start stamp
+# so the stop script can verify ownership (a reused PID mismatches the
+# live process start time and takes the ungrouped fallback).
+# RAGAPP_BOUNDED_EXIT=1 (inherited by the child only for this launch)
+# enables the lifespan's bounded tail exit — same contract as the Dockerfile.
+$BackendArgs = @("-m","uvicorn","app.main:app","--host","0.0.0.0","--port",$BackendPort,"--no-access-log","--timeout-graceful-shutdown","20")
+$env:RAGAPP_BOUNDED_EXIT = "1"
+$env:RAGAPP_MARKER_DIR = $RepoRoot
 Start-Process $BackendPython `
-    -ArgumentList "-m","uvicorn","app.main:app","--host","0.0.0.0","--port",$BackendPort,"--no-access-log" `
+    -ArgumentList (@((Join-Path $RepoRoot "scripts\win_grouped_backend.py"), $BackendPython) + $BackendArgs) `
     -WorkingDirectory $BackendDir `
     -WindowStyle Hidden
+$env:RAGAPP_BOUNDED_EXIT = $null
+$env:RAGAPP_MARKER_DIR = $null
 
 # Use cmd /c to avoid npm .cmd being opened in Notepad by Start-Process.
 Start-Process cmd `

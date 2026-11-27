@@ -1564,6 +1564,12 @@ def _hot_rebind_llm_clients_locked(app, update: SettingsUpdate) -> None:
             thinking_client = create_thinking_client()
         except ModelNotConfiguredError as exc:
             logger.debug("Thinking activation skipped: %s", exc)
+        except URLBlocked as exc:
+            # #799 AC3 class sibling: the constructor runs the live-DNS
+            # assert_url_safe; an SSRF-rejected endpoint must skip the
+            # activation (the app keeps its degraded client) instead of
+            # 500-ing the settings save.
+            logger.warning("Thinking activation blocked by SSRF guard: %s", exc)
         else:
             app.state.thinking_llm_client = thinking_client
             if getattr(app.state, "llm_client", None) is None:
@@ -1638,6 +1644,10 @@ def _hot_rebind_llm_clients_locked(app, update: SettingsUpdate) -> None:
             instant_client = create_instant_client()
         except ModelNotConfiguredError as exc:
             logger.debug("Instant activation skipped: %s", exc)
+        except URLBlocked as exc:
+            # #799 AC3 class sibling (instant leg): SSRF-rejected endpoint
+            # skips the activation instead of 500-ing the settings save.
+            logger.warning("Instant activation blocked by SSRF guard: %s", exc)
         else:
             app.state.instant_llm_client = instant_client
             rag_engine = getattr(app.state, "rag_engine", None)

@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional
@@ -125,6 +126,32 @@ def _numeric_multiset(text: str) -> tuple:
 _CURATOR_OFFLOAD_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="wiki-curator"
 )
+
+# Cooperative shutdown flag (#799/#854 lifecycle drain): set by the lifespan
+# wiki stage at shutdown; checked BETWEEN curator propose calls so an
+# in-flight curate() orchestration aborts at the next call boundary instead
+# of holding its worker for the full configured request sequence. Reset at
+# lifespan startup for same-process restarts (embedded/TestClient lifespans).
+CURATOR_SHUTDOWN = threading.Event()
+
+
+def _get_curator_offload_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Recreate-on-demand accessor for the curator offload executor.
+
+    The lifespan wiki stage shuts the executor down (``wait=False,
+    cancel_futures=True``) so queued orchestration never extends interpreter
+    exit; mirroring the wiki-lint accessor convention
+    (``app.api.routes.wiki._get_wiki_lint_executor``, PR #1113 N-05a), this
+    accessor detects the shutdown and hands out a FRESH executor so the next
+    lifespan entry in the same interpreter (tests, embedded runs) can still
+    schedule work.
+    """
+    global _CURATOR_OFFLOAD_EXECUTOR
+    if getattr(_CURATOR_OFFLOAD_EXECUTOR, "_shutdown", False):
+        _CURATOR_OFFLOAD_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="wiki-curator"
+        )
+    return _CURATOR_OFFLOAD_EXECUTOR
 
 # ---------------------------------------------------------------------------
 # Regex patterns
@@ -1467,7 +1494,7 @@ class WikiCompiler:
             # and log line. Copy the context here and run the coroutine
             # inside it on the worker thread.
             submit_ctx = contextvars.copy_context()
-            cur_result = _CURATOR_OFFLOAD_EXECUTOR.submit(
+            cur_result = _get_curator_offload_executor().submit(
                 submit_ctx.run, asyncio.run, coro
             ).result()
         except Exception as e:  # broad — curator must never fail the job

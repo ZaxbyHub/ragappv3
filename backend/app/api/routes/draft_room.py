@@ -3388,6 +3388,11 @@ async def upload_draft_input(
     async def _commit_upload() -> Any:
         """Finalize + enqueue as ONE cancellation-atomic unit (#913, R2).
 
+        Recovery-critical registration (#799/#854 shutdown gate): the commit
+        task is already tracked in _INFLIGHT_UPLOAD_COMMITS (the drain's
+        authoritative registry); this registration is belt-and-suspenders so
+        the critical-work registry is also non-empty while the unit runs.
+
         Runs as its own task owning a POOL connection for every DB step: the
         request dependency releases its connection at teardown, and this
         continuation may legitimately outlive the request (a cancelled upload
@@ -3504,7 +3509,13 @@ async def upload_draft_input(
                 )
             raise
 
-    commit_task = asyncio.create_task(_commit_upload())
+    async def _commit_upload_registered() -> Any:
+        from app.services.shutdown_gate import critical_shutdown_work
+
+        async with critical_shutdown_work("upload-commit"):
+            return await _commit_upload()
+
+    commit_task = asyncio.create_task(_commit_upload_registered())
     _INFLIGHT_UPLOAD_COMMITS.add(commit_task)
     commit_task.add_done_callback(
         lambda task, _d=draft_id, _i=input_record.id: _consume_upload_commit(

@@ -54,6 +54,15 @@ from app.utils.request_context import JsonFormatter, RequestIdFilter
 
 logger = logging.getLogger(__name__)  # noqa: E402
 
+# Aggregate process-shutdown budget (#799/#854, plan rev 7-10): one deadline
+# covering every lifespan shutdown stage (email, residency, watcher, the
+# four processor stops, admission, store/pool closes, the upload-commit and
+# turn-finalizer gates). Sizing lives in docker-compose.yml's derivation
+# comment: 20 s uvicorn request drain + this 60 s aggregate + 30 s
+# SQLite-family join tail + 5 s teardown = 115 s natural worst, inside the
+# 125 s native stop wait and the 130 s compose grace.
+_SHUTDOWN_BUDGET_SECONDS = 60.0
+
 
 # ── Persisted-settings replay decoding (issue #494 CONFIG-003) ──────────────
 # Typed converters for ``settings_kv`` values, derived from the Settings field
@@ -153,6 +162,16 @@ def _create_llm_clients() -> "tuple[LLMClient | None, LLMClient | None]":
             "Thinking chat model not configured; chat is disabled until an "
             "endpoint is set (Settings -> Models or OLLAMA_CHAT_URL/CHAT_MODEL)"
         )
+    except URLBlocked as e:
+        # Environment-shaped failure (#799 AC3): the constructor runs the
+        # live-DNS assert_url_safe, so a blocked/unresolvable endpoint must
+        # degrade the client instead of failing startup — same degraded
+        # state as "not configured" until an operator fixes the endpoint.
+        logger.warning(
+            "Thinking chat endpoint rejected by the SSRF guard; chat is "
+            "disabled until the endpoint is fixed: %s",
+            e,
+        )
     try:
         instant = create_instant_client()
     except ModelNotConfiguredError:
@@ -160,6 +179,12 @@ def _create_llm_clients() -> "tuple[LLMClient | None, LLMClient | None]":
             "Instant chat model not configured; instant mode is disabled "
             "until an endpoint is set (Settings -> Models or "
             "INSTANT_CHAT_URL/INSTANT_CHAT_MODEL)"
+        )
+    except URLBlocked as e:
+        logger.warning(
+            "Instant chat endpoint rejected by the SSRF guard; instant mode "
+            "is disabled until the endpoint is fixed: %s",
+            e,
         )
     return thinking, instant
 def _validate_setting_value(key: str, value) -> bool:
@@ -558,8 +583,9 @@ async def validate_fts_index(table) -> bool:
         if not fts_index_exists:
             logger.error(
                 "Hybrid search is enabled but the FTS index is missing on the 'text' column. "
-                "FTS search will not function. Create the index with "
-                "VectorStore._ensure_fts_index() or rebuild the table."
+                "FTS search will not function. Trigger a full reindex from the "
+                "admin UI (a full reindex recreates the FTS index) or disable "
+                "hybrid search (ENABLE_HYBRID_SEARCH=false)."
             )
         return fts_index_exists
     except Exception as e:
@@ -579,6 +605,15 @@ async def lifespan(app: FastAPI):
     # default WARNING and all app INFO logs were silently dropped. We set the
     # level here and only add a handler if the root has none, so uvicorn's own
     # access/error handlers are left intact.
+    #
+    # Same-process restart hygiene (#799/#854): a previous lifespan entry in
+    # this interpreter may have set the curator shutdown flag / shut its
+    # executor; clear the flag and let the recreate-on-demand accessors
+    # replace any dead executors before startup proceeds.
+    with contextlib_suppress(Exception):
+        from app.services.wiki_compiler import CURATOR_SHUTDOWN
+
+        CURATOR_SHUTDOWN.clear()
     _root_logger = logging.getLogger()
     _root_logger.setLevel(
         getattr(logging, settings.log_level.upper(), logging.INFO)
@@ -772,11 +807,18 @@ async def lifespan(app: FastAPI):
         logger.info("Checking for upload migration...")
         _migration_started = time.monotonic()
         await asyncio.to_thread(migrate_uploads, False)
+        # Record the outcome for readiness (#799 AC7): healthz reads this
+        # attribute and reports degraded (503) when a migration FAILED while
+        # the app deliberately continued ("continuing anyway" must stay
+        # observable to the health probe that exists to surface exactly
+        # this degradation).
+        app.state.upload_migration_ok = True
         logger.info(
             "Upload migration finished in %.1fs",
             time.monotonic() - _migration_started,
         )
     except Exception as e:
+        app.state.upload_migration_ok = False
         logger.warning(f"Upload migration failed (continuing anyway): {e}")
 
     # Dual LLM clients, both operator-configured (no shipped defaults,
@@ -1188,63 +1230,167 @@ async def lifespan(app: FastAPI):
         from app.services.llm_client import create_editorial_client
 
         async def _prime_editorial() -> None:
-            editorial_client = create_editorial_client()
+            # Construction lives INSIDE the try (#799 AC1): a misconfigured
+            # editorial pair must be contained in this task (logged, startup
+            # continues) instead of escaping the task — an escaped exception
+            # is re-raised by the shutdown loop's `await rt` and would skip
+            # every later shutdown stage (the AC2 hazard).
+            editorial_client = None
             try:
+                editorial_client = create_editorial_client()
                 await _prime_residency("Editorial", editorial_client)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — priming must never fail startup
+                logger.warning(
+                    "Editorial residency priming failed (continuing): %s", e
+                )
             finally:
-                await editorial_client.close()
+                if editorial_client is not None:
+                    await editorial_client.close()
 
         residency_tasks.append(asyncio.create_task(_prime_editorial()))
 
     yield
 
-    # Shutdown: stop services, cancel background tasks
+    # Shutdown: stop services, cancel background tasks — under ONE aggregate
+    # process-shutdown budget (#799/#854). Every stage below runs through
+    # _stop_stage with the REMAINING budget; an exhausted budget skips the
+    # stage with a warning instead of an unbounded await. Only
+    # BackgroundProcessor.stop() takes a timeout argument (the sibling
+    # processors' stop() methods take none); everything else is wrapped.
+    _shutdown_deadline = time.monotonic() + _SHUTDOWN_BUDGET_SECONDS
+
+    def _remaining() -> float:
+        return max(0.0, _shutdown_deadline - time.monotonic())
+
+    async def _stop_stage(name: str, factory):
+        """Await one shutdown stage under the remaining process budget.
+
+        ``factory`` is a zero-arg callable returning the awaitable, so the
+        coroutine is only created when the stage actually runs.
+        """
+        budget = _remaining()
+        if budget <= 0:
+            logger.warning(
+                "Shutdown stage '%s' skipped: aggregate budget exhausted",
+                name,
+            )
+            return None
+        try:
+            return await asyncio.wait_for(factory(), timeout=budget)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Shutdown stage '%s' exceeded the aggregate shutdown budget; "
+                "continuing shutdown",
+                name,
+            )
+        except Exception:  # noqa: BLE001 — one stage's failure never skips the rest
+            logger.warning("Shutdown stage '%s' failed", name, exc_info=True)
+        return None
+
     # Stop email ingestion service
     if app.state.email_service:
-        await app.state.email_service.stop_polling()
+        await _stop_stage("email stop_polling", app.state.email_service.stop_polling)
     for rt in residency_tasks:
         rt.cancel()
         try:
             await rt
         except asyncio.CancelledError:
             pass
+        except Exception as e:  # noqa: BLE001 — #799 AC2: a task that DIED with
+            # a natural exception re-raises here; absorbing it keeps the
+            # processor stops, admission release, store/pool closes below
+            # reachable instead of skipping the whole shutdown chain.
+            logger.warning(
+                "Residency task ended with exception at shutdown (continuing): %s",
+                e,
+            )
     # Cancel the periodic memory eviction background task.
     if memory_eviction_task:
         memory_eviction_task.cancel()
-        try:
-            await memory_eviction_task
-        except asyncio.CancelledError:
-            pass
+        await _stop_stage(
+            "memory eviction cancel",
+            lambda: asyncio.gather(memory_eviction_task, return_exceptions=True),
+        )
     # Cancel the one-shot memory embedding backfill task if still running.
     if memory_backfill_task and not memory_backfill_task.done():
         memory_backfill_task.cancel()
-        try:
-            await memory_backfill_task
-        except asyncio.CancelledError:
-            pass
+        await _stop_stage(
+            "memory backfill cancel",
+            lambda: asyncio.gather(memory_backfill_task, return_exceptions=True),
+        )
     # Cancel the periodic memory embed-heal task (issue #937).
     if memory_embed_heal_task and not memory_embed_heal_task.done():
         memory_embed_heal_task.cancel()
-        try:
-            await memory_embed_heal_task
-        except asyncio.CancelledError:
-            pass
+        await _stop_stage(
+            "memory embed-heal cancel",
+            lambda: asyncio.gather(memory_embed_heal_task, return_exceptions=True),
+        )
     if app.state.file_watcher:
-        await app.state.file_watcher.stop()
+        await _stop_stage("file watcher stop", app.state.file_watcher.stop)
     if app.state.background_processor:
-        await app.state.background_processor.stop()
+        # The only stop() that takes a timeout: stop() itself aggregates its
+        # whole composed drain sequence inside the slice it is given (#854).
+        remaining_budget = _remaining()
+        if remaining_budget > 0:
+            try:
+                await asyncio.wait_for(
+                    app.state.background_processor.stop(timeout=remaining_budget),
+                    timeout=remaining_budget + 5,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Background processor stop exceeded the aggregate shutdown "
+                    "budget; continuing shutdown"
+                )
+        else:
+            logger.warning(
+                "Shutdown stage 'background processor stop' skipped: aggregate "
+                "budget exhausted"
+            )
     if getattr(app.state, "wiki_compile_processor", None):
-        await app.state.wiki_compile_processor.stop()
+        await _stop_stage(
+            "wiki compile processor stop",
+            app.state.wiki_compile_processor.stop,
+        )
+    # Curator lifecycle ownership (#799/#854): set the cooperative flag so an
+    # in-flight curate() orchestration aborts at its next call boundary, and
+    # shut the offload executor down so QUEUED orchestration never extends
+    # interpreter exit. The recreate-on-demand accessor keeps a NEXT lifespan
+    # entry in the same interpreter working (wiki-lint convention, PR #1113).
+    with contextlib_suppress(Exception):
+        from app.services.wiki_compiler import (
+            CURATOR_SHUTDOWN,
+            _get_curator_offload_executor,
+        )
+
+        CURATOR_SHUTDOWN.set()
+        _get_curator_offload_executor().shutdown(wait=False, cancel_futures=True)
     if getattr(app.state, "draft_job_processor", None):
-        await app.state.draft_job_processor.stop()
+        await _stop_stage(
+            "draft job processor stop",
+            app.state.draft_job_processor.stop,
+        )
     if getattr(app.state, "kms_compile_processor", None):
-        await app.state.kms_compile_processor.stop()
+        await _stop_stage(
+            "kms compile processor stop",
+            app.state.kms_compile_processor.stop,
+        )
+    # Parse executor lifecycle ownership (#799/#854): cancel queued parses so
+    # they never extend interpreter exit; in-flight parses keep running per
+    # the documented abandoned-thread contract (issue #703) and are skipped
+    # by the bounded tail exit below.
+    with contextlib_suppress(Exception):
+        from app.services.document_processor import _get_parse_executor
+
+        _get_parse_executor().shutdown(wait=False, cancel_futures=True)
     # E3 admission shutdown (issue #518, swarm review F-006): after all
     # background workers have drained, release their admission slots,
     # reject further admits and close a Redis shared store's connection
     # pool. Must run AFTER the processor stop() calls above — those drains
     # hold background leases until they finish.
-    try:
+    async def _admission_shutdown() -> None:
         from app.services.admission import get_admission_controller
 
         controller = get_admission_controller()
@@ -1252,45 +1398,36 @@ async def lifespan(app: FastAPI):
         close = getattr(controller.store, "close", None)
         if close is not None:
             await close()
-    except Exception:
-        logger.exception("Admission shutdown failed")
+
+    await _stop_stage("admission shutdown", _admission_shutdown)
     # Close both underlying LLM clients. The ``llm_client`` attr is an
     # alias of ``thinking_llm_client`` so closing it separately is
-    # unnecessary; ``LLMClient.close()`` is also idempotent.
-    try:
-        await app.state.thinking_llm_client.close()
-    except Exception:
-        pass
-    try:
-        await app.state.instant_llm_client.close()
-    except Exception:
-        pass
-    try:
-        await app.state.embedding_service.close()
-    except Exception:
-        pass
-    try:
-        await app.state.reranking_service.close()
-    except Exception:
-        pass
-    try:
-        app.state.vector_store.close()
-    except Exception:
-        pass
+    # unnecessary; ``LLMClient.close()`` is also idempotent. Unconfigured
+    # boots carry None clients — the getattr guard keeps that inert.
+    for _client_attr in ("thinking_llm_client", "instant_llm_client"):
+        _client = getattr(app.state, _client_attr, None)
+        if _client is not None:
+            await _stop_stage(f"{_client_attr} close", _client.close)
+    for _service_attr in ("embedding_service", "reranking_service"):
+        _service = getattr(app.state, _service_attr, None)
+        if _service is not None:
+            await _stop_stage(f"{_service_attr} close", _service.close)
+    # Synchronous closes run on a worker under the remaining budget (never
+    # wait_for(None) — both are plain functions): handle-close and
+    # lock-scoped operations, fast by construction per the census.
+    await _stop_stage(
+        "vector store close", lambda: asyncio.to_thread(app.state.vector_store.close)
+    )
     # Review PRR-020: let detached upload commit tasks settle (bounded)
     # before the pool closes, so every commit/compensation decides its
     # outcome instead of racing pool closure.
-    try:
+    async def _upload_commit_drain() -> None:
         from app.api.routes.draft_room import drain_inflight_upload_commits
 
         await drain_inflight_upload_commits()
-    except Exception as exc:
-        # The finalizer gate below decides whether the pool can close; record
-        # why the upload drain could not settle first.
-        logger.warning(
-            "Upload commit drain failed during shutdown: %s", type(exc).__name__
-        )
-    await _finalize_turns_and_close_pool(app)
+
+    await _stop_stage("upload commit drain", _upload_commit_drain)
+    turn_finalizers_drained, pool_closed = await _finalize_turns_and_close_pool(app)
     try:
         from app.services.auth_service import _auth_executor
         _auth_executor.shutdown(wait=False)
@@ -1307,15 +1444,68 @@ async def lifespan(app: FastAPI):
         from app.services import redis_io
         redis_io.shutdown_executor()
 
+    # Bounded tail exit (#799/#854, plan-critic rounds 6-10): when the
+    # production launch surface opted in, every recovery-critical workflow
+    # has completed (deny-by-default registry empty, turn finalizers
+    # drained, pool closed, upload registry empty), and logging is flushed,
+    # exit NOW instead of joining whatever non-critical worker threads
+    # (abandoned parses, curator tail, file-watcher scans) happen to be
+    # alive — the interpreter-exit join is the only unbounded natural-exit
+    # contributor and nothing administrates it otherwise. os._exit skips
+    # executor joins and interpreter teardown; there are no app-level
+    # atexit registrations. Tests/embedded lifespans never set the env
+    # (conftest pops it) and take the normal path.
+    if os.environ.get("RAGAPP_BOUNDED_EXIT") == "1":
+        try:
+            from app.api.routes.draft_room import _INFLIGHT_UPLOAD_COMMITS
+            from app.services.shutdown_gate import critical_work_active
 
-async def _finalize_turns_and_close_pool(app) -> None:
+            uploads_pending = bool(_INFLIGHT_UPLOAD_COMMITS)
+        except Exception:  # noqa: BLE001 — unreadable state = do not exit
+            uploads_pending = True
+        critical_complete = (
+            turn_finalizers_drained
+            and pool_closed
+            and not uploads_pending
+            and not critical_work_active()
+        )
+        for handler in logging.getLogger().handlers:
+            with contextlib_suppress(Exception):
+                handler.flush()
+        if critical_complete:
+            logging.getLogger().info(
+                "ragapp: bounded tail exit — critical shutdown complete; "
+                "skipping non-critical executor joins"
+            )
+            for handler in logging.getLogger().handlers:
+                with contextlib_suppress(Exception):
+                    handler.flush()
+            os._exit(0)
+        else:
+            logging.getLogger().info(
+                "ragapp: critical work incomplete at the tail (finalizers=%s "
+                "pool_closed=%s uploads_pending=%s) — normal exit; recovery "
+                "contracts govern",
+                turn_finalizers_drained,
+                pool_closed,
+                uploads_pending,
+            )
+            for handler in logging.getLogger().handlers:
+                with contextlib_suppress(Exception):
+                    handler.flush()
+
+
+async def _finalize_turns_and_close_pool(app) -> tuple[bool, bool]:
     """Drain durable turn finalizers, then close the pool only when safe.
 
     Keeping this decision in one runtime-testable function makes an
     unconditional close (or a close that races a live finalizer) observable
-    instead of relying on source-order inspection alone.
+    instead of relying on source-order inspection alone. Returns
+    ``(turn_finalizers_drained, pool_closed)`` so the bounded tail exit can
+    consume the authoritative state (#799/#854) instead of inferring it.
     """
     turn_finalizers_drained = False
+    pool_closed = False
     try:
         # Issue #1202: cancellation finalizes run on a worker; drain them before
         # the pool becomes unusable, or an interrupted turn can be lost.
@@ -1344,3 +1534,5 @@ async def _finalize_turns_and_close_pool(app) -> None:
         )
     if turn_finalizers_drained:
         app.state.db_pool.close_all()
+        pool_closed = True
+    return turn_finalizers_drained, pool_closed
