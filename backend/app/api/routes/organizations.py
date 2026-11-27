@@ -1147,6 +1147,28 @@ async def accept_org_invite(
         try:
             await asyncio.to_thread(conn.execute, "BEGIN IMMEDIATE")
             try:
+                # Issue #1219: revoked_at/accepted_at were last read on an
+                # autocommit connection BEFORE this transaction opened, so a
+                # revoke (or accept) committing inside that window was
+                # invisible here. Re-read the invite's state under this write
+                # lock and refuse BEFORE minting the membership row. Same
+                # generic message as the pre-transaction checks, so invite
+                # state cannot be enumerated.
+                current = await asyncio.to_thread(
+                    conn.execute,
+                    "SELECT revoked_at, accepted_at FROM org_invites WHERE id = ?",
+                    (invite_id,),
+                )
+                row = await asyncio.to_thread(current.fetchone)
+                if not row or row[0] or row[1]:
+                    # Roll back BEFORE raising so the transaction is closed
+                    # before HTTPException propagates (mirrors the
+                    # IntegrityError branch below).
+                    await asyncio.to_thread(conn.rollback)
+                    raise HTTPException(
+                        status_code=400, detail="Invalid or expired invite"
+                    )
+
                 await asyncio.to_thread(
                     conn.execute,
                     "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
