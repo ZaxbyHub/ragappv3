@@ -20,9 +20,11 @@ Issue #934 item 1: the RETURNING-style 0-row exit (``row =
 X.execute('UPDATE ... RETURNING ...').fetchone()`` followed by ``if row:`` /
 ``if not row:``) is a zero-row early return without any rowcount guard, so it
 now gets the same treatment — the no-row path must roll back before it
-returns. Nested control flow on the no-row path is followed one level;
-deeper shapes are not flagged (conservative by design: the census never
-false-positives, at the cost of missing exotic nesting).
+returns. Nested control flow on the no-row path is followed one level
+(``try`` / ``with`` bodies are descended into, and a path that falls off the
+end of the function is an implicit ``return None``); shapes it cannot read
+statically (a ``raise``, loops, deeper nesting) are not flagged — the matcher
+prefers a missed exotic shape over flagging code it cannot prove dirty.
 """
 
 import ast
@@ -160,22 +162,88 @@ def _statements_after(node: ast.AST, parents: dict) -> list:
     return []
 
 
-def _zero_path_verdict(stmts) -> str:
+def _is_rollback_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "rollback"
+    )
+
+
+def _finally_rolls_back(node: ast.Try) -> bool:
+    """A ``finally:`` rollback runs before any return in the ``try`` body
+    completes, so it covers every exit through that body."""
+    return any(
+        _is_rollback_call(n) for stmt in node.finalbody for n in ast.walk(stmt)
+    )
+
+
+def _zero_path_after_guard(guard: ast.If, parents: dict, func: ast.AST):
+    """The statements the no-row path of an ``if row:`` guard runs, in
+    order, and whether that path falls off the end of ``func`` (an implicit
+    ``return None``). Returns ``None`` when an enclosing ``try:`` rolls back
+    in its ``finally:`` block (every exit is covered: clean).
+
+    Climbs out of enclosing ``try:`` bodies (through their ``else`` block)
+    and ``with`` bodies, which the normal path leaves by continuing after
+    them. Any other enclosing block (loop, ``if``, except handler) stops the
+    climb: what runs next is not statically flat, so the path is not treated
+    as reaching the function end.
+    """
+    stmts = list(guard.orelse)
+    current = guard
+    while True:
+        stmts += _statements_after(current, parents)
+        parent = parents.get(current)
+        if parent is func:
+            return stmts, True
+        if isinstance(parent, ast.Try) and any(s is current for s in parent.body):
+            if _finally_rolls_back(parent):
+                return None
+            stmts += list(parent.orelse) + list(parent.finalbody)
+        elif not isinstance(parent, (ast.With, ast.AsyncWith)):
+            return stmts, False
+        current = parent
+
+
+def _zero_path_verdict(stmts, falls_off_end: bool = False) -> str:
     """Verdict for the flat 0-row statement sequence after a guard:
 
     ``"clean"`` — a rollback call is reached before any exit;
     ``"dirty"`` — a return (or a nested returning guard that does not roll
-    back) is reached first; ``"unclear"`` — no clear exit, do not flag.
+    back) is reached first, or the path falls off the end of the function
+    (implicit ``return None``) with no rollback call anywhere on it;
+    ``"unclear"`` — no statically clear exit (e.g. a ``raise``, which the
+    enclosing handler may roll back), do not flag.
+
+    ``try`` / ``with`` statements on the path are descended into, so a
+    rollback wrapped in one still counts as reached.
     """
     for stmt in stmts:
-        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-            func = stmt.value.func
-            if isinstance(func, ast.Attribute) and func.attr == "rollback":
-                return "clean"
+        if isinstance(stmt, ast.Expr) and _is_rollback_call(stmt.value):
+            return "clean"
         if isinstance(stmt, ast.Return):
             return "dirty"
+        if isinstance(stmt, ast.Raise):
+            return "unclear"
         if isinstance(stmt, ast.If) and _returns(stmt):
             return "clean" if _taken_path_rolls_back(stmt) else "dirty"
+        if isinstance(stmt, ast.Try):
+            if _finally_rolls_back(stmt):
+                return "clean"
+            inner = _zero_path_verdict(
+                list(stmt.body) + list(stmt.orelse) + list(stmt.finalbody)
+            )
+            if inner != "unclear":
+                return inner
+        if isinstance(stmt, (ast.With, ast.AsyncWith)):
+            inner = _zero_path_verdict(stmt.body)
+            if inner != "unclear":
+                return inner
+    if falls_off_end and not any(
+        _is_rollback_call(node) for stmt in stmts for node in ast.walk(stmt)
+    ):
+        return "dirty"
     return "unclear"
 
 
@@ -221,8 +289,8 @@ def _returning_zero_row_exits_missing_rollback(tree):
                 and node.body
                 and isinstance(node.body[-1], ast.Return)
             ):
-                zero_path = list(node.orelse) + _statements_after(node, parents)
-                if _zero_path_verdict(zero_path) == "dirty":
+                after = _zero_path_after_guard(node, parents, func)
+                if after is not None and _zero_path_verdict(*after) == "dirty":
                     violations.append(node.lineno)
     return violations
 
@@ -453,6 +521,139 @@ class TestZeroRowPathsRollBack(unittest.TestCase):
             "        return None\n"
         )
         self.assertEqual(_returning_zero_row_exits_missing_rollback(plain), [])
+
+    def test_returning_implicit_return_without_rollback_is_detected(self):
+        """PR #1137 review: deleting both the rollback and the trailing
+        ``return None`` leaves an implicit ``return None`` that must still be
+        flagged — at function level and inside the ``try:`` body used by
+        WikiStore.claim_next_pending_job."""
+        bare = ast.parse(
+            "class S:\n"
+            "    def f(self):\n"
+            "        row = self._db.execute(\n"
+            "            'UPDATE t SET x = 1 RETURNING *'\n"
+            "        ).fetchone()\n"
+            "        if row:\n"
+            "            self._db.commit()\n"
+            "            return row\n"
+        )
+        self.assertEqual(_returning_zero_row_exits_missing_rollback(bare), [6])
+        in_try = ast.parse(
+            "class S:\n"
+            "    def f(self):\n"
+            "        try:\n"
+            "            row = self._db.execute(\n"
+            "                'UPDATE t SET x = 1 RETURNING *'\n"
+            "            ).fetchone()\n"
+            "            if row:\n"
+            "                self._db.commit()\n"
+            "                return row\n"
+            "        except Exception:\n"
+            "            self._db.rollback()\n"
+            "            raise\n"
+        )
+        self.assertEqual(_returning_zero_row_exits_missing_rollback(in_try), [7])
+        clean = ast.parse(
+            "class S:\n"
+            "    def f(self):\n"
+            "        try:\n"
+            "            row = self._db.execute(\n"
+            "                'UPDATE t SET x = 1 RETURNING *'\n"
+            "            ).fetchone()\n"
+            "            if row:\n"
+            "                self._db.commit()\n"
+            "                return row\n"
+            "            self._db.rollback()\n"
+            "        except Exception:\n"
+            "            self._db.rollback()\n"
+            "            raise\n"
+        )
+        self.assertEqual(_returning_zero_row_exits_missing_rollback(clean), [])
+
+    def test_returning_wrapped_rollback_and_raise_are_not_flagged(self):
+        """PR #1137 review: a rollback wrapped in ``try:`` / ``with`` on the
+        no-row path is reached (no false positive), and a ``raise`` exit is
+        left to the enclosing handler (not flagged)."""
+        for zero_path in (
+            "        try:\n"
+            "            self._db.rollback()\n"
+            "        except Exception:\n"
+            "            pass\n"
+            "        return None\n",
+            "        with self._lock:\n"
+            "            self._db.rollback()\n"
+            "        return None\n",
+            "        raise LookupError('no pending job')\n",
+        ):
+            with self.subTest(zero_path=zero_path):
+                tree = ast.parse(
+                    "class S:\n"
+                    "    def f(self):\n"
+                    "        row = self._db.execute(\n"
+                    "            'UPDATE t SET x = 1 RETURNING *'\n"
+                    "        ).fetchone()\n"
+                    "        if row:\n"
+                    "            self._db.commit()\n"
+                    "            return row\n" + zero_path
+                )
+                self.assertEqual(
+                    _returning_zero_row_exits_missing_rollback(tree), []
+                )
+        # A ``finally:`` rollback runs before the return completes: clean,
+        # both on the path and on an enclosing try the guard sits in.
+        finally_on_path = ast.parse(
+            "class S:\n"
+            "    def f(self):\n"
+            "        row = self._db.execute(\n"
+            "            'UPDATE t SET x = 1 RETURNING *'\n"
+            "        ).fetchone()\n"
+            "        if row:\n"
+            "            self._db.commit()\n"
+            "            return row\n"
+            "        try:\n"
+            "            return None\n"
+            "        finally:\n"
+            "            self._db.rollback()\n"
+        )
+        self.assertEqual(
+            _returning_zero_row_exits_missing_rollback(finally_on_path), []
+        )
+        finally_enclosing = ast.parse(
+            "class S:\n"
+            "    def f(self):\n"
+            "        try:\n"
+            "            row = self._db.execute(\n"
+            "                'UPDATE t SET x = 1 RETURNING *'\n"
+            "            ).fetchone()\n"
+            "            if row:\n"
+            "                self._db.commit()\n"
+            "                return row\n"
+            "            return None\n"
+            "        finally:\n"
+            "            self._db.rollback()\n"
+        )
+        self.assertEqual(
+            _returning_zero_row_exits_missing_rollback(finally_enclosing), []
+        )
+        # Anti-vacuity for the descent: a try-wrapped path that returns
+        # before any rollback (the handler's rollback runs only on error) is
+        # still dirty.
+        dirty = ast.parse(
+            "class S:\n"
+            "    def f(self):\n"
+            "        row = self._db.execute(\n"
+            "            'UPDATE t SET x = 1 RETURNING *'\n"
+            "        ).fetchone()\n"
+            "        if row:\n"
+            "            self._db.commit()\n"
+            "            return row\n"
+            "        try:\n"
+            "            return None\n"
+            "        except Exception:\n"
+            "            self._db.rollback()\n"
+            "            raise\n"
+        )
+        self.assertEqual(_returning_zero_row_exits_missing_rollback(dirty), [6])
 
     def test_wiki_and_kms_stores_have_no_unguarded_zero_row_returns(self):
         backend = Path(__file__).resolve().parents[1] / "app" / "services"

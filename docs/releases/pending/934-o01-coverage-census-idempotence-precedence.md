@@ -14,9 +14,13 @@ production behavior is altered.
   `backend/app/services/wiki_store.py`) and the `if not row:` shape. The
   alternative rowcount spellings, taken-path rollback requirement, and
   every-store scan landed earlier with the pr930-20261015 PRR-016 round;
-  self-tests pin each new form (fallthrough, else-branch, `not row`, and a
-  plain SELECT fetchone staying unflagged). Removing the rollback from
-  `claim_next_pending_job`'s no-row path now fails the census.
+  self-tests pin each new form (fallthrough, else-branch, `not row`, an
+  implicit `return None` falling off the function end, and a plain SELECT
+  fetchone staying unflagged). Removing the rollback from
+  `claim_next_pending_job`'s no-row path now fails the census, including
+  when the trailing `return None` is removed with it. A rollback wrapped in
+  `try:` / `with` (or in an enclosing `finally:`) on the no-row path counts
+  as reached, so those shapes are not false-positives.
 - **Migration idempotence asserts origin preservation, not just column
   presence (#934 item 2).** New
   `TestO01FreshInit::test_second_run_migrations_preserves_existing_origins`
@@ -46,9 +50,11 @@ production behavior is altered.
   upsert of the same fingerprint (rule 4 fresh row), user dismisses the
   curator row, linter re-detect — and asserts the finding stays
   suppressed and the curator row stays `dismissed`. Scoping rule 2 of
-  `WikiStore.upsert_lint_findings` to same-origin rows (a mutation that
-  previously left all 28 lint tests green) now fails here, as does the
-  rule-2/rule-3 reorder (also covered by the seeded-mixed test).
+  `WikiStore.upsert_lint_findings` to same-origin rows now fails here, as
+  does the rule-2/rule-3 reorder (which the issue's reviewer probe showed
+  left every o01 test green). This new test — not the pre-existing
+  `test_mixed_auto_resolved_and_dismissed_stays_suppressed`, which never
+  builds a coexisting cross-origin pair — is what pins the reorder.
 - **Temp dirs are cleaned up (#934 item 6).** `backend/tests/test_o01_migration.py`,
   `test_o01_wiki_lint_reconcile.py`, `test_o01_origin_guards.py` and
   `test_o01_kms_update_entry_rollback.py` register
@@ -86,8 +92,10 @@ None — test-only; no schema, config, or runtime changes.
 ## Known caveats
 
 - The census follows nested control flow on a RETURNING no-row path one
-  level deep; more exotic nesting is deliberately not flagged
-  (conservative: no false positives, possible false negatives).
+  level deep (descending into `try:` / `with` bodies); shapes it cannot
+  read statically — a `raise` exit, loops, deeper nesting — are
+  deliberately not flagged (it prefers a possible false negative over
+  flagging code it cannot prove dirty).
 - The migration's `failed`-phase journal branches remain untested, per the
   issue's own reachability analysis (IntegrityError fires first; no
   REFERENCES constraint exists to violate).
