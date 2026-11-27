@@ -41,7 +41,7 @@ Tests: new regression suite
    content and `aria-label`);
 4. A→B→A with B pending: chart A's held output is shown for the
    reselected chart while chart A redraws, and the late B completion
-   cannot replace it;
+   cannot replace it (RED on the pre-fix tree);
 5. a render failure with an empty message shows the error fallback
    instead of leaving the loading spinner up forever (RED on the pre-fix
    tree).
@@ -98,5 +98,5 @@ or persistence surfaces changed.
   state. That output is tagged for chart A, the selected chart, so it is
   not stale and its `aria-label` matches.
 - The out-of-order test (case 3) also passes on the pre-fix tree, because
-  the `cancelled` flag already drops the older draw. Cases 1 and 2 are the
-  ones that fail without this change.
+  the `cancelled` flag already drops the older draw. Cases 1, 2, 4 and 5
+  fail without this change.
