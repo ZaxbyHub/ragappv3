@@ -26,6 +26,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "check_double_hold_routes.py"
 _spec = importlib.util.spec_from_file_location("check_double_hold_routes", _SCRIPT)
 guard = importlib.util.module_from_spec(_spec)
@@ -241,3 +243,87 @@ def test_classified_name_sets_are_pinned():
         "require_health_probe_auth",
         "require_deep_health_probe_auth",
     }
+
+
+@pytest.mark.parametrize("method", ["get", "post", "put", "patch", "delete"])
+def test_every_router_method_is_scanned(method):
+    """All five router methods must be scanned, not just get/post.
+
+    Regression pin: dropping put/patch/delete from ROUTER_METHODS would
+    silently unscanned 54 of the repo's 262 routes (and 6 of the 18
+    organizations handlers) while every other test stayed green.
+    """
+    src = (
+        "from fastapi import APIRouter, Depends\n"
+        "router = APIRouter()\n"
+        "\n"
+        f"@router.{method}('/x')\n"
+        "async def h(user=Depends(require_role('admin'))):\n"
+        "    conn = await pool.get_connection_async()\n"
+        "    return 1\n"
+    )
+    violations = guard.scan_source("synthetic.py", src)
+    assert any("C-DBLHOLD-1" in v for v in violations), (method, violations)
+
+
+def test_draft_room_acquisition_outside_commit_upload_still_fires():
+    """Only acquisitions INSIDE _commit_upload are exempt.
+
+    Regression pin: dropping the ``nf.name == "_commit_upload"`` check (or
+    the line-range narrowing) would exempt every nested function in the
+    handler, letting a new acquisition inside the handler body pass.
+    """
+    src = (
+        "from fastapi import APIRouter, Depends\n"
+        "router = APIRouter()\n"
+        "\n"
+        "@router.post('/x')\n"
+        "async def upload_draft_input(user=Depends(require_role('admin'))):\n"
+        "    async def _commit_upload():\n"
+        "        async with db_pool.connection_async() as conn:\n"
+        "            pass\n"
+        "    async with db_pool.connection_async() as conn:\n"
+        "        pass\n"
+        "    return 1\n"
+    )
+    violations = guard.scan_source("draft_room.py", src)
+    assert any("C-DBLHOLD-1" in v for v in violations), violations
+
+
+def test_keyword_only_dependency_is_scanned():
+    """Keyword-only dependency defaults are scanned too.
+
+    Regression pin: ignoring ``kw_defaults`` would unscanned every
+    keyword-only auth dependency.
+    """
+    src = (
+        "from fastapi import APIRouter, Depends\n"
+        "router = APIRouter()\n"
+        "\n"
+        "@router.get('/x')\n"
+        "async def h(*, user=Depends(require_role('admin'))):\n"
+        "    conn = await pool.get_connection_async()\n"
+        "    return 1\n"
+    )
+    violations = guard.scan_source("synthetic.py", src)
+    assert any("C-DBLHOLD-1" in v for v in violations), violations
+
+
+def test_attribute_form_dependency_is_scanned():
+    """``Depends(module.callable)`` is resolved to the callable's name.
+
+    Regression pin: ignoring the attribute form would leave
+    ``Depends(deps.get_db)``-style dependencies unscanned.
+    """
+    src = (
+        "from fastapi import APIRouter, Depends\n"
+        "import app.api.deps as deps\n"
+        "router = APIRouter()\n"
+        "\n"
+        "@router.get('/x')\n"
+        "async def h(user=Depends(deps.get_db)):\n"
+        "    conn = await pool.get_connection_async()\n"
+        "    return 1\n"
+    )
+    violations = guard.scan_source("synthetic.py", src)
+    assert any("C-DBLHOLD-1" in v for v in violations), violations

@@ -42,17 +42,18 @@
   a LIVE instance of the same class remains in the documents.py upload path
   (the handler holds a request-scoped connection via require_vault_permission
   while _do_upload takes a second one at documents.py:2884; pre-existing and
-  unchanged by this PR), filed as a Priority follow-up.
+  unchanged by this PR), filed as Priority follow-up #1217.
 - Nine direct-caller/race harness suites migrated to the `db=` call-site
   seam (distinct connections per simulated request preserved).
 - New Quality-contracts guardrail `scripts/check_double_hold_routes.py`
   (fail-closed within its scanned lane on unclassified auth dependencies;
   C-DBLHOLD-1 double-hold, C-DBLHOLD-2 unknown-auth, C-DBLHOLD-3
   manual-release rules), wired into `ci.yml`, the `justfile`
-  `quality-contracts` recipe, and all EIGHT script-inventory mirrors
+  `quality-contracts` recipe, and six script-inventory mirrors (EIGHT surfaces in
+  total, the ci.yml step included)
   (`AGENTS.md`, `docs/engineering/conventions.md`,
   `docs/engineering/testing.md`, `CONTRIBUTING.md`, the
-  `ci-compatibility-audit` and `ci-fix-monitor` skills); contract tests (13) in
+  `ci-compatibility-audit` and `ci-fix-monitor` skills); contract tests (21) in
   `backend/tests/test_double_hold_guardrail.py`.
 
 ## Why
