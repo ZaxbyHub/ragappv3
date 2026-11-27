@@ -87,10 +87,11 @@ class _RouteParityHarness(unittest.TestCase):
         self._db_path = str(Path(self._temp_dir) / "app.db")
         init_db(self._db_path)
 
-        # The organizations route reads via get_pool(str(settings.sqlite_path))
-        # directly (not via the get_db dependency), so point settings.data_dir
-        # at the temp DB and seed a superadmin + an org so list_organizations
-        # returns 200 with a handler-ran body.
+        # The organizations route reads through the request-scoped get_db
+        # dependency, which resolves the same pool from
+        # str(settings.sqlite_path), so point settings.data_dir at the temp DB
+        # and seed a superadmin + an org so list_organizations returns 200
+        # with a handler-ran body.
         self._original_data_dir = settings.data_dir
         settings.data_dir = Path(self._temp_dir)
 

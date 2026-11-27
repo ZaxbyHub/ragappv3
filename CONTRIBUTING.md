@@ -261,6 +261,7 @@ npm run build
 ```bash
 python scripts/check_runtime_contract.py   # runtime pins: Docker/CI/engines/docs parity
 python scripts/check_config_contract.py
+python scripts/check_double_hold_routes.py
 python scripts/check_g06_setup_docs.py --check all   # .env.example/setup docs match code and compose (#738)
 python scripts/check_settings_consumers.py   # every Settings field has a production read site
 python scripts/check_batch_mock_seq.py   # send-path batch mocks mirror the save response contract

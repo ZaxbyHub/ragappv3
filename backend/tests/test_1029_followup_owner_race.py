@@ -32,7 +32,6 @@ from pathlib import Path  # noqa: E402
 import pytest  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
 
-from app.api.routes import organizations as org_mod  # noqa: E402
 from app.api.routes.organizations import (  # noqa: E402
     TransferOwnershipRequest,
     remove_org_member,
@@ -120,8 +119,6 @@ def test_remove_owner_racing_transfer_ownership_never_orphans_org(
     )
 
     facade = _PerCallerPool(real_pool)
-    saved_get_pool = org_mod.get_pool
-    org_mod.get_pool = lambda _path: facade
 
     real_to_thread = asyncio.to_thread
     real_transfer_ownership = transfer_ownership
@@ -134,23 +131,36 @@ def test_remove_owner_racing_transfer_ownership_never_orphans_org(
         # the original call. Every other to_thread call passes through.
         if getattr(func, "__name__", "") == "_remove_member" and not race["fired"]:
             race["fired"] = True
-            await real_transfer_ownership(
-                ORG_ID,
-                TransferOwnershipRequest(new_owner_user_id=MEMBER_ID),
-                user=OWNER,
-                _csrf_token="t",
-            )
+            race_conn = await facade.get_connection_async()
+            try:
+                await real_transfer_ownership(
+                    ORG_ID,
+                    TransferOwnershipRequest(new_owner_user_id=MEMBER_ID),
+                    user=OWNER,
+                    _csrf_token="t",
+                    db=race_conn,
+                )
+            finally:
+                facade.release_connection(race_conn)
         return await real_to_thread(func, *args, **kwargs)
+
+    async def _driven_remove() -> None:
+        # The driven route's request-scoped db= connection: checked out of
+        # the facade per simulated request and released by this CALLER (the
+        # handler no longer releases db, #798 AC4).
+        conn = await facade.get_connection_async()
+        try:
+            await remove_org_member(
+                ORG_ID, MEMBER_ID, user=OWNER, _csrf_token="t", db=conn
+            )
+        finally:
+            facade.release_connection(conn)
 
     try:
         monkeypatch.setattr(asyncio, "to_thread", _racing_to_thread)
         outcome: dict = {}
         try:
-            asyncio.run(
-                remove_org_member(
-                    ORG_ID, MEMBER_ID, user=OWNER, _csrf_token="t"
-                )
-            )
+            asyncio.run(_driven_remove())
             outcome["removed"] = True
         except HTTPException as exc:
             outcome["refused_status"] = exc.status_code
@@ -191,6 +201,5 @@ def test_remove_owner_racing_transfer_ownership_never_orphans_org(
         )
     finally:
         monkeypatch.setattr(asyncio, "to_thread", real_to_thread)
-        org_mod.get_pool = saved_get_pool
         real_pool.close_all()
         _pool_cache.clear()

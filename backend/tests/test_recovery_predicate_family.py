@@ -282,18 +282,14 @@ def test_prompt_store_default_commit_unchanged(tmp_path: Path) -> None:
 
 
 class _OrgEnv:
-    """Pool-patched org-route world for the success/ordering legs."""
+    """Org-route world for the success/ordering legs: direct handler calls
+    take their request-scoped ``db=`` connection from the pool (#798 AC4)."""
 
     def __init__(self, tmp_path: Path) -> None:
         _pool_cache.clear()
         self.db_path = str(tmp_path / "org-family.db")
         init_db(self.db_path)
         self.pool = SQLiteConnectionPool(self.db_path, max_size=4)
-        from app.api.routes import organizations as org_mod
-
-        self._org_mod = org_mod
-        self._saved_get_pool = org_mod.get_pool
-        org_mod.get_pool = lambda _p: self.pool
         seed = self.pool.get_connection()
         try:
             for uid, username, role in (
@@ -328,8 +324,19 @@ class _OrgEnv:
         finally:
             check.close()
 
+    async def run_handler(self, call):  # noqa: ANN001
+        """Await one direct handler call on a fresh pool connection: the
+        request-scoped ``db=`` connection is checked out per simulated
+        request (as the pre-migration handler checkout did) and released by
+        this CALLER afterwards — the handler no longer releases db (#798
+        AC4)."""
+        conn = await self.pool.get_connection_async()
+        try:
+            return await call(conn)
+        finally:
+            self.pool.release_connection(conn)
+
     def close(self) -> None:
-        self._org_mod.get_pool = self._saved_get_pool
         self.pool.close_all()
         _pool_cache.clear()
 
@@ -341,10 +348,20 @@ def test_superadmin_prompt_routes_still_succeed(tmp_path: Path) -> None:
         superadmin = {"id": 9, "username": "root9", "role": "superadmin"}
 
         async def go():
-            set_result = await set_prompt_override(
-                1, PromptOverrideSetRequest(version="v1"), user=superadmin, _csrf_token="t"
+            set_result = await env.run_handler(
+                lambda db: set_prompt_override(
+                    1,
+                    PromptOverrideSetRequest(version="v1"),
+                    user=superadmin,
+                    _csrf_token="t",
+                    db=db,
+                )
             )
-            clear_result = await clear_prompt_override(1, user=superadmin, _csrf_token="t")
+            clear_result = await env.run_handler(
+                lambda db: clear_prompt_override(
+                    1, user=superadmin, _csrf_token="t", db=db
+                )
+            )
             return set_result, clear_result
 
         set_result, clear_result = asyncio.run(go())
@@ -364,17 +381,26 @@ def test_add_member_success_and_conflict_ordering(tmp_path: Path) -> None:
         owner = {"id": 1, "username": "owner1", "role": "admin"}
 
         async def go():
-            first = await add_org_member(
-                1, OrgMemberRequest(user_id=2, role="member"), user=owner, _csrf_token="t"
-            )
-            from fastapi import HTTPException
-
-            try:
-                await add_org_member(
+            first = await env.run_handler(
+                lambda db: add_org_member(
                     1,
                     OrgMemberRequest(user_id=2, role="member"),
                     user=owner,
                     _csrf_token="t",
+                    db=db,
+                )
+            )
+            from fastapi import HTTPException
+
+            try:
+                await env.run_handler(
+                    lambda db: add_org_member(
+                        1,
+                        OrgMemberRequest(user_id=2, role="member"),
+                        user=owner,
+                        _csrf_token="t",
+                        db=db,
+                    )
                 )
                 conflict = None
             except HTTPException as exc:
@@ -400,11 +426,14 @@ def test_missing_org_404_precedes_privilege(tmp_path: Path) -> None:
 
         async def go():
             try:
-                await add_org_member(
-                    999,
-                    OrgMemberRequest(user_id=2, role="member"),
-                    user=owner,
-                    _csrf_token="t",
+                await env.run_handler(
+                    lambda db: add_org_member(
+                        999,
+                        OrgMemberRequest(user_id=2, role="member"),
+                        user=owner,
+                        _csrf_token="t",
+                        db=db,
+                    )
                 )
                 return None
             except HTTPException as exc:
