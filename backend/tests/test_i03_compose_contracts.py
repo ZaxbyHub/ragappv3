@@ -180,7 +180,39 @@ class TestWindowsLauncherDefaultImageMatchesComposePin:
         ]
         # Resolution branch: the default expression itself reads the pin
         # from docker-compose.yml, so it tracks dependabot digest bumps.
-        resolves_from_compose = "docker-compose.yml" in param_line
+        # Mentioning the filename is not enough — replay the expression's
+        # Select-String against the real compose file (first matching line,
+        # first match on it; Select-String is case-insensitive by default)
+        # and require it to yield exactly compose's harrier-embed pin.
+        resolves_from_compose = False
+        reads_compose = re.search(
+            r'Select-String\s+-LiteralPath\s+\(Join-Path\s+\$PSScriptRoot\s+'
+            r'"docker-compose\.yml"\)',
+            param_line,
+        )
+        pattern_match = re.search(r'-Pattern\s+"([^"]+)"', param_line)
+        # ...and the match must be USED as the image: the first matching
+        # line's first regex match (not .Line, not an inverted branch, not a
+        # -SimpleMatch literal search the Python replay would not model).
+        uses_match = (
+            re.search(r"\$pin\s*=\s*Select-String", param_line)
+            and re.search(r"\|\s*Select-Object\s+-First\s+1\b", param_line)
+            and re.search(
+                r"if\s*\(\s*\$pin\s*\)\s*\{\s*\$pin\.Matches\[0\]\.Value\s*\}",
+                param_line,
+            )
+            and "-SimpleMatch" not in param_line
+            and "-CaseSensitive" not in param_line
+        )
+        if reads_compose and pattern_match and uses_match:
+            pattern = re.compile(pattern_match.group(1), re.IGNORECASE)
+            compose_lines = COMPOSE_PATH.read_text(encoding="utf-8").splitlines()
+            first_hit = next(
+                (m for m in map(pattern.search, compose_lines) if m), None
+            )
+            resolves_from_compose = (
+                first_hit is not None and first_hit.group(0) == compose_image
+            )
         assert literal_matches or resolves_from_compose, (
             "start-services.ps1's EmbeddingImage default drifts from "
             "docker-compose.yml's harrier-embed digest pin "
