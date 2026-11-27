@@ -170,6 +170,29 @@ describe('CreateUserDialog — issue #1189 admin-user creation contract', () => 
     await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
     expect(onCreate).toHaveBeenCalledWith('newuser', '', 'Password123', 'member');
   });
+
+  it('AC1: cancelling the dialog clears the confirm entry', async () => {
+    const onOpenChange = vi.fn();
+    const { rerender } = render(
+      <CreateUserDialog open onCreate={onCreate} onOpenChange={onOpenChange} isSuperAdmin={false} />,
+    );
+
+    fill('create-password', 'Password123');
+    fill('create-confirm-password', 'Password123');
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    });
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+
+    // Same component instance (no remount): reopening must not leak the entry.
+    rerender(
+      <CreateUserDialog open={false} onCreate={onCreate} onOpenChange={onOpenChange} isSuperAdmin={false} />,
+    );
+    rerender(
+      <CreateUserDialog open onCreate={onCreate} onOpenChange={onOpenChange} isSuperAdmin={false} />,
+    );
+    expect((document.getElementById('create-confirm-password') as HTMLInputElement).value).toBe('');
+  });
 });
 
 // Issue #1189's in-scope list also names the edit dialog. Its error paths are

@@ -31,18 +31,21 @@ confirm field (behavior-reflecting, not test-weakening):
 
 New regression spec:
 `frontend/src/pages/AdminUsersPage/create-user-dialog.issue1189.test.tsx`
-(5 tests — two password fields present + required, the first-sign-in
+(7 tests — two password fields present + required, the first-sign-in
 statement rendered and wired to both inputs via `aria-describedby`, mismatch
 blocks `onCreate`, empty confirm blocks submission natively, empty confirm
 is still blocked by the JS gate when native validation is bypassed, matching
-entries call `onCreate`).
+entries call `onCreate`, the confirm field resets when the dialog is
+cancelled, and an `EditUserDialog` success path — prefilled from the row,
+username read-only, Save passes the edited full name to `onSave`).
 
-Edit-dialog and labeled row-action coverage named in the issue's in-scope
-list already exists on master and is unchanged by this PR:
+Labeled row actions and the edit dialog's error paths, both named in the
+issue's in-scope list, were already covered on master:
 `AdminUsersPage.error-handling.test.tsx` drives the `Edit user <name>` /
 `Reset password for <name>` / `Manage groups for <name>` row actions and the
-edit dialog, and `AdminUsersPage.superadminTargetGating.issue722.test.tsx`
-pins the labeled row actions per target.
+edit dialog's failure toasts, and
+`AdminUsersPage.superadminTargetGating.issue722.test.tsx` pins the labeled
+row actions per target. This PR adds the edit dialog's success path.
 
 ## Why
 
