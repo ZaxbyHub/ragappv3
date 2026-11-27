@@ -50,11 +50,12 @@ production behavior is altered.
   upsert of the same fingerprint (rule 4 fresh row), user dismisses the
   curator row, linter re-detect — and asserts the finding stays
   suppressed and the curator row stays `dismissed`. Scoping rule 2 of
-  `WikiStore.upsert_lint_findings` to same-origin rows now fails here, as
-  does the rule-2/rule-3 reorder (which the issue's reviewer probe showed
-  left every o01 test green). This new test — not the pre-existing
-  `test_mixed_auto_resolved_and_dismissed_stays_suppressed`, which never
-  builds a coexisting cross-origin pair — is what pins the reorder.
+  `WikiStore.upsert_lint_findings` to same-origin rows now fails here (and
+  only here). The rule-2/rule-3 reorder fails here too, and is also killed
+  by the seeded-mixed test
+  `test_seeded_mixed_state_suppresses_and_reordering_rule3_first_fails`;
+  the single-row `test_mixed_auto_resolved_and_dismissed_stays_suppressed`
+  pins neither.
 - **Temp dirs are cleaned up (#934 item 6).** `backend/tests/test_o01_migration.py`,
   `test_o01_wiki_lint_reconcile.py`, `test_o01_origin_guards.py` and
   `test_o01_kms_update_entry_rollback.py` register
@@ -91,11 +92,16 @@ None — test-only; no schema, config, or runtime changes.
 
 ## Known caveats
 
-- The census follows nested control flow on a RETURNING no-row path one
-  level deep (descending into `try:` / `with` bodies); shapes it cannot
-  read statically — a `raise` exit, loops, deeper nesting — are
-  deliberately not flagged (it prefers a possible false negative over
-  flagging code it cannot prove dirty).
+- The census descends into `try:` / `with` bodies on a RETURNING no-row
+  path and treats the stores' transaction context managers
+  (`with self.transaction():` / `_write_txn()`) and `finally:` rollbacks
+  as finalizing every exit. Shapes it cannot read statically — a `raise`
+  exit, loops, a guard nested under another `if`, a rollback under a
+  condition, `if row is None` spellings — are deliberately not flagged (it
+  prefers a possible false negative over flagging code it cannot prove
+  dirty). The pre-existing rowcount and `if not row:` checks keep their
+  taken-path granularity: a rollback that only a wrapping `try:` / `with`
+  performs is not recognized there.
 - The migration's `failed`-phase journal branches remain untested, per the
   issue's own reachability analysis (IntegrityError fires first; no
   REFERENCES constraint exists to violate).

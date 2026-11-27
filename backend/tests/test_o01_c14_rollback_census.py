@@ -20,11 +20,13 @@ Issue #934 item 1: the RETURNING-style 0-row exit (``row =
 X.execute('UPDATE ... RETURNING ...').fetchone()`` followed by ``if row:`` /
 ``if not row:``) is a zero-row early return without any rowcount guard, so it
 now gets the same treatment — the no-row path must roll back before it
-returns. Nested control flow on the no-row path is followed one level
-(``try`` / ``with`` bodies are descended into, and a path that falls off the
-end of the function is an implicit ``return None``); shapes it cannot read
-statically (a ``raise``, loops, deeper nesting) are not flagged — the matcher
-prefers a missed exotic shape over flagging code it cannot prove dirty.
+returns. ``try`` / ``with`` bodies on the no-row path are descended into, a
+path that falls off the end of the function is an implicit ``return None``,
+and the stores' transaction context managers (``with self.transaction():``)
+and ``finally:`` rollbacks count as finalizing every exit; shapes it cannot
+read statically (a ``raise``, loops, a guard nested under another ``if``, a
+rollback under a condition) are not flagged — the matcher prefers a missed
+exotic shape over flagging code it cannot prove dirty.
 """
 
 import ast
@@ -178,17 +180,40 @@ def _finally_rolls_back(node: ast.Try) -> bool:
     )
 
 
+_TXN_CONTEXT_NAMES = frozenset({"transaction", "_write_txn"})
+
+
+def _is_txn_context(node: ast.AST) -> bool:
+    """True for ``with X.transaction():`` / ``with X._write_txn():`` — the
+    stores' own transaction context managers, which commit on a normal exit
+    and roll back on an exception, so they finalize every path out of their
+    body (``WikiStore.transaction``, ``JobLease._write_txn``)."""
+    if not isinstance(node, (ast.With, ast.AsyncWith)):
+        return False
+    for item in node.items:
+        expr = item.context_expr
+        if not isinstance(expr, ast.Call):
+            continue
+        func = expr.func
+        if isinstance(func, ast.Attribute) and func.attr in _TXN_CONTEXT_NAMES:
+            return True
+        if isinstance(func, ast.Name) and func.id in _TXN_CONTEXT_NAMES:
+            return True
+    return False
+
+
 def _zero_path_after_guard(guard: ast.If, parents: dict, func: ast.AST):
     """The statements the no-row path of an ``if row:`` guard runs, in
     order, and whether that path falls off the end of ``func`` (an implicit
-    ``return None``). Returns ``None`` when an enclosing ``try:`` rolls back
-    in its ``finally:`` block (every exit is covered: clean).
+    ``return None``). Returns ``None`` when an enclosing block finalizes the
+    transaction on every exit — a ``try:`` with a ``finally:`` rollback, or
+    a store transaction context manager (see ``_is_txn_context``) — clean.
 
-    Climbs out of enclosing ``try:`` bodies (through their ``else`` block)
-    and ``with`` bodies, which the normal path leaves by continuing after
-    them. Any other enclosing block (loop, ``if``, except handler) stops the
-    climb: what runs next is not statically flat, so the path is not treated
-    as reaching the function end.
+    Climbs out of enclosing ``try:`` bodies (through their ``else`` and
+    ``finally`` blocks) and other ``with`` bodies, which the normal path
+    leaves by continuing after them. Any other enclosing block (loop,
+    ``if``, except handler) conservatively stops the climb, so the path is
+    not treated as reaching the function end.
     """
     stmts = list(guard.orelse)
     current = guard
@@ -201,6 +226,8 @@ def _zero_path_after_guard(guard: ast.If, parents: dict, func: ast.AST):
             if _finally_rolls_back(parent):
                 return None
             stmts += list(parent.orelse) + list(parent.finalbody)
+        elif _is_txn_context(parent):
+            return None
         elif not isinstance(parent, (ast.With, ast.AsyncWith)):
             return stmts, False
         current = parent
@@ -216,8 +243,9 @@ def _zero_path_verdict(stmts, falls_off_end: bool = False) -> str:
     ``"unclear"`` — no statically clear exit (e.g. a ``raise``, which the
     enclosing handler may roll back), do not flag.
 
-    ``try`` / ``with`` statements on the path are descended into, so a
-    rollback wrapped in one still counts as reached.
+    ``try`` / ``with`` statements on the path are descended into (to any
+    depth), so a rollback wrapped in one still counts as reached; a store
+    transaction context manager on the path finalizes itself (clean).
     """
     for stmt in stmts:
         if isinstance(stmt, ast.Expr) and _is_rollback_call(stmt.value):
@@ -236,6 +264,8 @@ def _zero_path_verdict(stmts, falls_off_end: bool = False) -> str:
             )
             if inner != "unclear":
                 return inner
+        if _is_txn_context(stmt):
+            return "clean"
         if isinstance(stmt, (ast.With, ast.AsyncWith)):
             inner = _zero_path_verdict(stmt.body)
             if inner != "unclear":
@@ -292,7 +322,9 @@ def _returning_zero_row_exits_missing_rollback(tree):
                 after = _zero_path_after_guard(node, parents, func)
                 if after is not None and _zero_path_verdict(*after) == "dirty":
                     violations.append(node.lineno)
-    return violations
+    # A guard inside a nested function is visited by both the outer and the
+    # inner function walk; report each source line once.
+    return sorted(set(violations))
 
 
 class TestZeroRowPathsRollBack(unittest.TestCase):
@@ -654,6 +686,100 @@ class TestZeroRowPathsRollBack(unittest.TestCase):
             "            raise\n"
         )
         self.assertEqual(_returning_zero_row_exits_missing_rollback(dirty), [6])
+
+    def test_returning_inside_store_transaction_is_not_flagged(self):
+        """PR #1137 review: ``with self.transaction():`` commits on a normal
+        exit, so a no-row path leaving it (implicitly or via a return after
+        the block) is finalized — while an arbitrary ``with`` (a lock) is
+        climbed through and still flagged."""
+        body = (
+            "        row = self._db.execute(\n"
+            "            'UPDATE t SET x = 1 RETURNING *'\n"
+            "        ).fetchone()\n"
+            "        if row:\n"
+            "            return row\n"
+        )
+        indented = "".join("    " + line + "\n" for line in body.splitlines())
+        for ctx in ("self.transaction()", "self._write_txn()"):
+            for tail in ("", "        return None\n"):
+                with self.subTest(ctx=ctx, tail=tail):
+                    tree = ast.parse(
+                        "class S:\n"
+                        "    def f(self):\n"
+                        f"        with {ctx}:\n" + indented + tail
+                    )
+                    self.assertEqual(
+                        _returning_zero_row_exits_missing_rollback(tree), []
+                    )
+        lock = ast.parse(
+            "class S:\n"
+            "    def f(self):\n"
+            "        with self._lock:\n" + indented + "        return None\n"
+        )
+        self.assertEqual(_returning_zero_row_exits_missing_rollback(lock), [7])
+
+    def test_returning_climb_reads_try_else_and_conditional_rollback(self):
+        """PR #1137 review: the climb out of a ``try:`` body runs its
+        ``else:`` block (a rollback there is reached), and a fall-off path
+        whose only rollback sits under a condition is not provably dirty."""
+        try_else = ast.parse(
+            "class S:\n"
+            "    def f(self):\n"
+            "        try:\n"
+            "            row = self._db.execute(\n"
+            "                'UPDATE t SET x = 1 RETURNING *'\n"
+            "            ).fetchone()\n"
+            "            if row:\n"
+            "                self._db.commit()\n"
+            "                return row\n"
+            "        except Exception:\n"
+            "            raise\n"
+            "        else:\n"
+            "            self._db.rollback()\n"
+        )
+        self.assertEqual(_returning_zero_row_exits_missing_rollback(try_else), [])
+        conditional = ast.parse(
+            "class S:\n"
+            "    def f(self):\n"
+            "        row = self._db.execute(\n"
+            "            'UPDATE t SET x = 1 RETURNING *'\n"
+            "        ).fetchone()\n"
+            "        if row:\n"
+            "            self._db.commit()\n"
+            "            return row\n"
+            "        if self._db.in_transaction:\n"
+            "            self._db.rollback()\n"
+        )
+        self.assertEqual(
+            _returning_zero_row_exits_missing_rollback(conditional), []
+        )
+
+    def test_returning_guard_in_nested_function_reported_once(self):
+        """The outer and inner function walks both visit a nested guard; the
+        violation is one source line, reported once."""
+        tree = ast.parse(
+            "def outer(db):\n"
+            "    def inner():\n"
+            "        row = db.execute('UPDATE t SET x = 1 RETURNING *').fetchone()\n"
+            "        if row:\n"
+            "            return row\n"
+            "        return None\n"
+            "    return inner\n"
+        )
+        self.assertEqual(_returning_zero_row_exits_missing_rollback(tree), [4])
+
+    def test_rowcount_rollback_only_in_else_branch_is_detected(self):
+        """Issue #934 item 1: a rollback in the ELSE branch of a rowcount
+        guard is not on the 0-row path that returns — still a violation."""
+        tree = ast.parse(
+            "class S:\n"
+            "    def f(self, cur):\n"
+            "        if cur.rowcount == 0:\n"
+            "            return None\n"
+            "        else:\n"
+            "            self._db.rollback()\n"
+        )
+        self.assertEqual(_rowcount_zero_branches_missing_rollback(tree), [3])
 
     def test_wiki_and_kms_stores_have_no_unguarded_zero_row_returns(self):
         backend = Path(__file__).resolve().parents[1] / "app" / "services"

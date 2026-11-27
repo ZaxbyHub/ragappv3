@@ -150,6 +150,8 @@ class TestLintRunLifecycle(unittest.TestCase):
         # linger open, not be deleted) — they survive as linter-owned
         # history (#791; status + survival pinned by issue #934 item 7).
         open_ids = [f.id for f in findings2]
+        # Non-vacuity: the per-id auto_resolved loop below must check rows.
+        self.assertTrue(open_ids)
         self.conn.execute("DELETE FROM wiki_claims WHERE vault_id = 1")
         self.conn.commit()
         findings3 = self.linter.run_lint(1)

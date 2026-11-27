@@ -9,8 +9,9 @@ candidate (finding_type-scoped resolve pass + suppression that excludes all
       run_lint — kills finding_type scoping;
 (ii)  user-resolved and user-acknowledged findings stay suppressed on
       re-detection — kills suppression-excludes-resolved;
-(iii) a mixed [auto_resolved, dismissed] fingerprint stays suppressed —
-      pins the precedence rule that a user disposition always wins;
+(iii) a dismissed fingerprint stays suppressed on re-detection (this guard
+      only ever holds one row, so it does NOT pin the precedence rule —
+      (vi) and (xi) do);
 (iv)  a curator rerun of the SAME file attaches no duplicate source row —
       pins the source-dedupe semantics;
 (v)   a detect -> undetect -> re-detect cycle holds exactly one row per
@@ -28,6 +29,11 @@ swarm-pr-review round (pr930-20261015) additions:
        from the new detection;
 (x)    a non-integer related_page_ids element cannot abort the whole
        reconciliation.
+
+Issue #934 item 5 addition:
+(xi)   a user-dismissed CURATOR row suppresses a later LINTER re-detection
+       of the same fingerprint — kills an origin-scoped rule 2 and the
+       rule-2/rule-3 reorder.
 """
 
 import asyncio

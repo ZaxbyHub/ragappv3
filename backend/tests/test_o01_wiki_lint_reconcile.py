@@ -118,13 +118,12 @@ class TestLintReconcileScope(unittest.TestCase):
         )
         self.conn.commit()
         linter.run_lint(1)
-        row = self.conn.execute(
+        rows = self.conn.execute(
             "SELECT id, status FROM wiki_lint_findings WHERE vault_id=1"
-            " AND finding_type='unsupported_claim'"
-        ).fetchone()
-        assert row["status"] == "open"
+            " AND finding_type='unsupported_claim' ORDER BY id"
+        ).fetchall()
         # Reopen reuses the SAME row — no duplicate history row per flap.
-        assert row["id"] == original_id
+        assert [(r["id"], r["status"]) for r in rows] == [(original_id, "open")]
         open_count = self.conn.execute(
             "SELECT COUNT(*) FROM wiki_lint_findings WHERE vault_id=1 "
             "AND status='open' AND finding_type='unsupported_claim'"
