@@ -41,10 +41,10 @@ Tests for `get_current_active_user` caching live in `backend/tests/test_active_u
 - Cache state is module-level in `deps.py` (`_ACTIVE_USER_CACHE` dict + `_ACTIVE_USER_CACHE_LOCK`). Tests must reset it in `setUp`/`tearDown` by calling `deps._ACTIVE_USER_CACHE.clear()` — patching `time.monotonic` to control TTL expiry is also necessary for expiry-edge cases.
 - `invalidate_active_user_cache` is tested by inserting a cached entry, calling the function, and asserting the dict is empty.
 
-### Parallel vault permission tests (`test_effective_vault_permissions_parallel.py`)
-Tests for concurrent permission queries live in `backend/tests/test_effective_vault_permissions_parallel.py`. Key patterns:
-- Uses `IsolatedAsyncioTestCase` to test the `asyncio.gather` path in `get_effective_vault_permissions`.
-- The `_SQLITE_SERIALIZED` flag in `authz_policy.py` controls whether the concurrent or sequential branch of `get_effective_vault_permissions` runs; tests may monkey-patch `authz_policy._SQLITE_SERIALIZED` to force either path (patch the module attribute — `deps.py` imports only a copy of the value, so patching `deps` does not select the branch). `backend/tests/test_d08_sequential_branch_parity.py` is the reference forcing test.
+### Vault permission query dispatch tests (`test_effective_vault_permissions_parallel.py`)
+Tests for the `get_effective_vault_permissions` query dispatch live in `backend/tests/test_effective_vault_permissions_parallel.py`. Key patterns:
+- Pins the post-#1206 contract: all four permission queries are wrapped in `asyncio.to_thread` but `asyncio.gather` is never part of the dispatch path (the concurrent gather form wedged on the caller's shared `sqlite3.Connection` under CI load — issue #1206).
+- The `_SQLITE_SERIALIZED` flag in `authz_policy.py` now only gates the once-per-process `_warn_fallback_threading()` diagnostic for non-SERIALIZED builds; tests may monkey-patch `authz_policy._SQLITE_SERIALIZED` to force the warning path (patch the module attribute — `deps.py` imports only a copy of the value, so patching `deps` does not select the path). `backend/tests/test_d08_sequential_branch_parity.py` is the reference forcing test. The behavioral overlap pin and the AST source-shape census live in `backend/tests/test_authz_policy_query_isolation.py`.
 - Seeds multiple vaults, groups, and memberships; asserts each vault returns the correct effective permission string.
 
 ### Auth override async-path tests (`test_auth_override_async_path.py`)
