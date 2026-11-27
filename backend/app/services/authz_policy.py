@@ -30,9 +30,9 @@ logger = logging.getLogger(__name__)
 # quiet arm; see #1206 evidence, Actions run 45263195017). The queries now run
 # strictly one at a time on that connection; this flag survives only to keep
 # the once-per-process _warn_fallback_threading() diagnostic for
-# non-SERIALIZED builds, where sharing a connection across threads is unsafe
-# even sequentially-guarded ("SQLite objects created in a thread can only be
-# used in that same thread" and subtle data corruption).
+# non-SERIALIZED builds (threadsafety 0/1), where SQLite does not mutex the
+# connection itself, so cross-thread use (the pool opens connections with
+# check_same_thread=False) is safe only while callers never overlap on it.
 _SQLITE_SERIALIZED = sqlite3.threadsafety == 3
 _FALLBACK_WARNED = False
 
@@ -44,10 +44,10 @@ def _warn_fallback_threading() -> None:
         return
     _FALLBACK_WARNED = True
     logger.warning(
-        "SQLite threading mode is %s; get_effective_vault_permissions runs "
-        "its permission queries sequentially on the caller's connection "
-        "(issue #1206: concurrent dispatch on a shared connection wedged "
-        "under load; queries stay sequential on SERIALIZED builds too).",
+        "SQLite threading mode is %s (not SERIALIZED); SQLite does not mutex "
+        "connections, so get_effective_vault_permissions runs its permission "
+        "queries sequentially and a request connection must never be used by "
+        "two threads at once (see issue #1206).",
         sqlite3.threadsafety,
     )
 

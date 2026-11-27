@@ -1,13 +1,13 @@
-"""Sequential-vs-concurrent branch parity for get_effective_vault_permissions.
+"""Warning-path vs default-path parity for get_effective_vault_permissions.
 
-The branch is selected by THIS module's global ``_SQLITE_SERIALIZED``
-(app/services/authz_policy.py), not by the copy re-imported into
-app.api.deps. This file forces each branch explicitly via monkeypatch and
-asserts both merge the same fixture identically, and that the sequential
-run actually executed (the once-per-process fallback warning fires when
-``_FALLBACK_WARNED`` is reset).
-
-Expected to PASS at base: both branches already exist and must agree.
+THIS module's global ``_SQLITE_SERIALIZED`` (app/services/authz_policy.py),
+not the copy re-imported into app.api.deps, is what the function reads.
+Before issue #1206 it selected a concurrent asyncio.gather branch; since
+#1206 both values dispatch the four queries sequentially and the flag only
+gates the once-per-process non-SERIALIZED warning. This file forces each
+value explicitly via monkeypatch and asserts both merge the same fixture
+identically, and that the warning path actually executed (the warning fires
+when ``_FALLBACK_WARNED`` is reset). The test name predates #1206.
 """
 
 import asyncio
@@ -94,8 +94,8 @@ async def test_sequential_and_concurrent_branches_merge_identically(
 ):
     conn, principal, vault_ids = parity_db
 
-    # Sequential leg: force the module global off, reset the once-per-process
-    # warning latch, and prove the sequential branch really ran.
+    # Warning leg: force the module global off, reset the once-per-process
+    # warning latch, and prove the non-SERIALIZED warning path really ran.
     monkeypatch.setattr(authz_policy, "_SQLITE_SERIALIZED", False)
     monkeypatch.setattr(authz_policy, "_FALLBACK_WARNED", False)
     with caplog.at_level(logging.WARNING):
@@ -110,7 +110,8 @@ async def test_sequential_and_concurrent_branches_merge_identically(
     )
     assert warning_fired is True
 
-    # Concurrent leg: force the gather branch on, same fixture, fresh read.
+    # SERIALIZED leg (the former gather branch, sequential since #1206):
+    # same fixture, fresh read.
     monkeypatch.setattr(authz_policy, "_SQLITE_SERIALIZED", True)
     result_par = await get_effective_vault_permissions(
         conn, principal, list(vault_ids)

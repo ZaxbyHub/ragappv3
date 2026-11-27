@@ -17,7 +17,9 @@ the caller's single `sqlite3.Connection`. The module-level
 `_SQLITE_SERIALIZED` flag and the `_warn_fallback_threading()` helper are
 preserved for non-SERIALIZED builds, but the flag now only gates the
 once-per-process diagnostic warning — the dispatch shape is identical in both
-modes, and the warning text says so.
+modes. The warning (logged only on non-SERIALIZED builds) now says SQLite
+does not mutex connections there, so a request connection must never be
+used by two threads at once.
 
 The no-concurrent-dispatch contract is pinned twice in the new
 `backend/tests/test_authz_policy_query_isolation.py`:
@@ -30,16 +32,19 @@ The no-concurrent-dispatch contract is pinned twice in the new
 - `test_no_shared_connection_gather` (AC3) — an AST census
   (`test_c08_seam_census` style, with a KNOWN-BAD self-test so the matcher
   cannot fail open) asserting `get_effective_vault_permissions` contains no
-  `asyncio.gather` call at all.
+  concurrent-dispatch call at all (`gather` qualified or bare,
+  `create_task`, `ensure_future`, `wait`, `TaskGroup`).
 
 `backend/tests/test_effective_vault_permissions_parallel.py`, which
 previously pinned the gather construct, now pins its absence: gather must
 never be called (any build), the four `to_thread` wraps must still happen,
 and a raising `asyncio.gather` patch must leave the call unaffected.
-`backend/tests/test_d08_sequential_branch_parity.py` (branch parity + the
-forcing-test requirement of `test_d08_ops_hygiene` C18) and the
-`TestEvaluatePolicy` behavioral baseline in `backend/tests/test_deps_auth.py`
-(59 passed) are unchanged and still green.
+`backend/tests/test_d08_sequential_branch_parity.py` (flag parity + the
+forcing-test requirement of `test_d08_ops_hygiene` C18) keeps its assertions;
+only its docstring and comments were updated, since both flag values now run
+the same sequential dispatch and the parity check is warning-path vs
+default-path. The `TestEvaluatePolicy` behavioral baseline in
+`backend/tests/test_deps_auth.py` (59 passed) is unchanged and still green.
 
 ## Why
 
@@ -65,8 +70,17 @@ None. The public surface (`get_effective_vault_permissions`,
 unchanged, as is every permission level, the superadmin short-circuit, and
 the pooled-connection lifecycle in `backend/app/models/database.py`. The
 only observable differences: permission resolution no longer overlaps
-`execute` calls on a shared connection, and the fallback warning text now
-states the queries stay sequential on SERIALIZED builds too.
+`execute` calls on a shared connection, and the non-SERIALIZED fallback
+warning text was reworded.
+
+## Known residual (out of scope)
+
+`VisionEvidenceService.run` (`backend/app/services/vision_evidence.py`) fans
+out per-artifact tasks with `asyncio.gather`, and each can call the
+request-scoped DI `evaluate` on the non-streaming chat path, so two
+`get_effective_vault_permissions` calls can still overlap on one connection
+when `multimodal_query_vision_enabled` is on (default off). This PR does not
+touch that path; it is tracked as follow-up issue #1225.
 
 ## Known caveats
 

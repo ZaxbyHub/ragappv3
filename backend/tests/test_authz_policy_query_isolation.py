@@ -183,12 +183,22 @@ def _dotted_name(node: ast.AST) -> str:
     return ""
 
 
+# Concurrent-dispatch primitives, matched on the final name segment so
+# ``asyncio.gather``, a bare ``gather`` (``from asyncio import gather``) and
+# ``tg.create_task`` are all caught. The runtime overlap pin above covers any
+# shape this list misses.
+_CONCURRENT_DISPATCH_NAMES = frozenset(
+    {"gather", "create_task", "ensure_future", "wait", "TaskGroup"}
+)
+
+
 def _gather_calls(tree: ast.AST) -> list[str]:
-    """Every asyncio.gather call site inside tree, as dotted source names."""
+    """Every concurrent-dispatch call site inside tree, as dotted source names."""
     return [
         _dotted_name(call.func)
         for call in ast.walk(tree)
-        if isinstance(call, ast.Call) and _dotted_name(call.func) == "asyncio.gather"
+        if isinstance(call, ast.Call)
+        and _dotted_name(call.func).rsplit(".", 1)[-1] in _CONCURRENT_DISPATCH_NAMES
     ]
 
 
@@ -230,6 +240,19 @@ def test_gather_matcher_flags_the_known_bad_shape():
         "    return {}\n"
     )
     assert _gather_calls(_permissions_function(known_bad)) == ["asyncio.gather"]
+
+    known_bad_variants = ast.parse(
+        "async def get_effective_vault_permissions(db, principal, vault_ids):\n"
+        "    a = await gather(asyncio.to_thread(_query_vault_members))\n"
+        "    async with asyncio.TaskGroup() as tg:\n"
+        "        tg.create_task(asyncio.to_thread(_query_group_access))\n"
+        "    return {}\n"
+    )
+    assert sorted(_gather_calls(_permissions_function(known_bad_variants))) == [
+        "asyncio.TaskGroup",
+        "gather",
+        "tg.create_task",
+    ]
 
     known_good = ast.parse(
         "async def get_effective_vault_permissions(db, principal, vault_ids):\n"
