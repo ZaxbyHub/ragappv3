@@ -566,6 +566,17 @@ class TagAssignRequestBoundTest(unittest.TestCase):
         self.assertIs(self._accepted(vault_id=1, file_ids=[], tag_ids=[1]), False)
         self.assertIs(self._accepted(vault_id=1, file_ids=[1], tag_ids=[]), False)
 
+    def test_one_over_each_limit_rejected(self):
+        # Pin the exact ceilings: one id past either bound is rejected.
+        self.assertIs(
+            self._accepted(vault_id=1, file_ids=list(range(1, 1002)), tag_ids=[1]),
+            False,
+        )
+        self.assertIs(
+            self._accepted(vault_id=1, file_ids=[1], tag_ids=list(range(1, 102))),
+            False,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
