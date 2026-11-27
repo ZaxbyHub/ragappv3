@@ -1424,7 +1424,8 @@ async def lifespan(app: FastAPI):
             # bounded by two mechanisms, and this warning names the one
             # that applies:
             #   * State A — the bounded tail exit fires (the registry is
-            #     empty, the finalizers drained, the pool closed) and
+            #     empty, the finalizers drained, the upload registry
+            #     empty — the pool state is not a condition) and
             #     os._exit ends the process, so a detached task never
             #     delays the exit;
             #   * State B — the tail exit declines (a critical workflow is
@@ -1582,13 +1583,15 @@ async def lifespan(app: FastAPI):
         from app.services import redis_io
         redis_io.shutdown_executor()
 
-    # Bounded tail exit (#799/#854, plan-critic rounds 6-10): when the
-    # production launch surface opted in, every recovery-critical workflow
-    # has completed (deny-by-default registry empty, turn finalizers
-    # drained, pool closed, upload registry empty), and logging is flushed,
-    # exit NOW instead of joining whatever non-critical worker threads are
-    # alive. The decision lives in _bounded_tail_exit so tests drive the
-    # REAL gate (os._exit patched) instead of a re-implementation.
+    # Bounded tail exit (#799/#854, plan rev 11): when the production launch
+    # surface opted in, every recovery-critical workflow has completed
+    # (deny-by-default registry empty, turn finalizers drained, upload
+    # registry empty), and logging is flushed, exit NOW instead of joining
+    # whatever non-critical worker threads are alive. The pool state is NOT
+    # a firing condition -- it is a logged cleanup outcome (the process
+    # exit reclaims an unclosed pool's connections). The decision lives in
+    # _bounded_tail_exit so tests drive the REAL gate (os._exit patched)
+    # instead of a re-implementation.
     _bounded_tail_exit(turn_finalizers_drained, pool_closed)
 
 
@@ -1747,9 +1750,12 @@ async def _finalize_turns_and_close_pool(app, remaining=None) -> tuple[bool, boo
                 pool_closed = True
             except asyncio.TimeoutError:
                 # The close did not complete inside the aggregate budget; the
-                # pool is NOT marked closed, so the bounded tail exit cannot
-                # fire. close_all is idempotent-safe for a later retry (a
-                # second close finds an empty pool).
+                # pool is NOT marked closed. That is a RESOURCE-CLEANUP
+                # outcome, not a tail-exit blocker: the gate's decision
+                # turns on the durability conditions alone, and the process
+                # exit reclaims the connections. close_all is
+                # idempotent-safe for a later retry (a second close finds an
+                # empty pool).
                 logger.warning(
                     "Pool close exceeded the aggregate shutdown budget; "
                     "continuing shutdown (pool not marked closed)"
