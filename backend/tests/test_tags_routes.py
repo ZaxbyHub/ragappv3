@@ -299,13 +299,53 @@ class TestTagAssignment(TagsTestBase):
             headers=self._headers(),
         )
         self.assertEqual(resp.status_code, 422, resp.text)
+        self.assertEqual(self._rejected_fields(resp), {"file_ids"})
         resp = self.client.post(
             "/api/tags/assign",
             json={"vault_id": 2, "file_ids": [f1], "tag_ids": list(range(1, 40001))},
             headers=self._headers(),
         )
         self.assertEqual(resp.status_code, 422, resp.text)
+        self.assertEqual(self._rejected_fields(resp), {"tag_ids"})
         self.assertEqual(self._document_tag_pairs(), set())
+
+    def _rejected_fields(self, resp):
+        return {err["loc"][-1] for err in resp.json()["detail"]}
+
+    def test_assign_one_over_each_limit_rejected_by_route(self):
+        # One id past either ceiling (1001 files / 101 tags) is a 422 naming
+        # the offending field, with nothing persisted.
+        f1 = self._seed_file(2, "a.txt")
+        t1 = self._make_tag("alpha")
+        resp = self.client.post(
+            "/api/tags/assign",
+            json={"vault_id": 2, "file_ids": list(range(1, 1002)), "tag_ids": [t1]},
+            headers=self._headers(),
+        )
+        self.assertEqual(resp.status_code, 422, resp.text)
+        self.assertEqual(self._rejected_fields(resp), {"file_ids"})
+        resp = self.client.post(
+            "/api/tags/assign",
+            json={"vault_id": 2, "file_ids": [f1], "tag_ids": list(range(1, 102))},
+            headers=self._headers(),
+        )
+        self.assertEqual(resp.status_code, 422, resp.text)
+        self.assertEqual(self._rejected_fields(resp), {"tag_ids"})
+        self.assertEqual(self._document_tag_pairs(), set())
+
+    def test_assign_at_tag_batch_limit_exact_pairs(self):
+        # At the tag batch limit (100) the real route must assign exactly the
+        # requested file-tag pairs.
+        f1 = self._seed_file(2, "a.txt")
+        tag_ids = [self._make_tag(f"tag-{i}") for i in range(100)]
+        resp = self.client.post(
+            "/api/tags/assign",
+            json={"vault_id": 2, "file_ids": [f1], "tag_ids": tag_ids},
+            headers=self._headers(),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["assigned"], 100)
+        self.assertEqual(self._document_tag_pairs(), {(f1, t) for t in tag_ids})
 
     def test_assign_at_file_batch_limit_exact_pairs_and_retry(self):
         # At the file batch limit (1000) the real route must assign exactly
