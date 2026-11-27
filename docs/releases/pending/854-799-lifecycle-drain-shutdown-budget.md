@@ -209,6 +209,8 @@ restarts working.
 - scripts/check_p03_graceful_shutdown.py (C5 structural; wired into the CI Quality contracts job by this PR)
 - scripts/check_p03_shutdown_envelope.py (new in this PR; wired into the CI Quality contracts job — it owns the ONE envelope derivation: it reads every ENFORCED term from the code that enforces it, declares the two ALLOWANCE terms explicitly, and fails if the compose grace, either native stop wait, or any surface's quoted derivation drifts from the 135 s composed envelope)
 
-UX note: stop-services.ps1 now waits up to 15 s for non-backend ports
-(frontend/Ollama) before force-stopping, instead of force-killing
-immediately — a deliberate trade for the graceful-backend default.
+UX note: only the BACKEND port gets the graceful path. The frontend and
+Ollama processes are not signal-handling console apps, so they keep the
+immediate force stop they had at base (an earlier revision of this PR
+waited 15 s for them; that wait was reverted — it bought nothing and
+made every stop 15 s slower).
