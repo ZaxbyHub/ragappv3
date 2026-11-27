@@ -128,7 +128,7 @@ class TestConcurrency:
     """Verify the four query closures are dispatched without asyncio.gather."""
 
     @pytest.mark.asyncio
-    async def test_four_queries_run_via_asyncio_gather(self, db_conn):
+    async def test_four_queries_run_via_to_thread_without_gather(self, db_conn):
         """
         get_effective_vault_permissions wraps all four query closures in
         asyncio.to_thread, and never dispatches them through asyncio.gather
@@ -382,7 +382,7 @@ class TestErrorPropagation:
                 await get_effective_vault_permissions(db_conn, {"id": 1, "role": "member"}, [1, 2, 3])
 
     @pytest.mark.asyncio
-    async def test_exception_propagates_from_gather(self, db_conn):
+    async def test_raising_gather_patch_is_inert(self, db_conn):
         """gather is no longer part of the dispatch path (issue #1206).
 
         Replacing asyncio.gather with one that immediately raises must have

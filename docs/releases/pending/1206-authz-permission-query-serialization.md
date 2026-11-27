@@ -94,4 +94,18 @@ states the queries stay sequential on SERIALIZED builds too.
   `python -m pytest tests/test_deps_auth.py -q -p no:randomly -p no:cacheprovider`
   (59 passed, the preserved behavioral baseline),
   `python -m pytest tests/test_deps_auth.py tests/test_authz_policy_query_isolation.py -q -p no:randomly -p no:cacheprovider -n auto --timeout=120`
-  (62 passed under parallel load with a bounded per-test timeout).
+  (62 passed under parallel load with a bounded per-test timeout). The
+  `-n auto` flag needs `pytest-xdist`, which is NOT in
+  `backend/requirements-dev.txt` (CI never runs `-n auto`); install it
+  separately or drop `-n auto` to run the same tests serially.
+
+## SAST baseline
+
+The added module-level comment shifts the four pre-existing
+`get_effective_vault_permissions` B608 findings (the `IN ({placeholders})`
+f-string queries, whose placeholders are a fixed `?` list with every value
+bound as a parameter) down seven lines. `run_bandit.py` keys findings by
+line, so `backend/security/bandit-baseline.json` was regenerated with
+`python scripts/run_bandit.py --update-baseline`; the only change is those
+four entries' line numbers/snippets (163/170/183/193 to 170/177/190/200)
+and the file's `loc` count. No finding was added or removed.

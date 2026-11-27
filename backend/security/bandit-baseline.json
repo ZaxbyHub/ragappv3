@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 58,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 104861,
+      "loc": 104855,
       "nosec": 0,
       "skipped_tests": 73
     },
@@ -764,7 +764,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 4,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 229,
+      "loc": 223,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3557,30 +3557,9 @@
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "162         return db.execute(\n163             f\"\"\"SELECT vault_id, permission FROM vault_members\n164                 WHERE user_id = ? AND vault_id IN ({placeholders})\"\"\",\n165             (user_id, *normalized_ids),\n",
+      "code": "169         return db.execute(\n170             f\"\"\"SELECT vault_id, permission FROM vault_members\n171                 WHERE user_id = ? AND vault_id IN ({placeholders})\"\"\",\n172             (user_id, *normalized_ids),\n",
       "col_offset": 12,
       "end_col_offset": 69,
-      "filename": "backend/app/services/authz_policy.py",
-      "issue_confidence": "MEDIUM",
-      "issue_cwe": {
-        "id": 89,
-        "link": "https://cwe.mitre.org/data/definitions/89.html"
-      },
-      "issue_severity": "MEDIUM",
-      "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 163,
-      "line_range": [
-        163,
-        164
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
-      "test_id": "B608",
-      "test_name": "hardcoded_sql_expressions"
-    },
-    {
-      "code": "169         return db.execute(\n170             f\"\"\"SELECT vga.vault_id, vga.permission FROM vault_group_access vga\n171                JOIN group_members gm ON vga.group_id = gm.group_id\n172                JOIN groups g ON g.id = gm.group_id\n173                WHERE gm.user_id = ? AND vga.vault_id IN ({placeholders})\n174                  AND EXISTS (\n175                      SELECT 1 FROM org_members om\n176                      WHERE om.org_id = g.org_id AND om.user_id = ?\n177                  )\"\"\",\n178             (user_id, *normalized_ids, user_id),\n",
-      "col_offset": 12,
-      "end_col_offset": 21,
       "filename": "backend/app/services/authz_policy.py",
       "issue_confidence": "MEDIUM",
       "issue_cwe": {
@@ -3592,20 +3571,14 @@
       "line_number": 170,
       "line_range": [
         170,
-        171,
-        172,
-        173,
-        174,
-        175,
-        176,
-        177
+        171
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "182         return db.execute(\n183             f\"\"\"SELECT v.id FROM vaults v\n184                 WHERE v.visibility = 'public' AND v.id IN ({placeholders})\n185                 AND (v.org_id IS NULL OR EXISTS (\n186                     SELECT 1 FROM org_members WHERE org_id = v.org_id AND user_id = ?\n187                 ))\"\"\",\n188             (*normalized_ids, user_id),\n",
+      "code": "176         return db.execute(\n177             f\"\"\"SELECT vga.vault_id, vga.permission FROM vault_group_access vga\n178                JOIN group_members gm ON vga.group_id = gm.group_id\n179                JOIN groups g ON g.id = gm.group_id\n180                WHERE gm.user_id = ? AND vga.vault_id IN ({placeholders})\n181                  AND EXISTS (\n182                      SELECT 1 FROM org_members om\n183                      WHERE om.org_id = g.org_id AND om.user_id = ?\n184                  )\"\"\",\n185             (user_id, *normalized_ids, user_id),\n",
       "col_offset": 12,
       "end_col_offset": 21,
       "filename": "backend/app/services/authz_policy.py",
@@ -3616,20 +3589,47 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 183,
+      "line_number": 177,
       "line_range": [
+        177,
+        178,
+        179,
+        180,
+        181,
+        182,
         183,
-        184,
-        185,
-        186,
-        187
+        184
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "192         return db.execute(\n193             f\"\"\"SELECT v.id FROM vaults v\n194                 WHERE v.visibility = 'org' AND v.id IN ({placeholders})\n195                 AND v.org_id IS NOT NULL\n196                 AND EXISTS (\n197                     SELECT 1 FROM org_members WHERE org_id = v.org_id AND user_id = ?\n198                 )\"\"\",\n199             (*normalized_ids, user_id),\n",
+      "code": "189         return db.execute(\n190             f\"\"\"SELECT v.id FROM vaults v\n191                 WHERE v.visibility = 'public' AND v.id IN ({placeholders})\n192                 AND (v.org_id IS NULL OR EXISTS (\n193                     SELECT 1 FROM org_members WHERE org_id = v.org_id AND user_id = ?\n194                 ))\"\"\",\n195             (*normalized_ids, user_id),\n",
+      "col_offset": 12,
+      "end_col_offset": 21,
+      "filename": "backend/app/services/authz_policy.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 89,
+        "link": "https://cwe.mitre.org/data/definitions/89.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Possible SQL injection vector through string-based query construction.",
+      "line_number": 190,
+      "line_range": [
+        190,
+        191,
+        192,
+        193,
+        194
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
+      "test_id": "B608",
+      "test_name": "hardcoded_sql_expressions"
+    },
+    {
+      "code": "199         return db.execute(\n200             f\"\"\"SELECT v.id FROM vaults v\n201                 WHERE v.visibility = 'org' AND v.id IN ({placeholders})\n202                 AND v.org_id IS NOT NULL\n203                 AND EXISTS (\n204                     SELECT 1 FROM org_members WHERE org_id = v.org_id AND user_id = ?\n205                 )\"\"\",\n206             (*normalized_ids, user_id),\n",
       "col_offset": 12,
       "end_col_offset": 20,
       "filename": "backend/app/services/authz_policy.py",
@@ -3640,14 +3640,14 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 193,
+      "line_number": 200,
       "line_range": [
-        193,
-        194,
-        195,
-        196,
-        197,
-        198
+        200,
+        201,
+        202,
+        203,
+        204,
+        205
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
