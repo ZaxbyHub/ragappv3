@@ -418,6 +418,41 @@ def _guarded_async_from_url(url, *args, **kwargs):
     return _orig_async_from_url(url, *args, **kwargs)
 
 
+@pytest.fixture(autouse=True)
+def _reset_curator_shutdown_flag():
+    """Clear the curator cooperative-shutdown flag after every test.
+
+    Any test that enters a real lifespan shutdown sets
+    wiki_compiler.CURATOR_SHUTDOWN (#854/#799); a set flag makes every
+    later curator chunk in this worker return (None, None) — the exact
+    cross-file pollution that failed the wiki-curator suites on a shared
+    xdist worker while the same files passed in isolation. Production
+    clears the flag at the next lifespan startup; tests must not leak it.
+    """
+    yield
+    try:
+        from app.services.wiki_compiler import (
+            CURATOR_SHUTDOWN,
+            _get_curator_offload_executor,
+        )
+
+        CURATOR_SHUTDOWN.clear()
+        # A real-lifespan shutdown also SHUT the offload executor down; a
+        # later test that wraps or submits to the module global would hit a
+        # dead pool (RuntimeError, never-awaited coroutine). The accessor
+        # recreates a shut-down pool, mirroring production's recreate-on-
+        # demand contract.
+        _get_curator_offload_executor()
+    except Exception:  # noqa: BLE001 — module not importable in this test env
+        pass
+    try:
+        from app.services.document_processor import _get_parse_executor
+
+        _get_parse_executor()
+    except Exception:  # noqa: BLE001 — module not importable in this test env
+        pass
+
+
 def pytest_configure(config):
     """Called before test collection.
 
@@ -487,6 +522,7 @@ def pytest_configure(config):
     # embedded/TestClient lifespans take the normal exit path. A companion
     # test (test_p03_shutdown_ownership) pins this pop.
     os.environ.pop("RAGAPP_BOUNDED_EXIT", None)
+
 
     # A test must never connect to a Redis instance it did not start.
     # Guard redis.from_url for the whole session; opt out explicitly
