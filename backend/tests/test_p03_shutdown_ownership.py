@@ -351,6 +351,39 @@ class TestExhaustedBudgetTailExit(unittest.IsolatedAsyncioTestCase):
             "exit before Compose force-terminates it (frozen AC12)",
         )
 
+    async def test_the_real_drain_path_reaches_the_same_state(self):
+        """The LIVE finalizer drain (no mocked result) reaches (True, False).
+
+        The other case mocks ``shutdown_turn_finalizers`` to control the
+        drain's outcome; this one runs the REAL drain with no live
+        producers, so the exhausted-budget state is reached through the
+        production path rather than a stub.
+        """
+        from app.lifespan import _finalize_turns_and_close_pool
+
+        calls = []
+
+        class _Pool:
+            def close_all(self):
+                calls.append("closed")
+
+        class _State:
+            db_pool = _Pool()
+
+        class _App:
+            state = _State()
+
+        drained, pool_closed = await _finalize_turns_and_close_pool(
+            _App(), remaining=lambda: 0.0
+        )
+        self.assertTrue(
+            drained,
+            "the real drain with no live producers must report a completed "
+            "drain",
+        )
+        self.assertFalse(pool_closed, "the exhausted budget leaves the pool open")
+        self.assertEqual(calls, [], "the exhausted budget must not close the pool")
+
     async def test_incomplete_finalizers_never_fire_the_tail_exit(self):
         from app.lifespan import _bounded_tail_exit, _finalize_turns_and_close_pool
 
