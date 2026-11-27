@@ -17,7 +17,7 @@ admin-user creation contract:
   other fields on success and on dialog close.
 - The dialog states that the password must be changed at first sign-in: a
   `text-sm text-muted-foreground` note ("The user must change this password
-  at their first sign-in.", `id="first-signin-note") sits under the
+  at their first sign-in.", `id="first-signin-note"`) sits under the
   PasswordRequirements help text. Both password inputs reference it via
   `aria-describedby` (the primary input lists
   `password-requirements first-signin-note`, the confirm input uses
@@ -31,10 +31,18 @@ confirm field (behavior-reflecting, not test-weakening):
 
 New regression spec:
 `frontend/src/pages/AdminUsersPage/create-user-dialog.issue1189.test.tsx`
-(4 tests — two password fields present + required, the first-sign-in
+(5 tests — two password fields present + required, the first-sign-in
 statement rendered and wired to both inputs via `aria-describedby`, mismatch
-blocks `onCreate`, empty confirm blocks submission natively, matching
+blocks `onCreate`, empty confirm blocks submission natively, empty confirm
+is still blocked by the JS gate when native validation is bypassed, matching
 entries call `onCreate`).
+
+Edit-dialog and labeled row-action coverage named in the issue's in-scope
+list already exists on master and is unchanged by this PR:
+`AdminUsersPage.error-handling.test.tsx` drives the `Edit user <name>` /
+`Reset password for <name>` / `Manage groups for <name>` row actions and the
+edit dialog, and `AdminUsersPage.superadminTargetGating.issue722.test.tsx`
+pins the labeled row actions per target.
 
 ## Why
 

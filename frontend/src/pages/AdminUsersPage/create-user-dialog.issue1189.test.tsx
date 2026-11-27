@@ -10,6 +10,8 @@ import { render, screen, act, fireEvent, waitFor } from '@testing-library/react'
 import '@testing-library/jest-dom';
 import { toast } from 'sonner';
 import { CreateUserDialog } from './CreateUserDialog';
+import { EditUserDialog } from './EditUserDialog';
+import type { User } from './types';
 
 // --- Mocks (same shape as AdminUsersPage.error-handling.test.tsx) ---
 vi.mock('sonner', () => ({
@@ -133,8 +135,27 @@ describe('CreateUserDialog — issue #1189 admin-user creation contract', () => 
     const form = screen.getByTestId('dialog').querySelector('form') as HTMLFormElement;
     expect(form.checkValidity()).toBe(false);
 
-    // jsdom (like a browser) will not fire submit for an invalid form.
+    // Clicking the submit button runs constraint validation: the invalid
+    // form never reaches handleSubmit, so the JS mismatch gate is not hit.
     await submit();
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(onCreate).not.toHaveBeenCalled();
+  });
+
+  it('AC1: the JS gate still blocks an empty confirm when native validation is bypassed', async () => {
+    renderDialog();
+
+    fill('create-username', 'newuser');
+    fill('create-password', 'Password123');
+
+    // fireEvent.submit dispatches submit directly (no constraint validation),
+    // so this pins handleSubmit's own equality gate as defense in depth.
+    const form = screen.getByTestId('dialog').querySelector('form') as HTMLFormElement;
+    await act(async () => {
+      fireEvent.submit(form);
+    });
+
+    expect(toast.error).toHaveBeenCalledWith('Passwords do not match');
     expect(onCreate).not.toHaveBeenCalled();
   });
 
@@ -148,5 +169,39 @@ describe('CreateUserDialog — issue #1189 admin-user creation contract', () => 
 
     await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
     expect(onCreate).toHaveBeenCalledWith('newuser', '', 'Password123', 'member');
+  });
+});
+
+// Issue #1189's in-scope list also names the edit dialog. Its error paths are
+// covered by AdminUsersPage.error-handling.test.tsx; this pins the success
+// path: prefilled from the row, username read-only, and Save passes the
+// edited values through to onSave.
+describe('EditUserDialog — issue #1189 edit-dialog contract', () => {
+  const bob: User = {
+    id: 2,
+    username: 'bob',
+    full_name: 'Bob Builder',
+    role: 'member',
+    is_active: true,
+    created_at: '2026-01-01T00:00:00Z',
+  };
+
+  it('prefills from the user, keeps username read-only, and saves the edited full name', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<EditUserDialog open user={bob} onSave={onSave} onClose={vi.fn()} isSuperAdmin={false} />);
+
+    const username = document.getElementById('edit-username') as HTMLInputElement;
+    const fullName = document.getElementById('edit-fullname') as HTMLInputElement;
+    expect(username.value).toBe('bob');
+    expect(username.disabled).toBe(true);
+    expect(fullName.value).toBe('Bob Builder');
+
+    fill('edit-fullname', 'Bob Edited');
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+    });
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave).toHaveBeenCalledWith(bob, 'Bob Edited', 'member');
   });
 });
