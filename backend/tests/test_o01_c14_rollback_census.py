@@ -185,9 +185,11 @@ _TXN_CONTEXT_NAMES = frozenset({"transaction", "_write_txn"})
 
 def _is_txn_context(node: ast.AST) -> bool:
     """True for ``with X.transaction():`` / ``with X._write_txn():`` — the
-    stores' own transaction context managers, which commit on a normal exit
-    and roll back on an exception, so they finalize every path out of their
-    body (``WikiStore.transaction``, ``JobLease._write_txn``)."""
+    stores' own transaction context managers (``WikiStore.transaction``,
+    ``JobLease._write_txn``). When one ENCLOSES the RETURNING statement it
+    owns that transaction — committing on a normal exit, rolling back on an
+    exception — so it finalizes every path out of its body. That holds only
+    for the enclosing (climb) case; see ``_zero_path_verdict``."""
     if not isinstance(node, (ast.With, ast.AsyncWith)):
         return False
     for item in node.items:
@@ -244,8 +246,12 @@ def _zero_path_verdict(stmts, falls_off_end: bool = False) -> str:
     enclosing handler may roll back), do not flag.
 
     ``try`` / ``with`` statements on the path are descended into (to any
-    depth), so a rollback wrapped in one still counts as reached; a store
-    transaction context manager on the path finalizes itself (clean).
+    depth), so a rollback wrapped in one still counts as reached. A store
+    transaction context manager opened AFTER the guard is descended into
+    like any other ``with``: it does not own the UPDATE's still-open
+    implicit transaction (``_write_txn`` yields without finalizing when
+    ``in_transaction`` is already true; ``transaction()``'s nested ``BEGIN``
+    would raise), so it cannot clean the no-row path.
     """
     for stmt in stmts:
         if isinstance(stmt, ast.Expr) and _is_rollback_call(stmt.value):
@@ -264,8 +270,6 @@ def _zero_path_verdict(stmts, falls_off_end: bool = False) -> str:
             )
             if inner != "unclear":
                 return inner
-        if _is_txn_context(stmt):
-            return "clean"
         if isinstance(stmt, (ast.With, ast.AsyncWith)):
             inner = _zero_path_verdict(stmt.body)
             if inner != "unclear":
@@ -717,6 +721,18 @@ class TestZeroRowPathsRollBack(unittest.TestCase):
             "        with self._lock:\n" + indented + "        return None\n"
         )
         self.assertEqual(_returning_zero_row_exits_missing_rollback(lock), [7])
+        # A transaction block opened AFTER the guard does not own the
+        # UPDATE's open implicit transaction — returning inside it is dirty.
+        for ctx in ("self.transaction()", "self._write_txn()"):
+            with self.subTest(after_guard=ctx):
+                tree = ast.parse(
+                    "class S:\n"
+                    "    def f(self):\n" + body + f"        with {ctx}:\n"
+                    "            return None\n"
+                )
+                self.assertEqual(
+                    _returning_zero_row_exits_missing_rollback(tree), [6]
+                )
 
     def test_returning_climb_reads_try_else_and_conditional_rollback(self):
         """PR #1137 review: the climb out of a ``try:`` body runs its
