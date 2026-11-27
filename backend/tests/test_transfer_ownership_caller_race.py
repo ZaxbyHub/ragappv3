@@ -174,7 +174,12 @@ class _ZeroRowConn:
 
 
 class _RaceEnv:
-    """Per-test world: fresh db, real pool, patched org-route pool binding."""
+    """Per-test world: fresh db, real pool, per-caller facade connections.
+
+    The org routes take a request-scoped ``db=`` connection (#798 AC4), so
+    direct handler calls check their connection out of the facade at the
+    call site — one fresh connection per simulated request, exactly as the
+    pre-migration handler checkout did."""
 
     def __init__(self, tmp_path: Path) -> None:
         _pool_cache.clear()
@@ -182,8 +187,6 @@ class _RaceEnv:
         init_db(self.db_path)
         self.pool = SQLiteConnectionPool(self.db_path, max_size=6)
         self.facade: object = _MultiConnPool(self.pool)
-        self._saved_get_pool = org_mod.get_pool
-        org_mod.get_pool = lambda _p: self.facade
 
     def seed_org(self, second_member_role: str = "member") -> None:
         """Users 1 (org owner), 2 (member), 3 (member), 99 (superadmin);
@@ -282,7 +285,6 @@ class _RaceEnv:
         return [row[0] for row in rows]
 
     def close(self) -> None:
-        org_mod.get_pool = self._saved_get_pool
         for conn in list(getattr(self.facade, "_out", [])):
             try:
                 self.pool.release_connection(conn)
@@ -343,33 +345,43 @@ def _at_dispatch_interleave(fn_name: str, interleave):
     return build, state
 
 
-def _drive_interleaved(build, drive_factory) -> dict:  # noqa: ANN001
-    """Run the driven handler with the wrapped asyncio.to_thread."""
+def _drive_interleaved(build, env, drive_factory) -> dict:  # noqa: ANN001
+    """Run the driven handler with the wrapped asyncio.to_thread.
+
+    ``drive_factory`` receives the request-scoped ``db=`` connection,
+    checked out of the env facade per simulated request and released by
+    this CALLER afterwards (the handler no longer releases db, #798 AC4)."""
     real_to_thread = asyncio.to_thread
     scripted = build(real_to_thread)
     outcome: dict = {}
 
     async def drive() -> None:
         asyncio.to_thread = scripted
+        conn = await env.facade.get_connection_async()
         try:
-            result = await drive_factory()
+            result = await drive_factory(conn)
             outcome["ok"] = str(result)
         except HTTPException as exc:
             outcome["refused_status"] = exc.status_code
         finally:
+            env.facade.release_connection(conn)
             asyncio.to_thread = real_to_thread
 
     asyncio.run(drive())
     return outcome
 
 
-def _drive(drive_factory) -> dict:  # noqa: ANN001
-    """Run the driven handler without any to_thread patching."""
+def _drive(env, drive_factory) -> dict:  # noqa: ANN001
+    """Run the driven handler without any to_thread patching. The driven
+    call takes its request-scoped ``db=`` connection from the env facade
+    (fresh per simulated request) and this CALLER releases it afterwards
+    (the handler no longer releases db, #798 AC4)."""
     outcome: dict = {}
 
     async def drive() -> None:
+        conn = await env.facade.get_connection_async()
         try:
-            result = await drive_factory()
+            result = await drive_factory(conn)
             outcome["ok"] = str(result)
         except HTTPException as exc:
             outcome["refused_status"] = exc.status_code
@@ -401,24 +413,32 @@ def test_window_a_caller_demoted_before_transaction_is_refused(tmp_path: Path) -
 
         async def racing_superadmin_transfer() -> None:
             # Demotes user 1 (the driven caller) off the owner role after
-            # the caller's own pre-check read completed.
-            await transfer_ownership(
-                ORG_ID,
-                TransferOwnershipRequest(new_owner_user_id=3),
-                user=SUPERADMIN,
-                _csrf_token="t",
-            )
+            # the caller's own pre-check read completed. Runs on its own
+            # fresh facade connection (db= at the call site).
+            conn = await env.facade.get_connection_async()
+            try:
+                await transfer_ownership(
+                    ORG_ID,
+                    TransferOwnershipRequest(new_owner_user_id=3),
+                    user=SUPERADMIN,
+                    _csrf_token="t",
+                    db=conn,
+                )
+            finally:
+                env.facade.release_connection(conn)
 
         build, state = _after_read_interleave(
             _NEW_OWNER_READ_SQL, racing_superadmin_transfer
         )
         outcome = _drive_interleaved(
             build,
-            lambda: transfer_ownership(
+            env,
+            lambda db: transfer_ownership(
                 ORG_ID,
                 TransferOwnershipRequest(new_owner_user_id=2),
                 user=OWNER,
                 _csrf_token="t",
+                db=db,
             ),
         )
 
@@ -457,18 +477,26 @@ def test_window_b_new_owner_removed_before_transaction_is_refused(
         env.seed_org()
 
         async def racing_member_removal() -> None:
-            await remove_org_member(ORG_ID, 2, user=OWNER, _csrf_token="t")
+            conn = await env.facade.get_connection_async()
+            try:
+                await remove_org_member(
+                    ORG_ID, 2, user=OWNER, _csrf_token="t", db=conn
+                )
+            finally:
+                env.facade.release_connection(conn)
 
         build, state = _after_read_interleave(
             _NEW_OWNER_READ_SQL, racing_member_removal
         )
         outcome = _drive_interleaved(
             build,
-            lambda: transfer_ownership(
+            env,
+            lambda db: transfer_ownership(
                 ORG_ID,
                 TransferOwnershipRequest(new_owner_user_id=2),
                 user=OWNER,
                 _csrf_token="t",
+                db=db,
             ),
         )
 
@@ -510,12 +538,14 @@ def test_zero_row_promote_refuses_and_retains_old_owner(tmp_path: Path) -> None:
         env.facade = _SingleConnFacade(env.pool, wrapped)
 
         outcome = _drive(
-            lambda: transfer_ownership(
+            env,
+            lambda db: transfer_ownership(
                 ORG_ID,
                 TransferOwnershipRequest(new_owner_user_id=2),
                 user=OWNER,
                 _csrf_token="t",
-            )
+                db=db,
+            ),
         )
 
         assert wrapped.shim_fired, (
@@ -549,21 +579,28 @@ def test_same_family_remove_org_member_demoted_caller_is_refused(
 
         async def racing_caller_demotion() -> None:
             # Demote user 2 (the driven caller) from org admin to plain
-            # member after their privilege check has already passed.
-            await org_mod.update_org_member_role(
-                ORG_ID,
-                2,
-                org_mod.OrgMemberUpdateRequest(role="member"),
-                user=OWNER,
-                _csrf_token="t",
-            )
+            # member after their privilege check has already passed. Runs
+            # on its own fresh facade connection (db= at the call site).
+            conn = await env.facade.get_connection_async()
+            try:
+                await org_mod.update_org_member_role(
+                    ORG_ID,
+                    2,
+                    org_mod.OrgMemberUpdateRequest(role="member"),
+                    user=OWNER,
+                    _csrf_token="t",
+                    db=conn,
+                )
+            finally:
+                env.facade.release_connection(conn)
 
         build, state = _at_dispatch_interleave("_remove_member", racing_caller_demotion)
         outcome = _drive_interleaved(
             build,
-            lambda: remove_org_member(
+            env,
+            lambda db: remove_org_member(
                 ORG_ID, 3, user={"id": 2, "username": "admin2", "role": "member"},
-                _csrf_token="t",
+                _csrf_token="t", db=db,
             ),
         )
 
@@ -604,20 +641,27 @@ def test_same_family_superadmin_org_admin_demoted_caller_is_refused(
         async def racing_caller_demotion() -> None:
             # Demote user 99 (the driven caller, a superadmin who holds the
             # org-admin role) to plain org member after their privilege
-            # check has already passed.
-            await org_mod.update_org_member_role(
-                ORG_ID,
-                99,
-                org_mod.OrgMemberUpdateRequest(role="member"),
-                user=OWNER,
-                _csrf_token="t",
-            )
+            # check has already passed. Runs on its own fresh facade
+            # connection (db= at the call site).
+            conn = await env.facade.get_connection_async()
+            try:
+                await org_mod.update_org_member_role(
+                    ORG_ID,
+                    99,
+                    org_mod.OrgMemberUpdateRequest(role="member"),
+                    user=OWNER,
+                    _csrf_token="t",
+                    db=conn,
+                )
+            finally:
+                env.facade.release_connection(conn)
 
         build, state = _at_dispatch_interleave("_remove_member", racing_caller_demotion)
         outcome = _drive_interleaved(
             build,
-            lambda: remove_org_member(
-                ORG_ID, 3, user=SUPERADMIN, _csrf_token="t"
+            env,
+            lambda db: remove_org_member(
+                ORG_ID, 3, user=SUPERADMIN, _csrf_token="t", db=db
             ),
         )
 

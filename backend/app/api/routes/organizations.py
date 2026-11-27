@@ -11,9 +11,8 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
-from app.api.deps import UserRole, require_role
-from app.config import settings
-from app.models.database import get_pool, transaction_context
+from app.api.deps import UserRole, get_db, require_role
+from app.models.database import transaction_context
 from app.security import csrf_protect
 from app.services.authz_policy import (
     direct_vault_admin_ids,
@@ -204,10 +203,12 @@ def _is_org_admin_or_owner(conn: sqlite3.Connection, org_id: int, user_id: int) 
 
 @router.get("", include_in_schema=False)
 @router.get("/")
-async def list_organizations(user: dict = Depends(require_role("member"))):
+async def list_organizations(
+    user: dict = Depends(require_role("member")),
+    db: sqlite3.Connection = Depends(get_db),
+):
     """List organizations. Superadmin/admin see all; others see their own."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         user_role = user.get("role", "")
         if user_role in ("superadmin", "admin"):
@@ -253,7 +254,8 @@ async def list_organizations(user: dict = Depends(require_role("member"))):
             )
         return {"organizations": organizations, "total": len(organizations)}
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.post("", include_in_schema=False)
@@ -261,11 +263,11 @@ async def list_organizations(user: dict = Depends(require_role("member"))):
 async def create_organization(
     req: OrganizationCreateRequest,
     user: dict = Depends(require_role("admin")),
+    db: sqlite3.Connection = Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Create a new organization with the current user as owner."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         slug = _generate_slug(req.name)
         try:
@@ -329,17 +331,18 @@ async def create_organization(
             "vault_count": row[7] or 0,
         }
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.get("/{org_id}")
 async def get_organization(
     org_id: int,
     user: dict = Depends(require_role("member")),
+    db: sqlite3.Connection = Depends(get_db),
 ):
     """Get organization details with members list."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         # Check organization exists first (before revealing membership info)
         cursor = await asyncio.to_thread(
@@ -411,7 +414,8 @@ async def get_organization(
         org["members"] = members
         return org
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.patch("/{org_id}")
@@ -419,11 +423,11 @@ async def update_organization(
     org_id: int,
     req: OrganizationUpdateRequest,
     user: dict = Depends(require_role("member")),
+    db: sqlite3.Connection = Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Update organization details (admin or owner only)."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -537,17 +541,18 @@ async def update_organization(
 
         return await asyncio.to_thread(_update_organization)
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.get("/{org_id}/members")
 async def list_org_members(
     org_id: int,
     user: dict = Depends(require_role("member")),
+    db: sqlite3.Connection = Depends(get_db),
 ):
     """List members of an organization."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -593,7 +598,8 @@ async def list_org_members(
             )
         return {"members": members}
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.post("/{org_id}/members")
@@ -601,11 +607,11 @@ async def add_org_member(
     org_id: int,
     req: OrgMemberRequest,
     user: dict = Depends(require_role("member")),
+    db: sqlite3.Connection = Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Add a member to organization (admin or owner only)."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -726,7 +732,8 @@ async def add_org_member(
 
         return await asyncio.to_thread(_add_member)
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 # ---------------------------------------------------------------------------
@@ -771,11 +778,11 @@ async def create_org_invite(
     org_id: int,
     req: OrgInviteCreateRequest,
     user: dict = Depends(require_role("member")),
+    db: sqlite3.Connection = Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Create an invite for a user to join an organization (admin/owner only)."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -839,7 +846,8 @@ async def create_org_invite(
 
         return await asyncio.to_thread(_create_invite)
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.post("/{org_id}/invites/{invite_id}/resend", status_code=201)
@@ -847,11 +855,11 @@ async def resend_org_invite(
     org_id: int,
     invite_id: int,
     user: dict = Depends(require_role("member")),
+    db: sqlite3.Connection = Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Resend an invite with a new token (admin/owner only). Invalidates old token."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -937,7 +945,8 @@ async def resend_org_invite(
 
         return await asyncio.to_thread(_resend_invite)
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.post("/{org_id}/invites/{invite_id}/revoke")
@@ -945,11 +954,11 @@ async def revoke_org_invite(
     org_id: int,
     invite_id: int,
     user: dict = Depends(require_role("member")),
+    db: sqlite3.Connection = Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Revoke an invite (admin/owner only). Idempotent-ish."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -1010,17 +1019,18 @@ async def revoke_org_invite(
 
         return await asyncio.to_thread(_revoke_invite)
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.get("/{org_id}/invites")
 async def list_org_invites(
     org_id: int,
     user: dict = Depends(require_role("member")),
+    db: sqlite3.Connection = Depends(get_db),
 ):
     """List invites for an organization (admin/owner only)."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -1061,13 +1071,15 @@ async def list_org_invites(
             )
         return {"invites": invites}
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.post("/invites/accept")
 async def accept_org_invite(
     req: OrgInviteAcceptRequest,
     user: dict = Depends(require_role("member")),
+    db: sqlite3.Connection = Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Accept an organization invite using a token.
@@ -1077,8 +1089,7 @@ async def accept_org_invite(
     """
     token_hash = hashlib.sha256(req.token.encode()).hexdigest()
 
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         # Look up invite by token hash
         cursor = await asyncio.to_thread(
@@ -1181,7 +1192,8 @@ async def accept_org_invite(
             "joined_at": row[4],
         }
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.patch("/{org_id}/members/{member_user_id}")
@@ -1190,11 +1202,11 @@ async def update_org_member_role(
     member_user_id: int,
     req: OrgMemberUpdateRequest,
     user: dict = Depends(require_role("member")),
+    db: sqlite3.Connection = Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Update a member's role (admin or owner only)."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -1299,7 +1311,8 @@ async def update_org_member_role(
             "joined_at": row[4],
         }
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.delete("/{org_id}/members/{member_user_id}")
@@ -1307,11 +1320,11 @@ async def remove_org_member(
     org_id: int,
     member_user_id: int,
     user: dict = Depends(require_role("member")),
+    db: sqlite3.Connection = Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Remove a member from organization (admin or owner only)."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -1435,7 +1448,8 @@ async def remove_org_member(
             "user_id": member_user_id,
         }
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 class TransferOwnershipRequest(BaseModel):
@@ -1447,11 +1461,11 @@ async def transfer_ownership(
     org_id: int,
     req: TransferOwnershipRequest,
     user: dict = Depends(require_role("member")),
+    db: sqlite3.Connection = Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Transfer organization ownership to another member (current owner or superadmin only)."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         cursor = await asyncio.to_thread(
             conn.execute,
@@ -1549,18 +1563,19 @@ async def transfer_ownership(
             "new_owner_user_id": req.new_owner_user_id,
         }
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.delete("/{org_id}")
 async def delete_organization(
     org_id: int,
     user: dict = Depends(require_role("superadmin")),
+    db: sqlite3.Connection = Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Delete organization and all associated data (superadmin only)."""
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -1607,7 +1622,8 @@ async def delete_organization(
             "org_id": org_id,
         }
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 # ---------------------------------------------------------------------------
@@ -1635,6 +1651,7 @@ async def set_prompt_override(
     org_id: int,
     req: PromptOverrideSetRequest,
     user: dict = Depends(require_role("member")),
+    db: sqlite3.Connection = Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Set (or update) an organization's prompt version override.
@@ -1643,8 +1660,7 @@ async def set_prompt_override(
     must exist (404 if not). Returns the effective version (which may be
     the global active if no override is set).
     """
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         # Check org exists
         cursor = await asyncio.to_thread(
@@ -1703,13 +1719,15 @@ async def set_prompt_override(
             org_id=org_id,
         )
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.delete("/{org_id}/prompt-override")
 async def clear_prompt_override(
     org_id: int,
     user: dict = Depends(require_role("member")),
+    db: sqlite3.Connection = Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Clear an organization's prompt version override.
@@ -1717,8 +1735,7 @@ async def clear_prompt_override(
     Only org admins and owners may clear the override. After clearing,
     the org uses the global active version. Returns the global active version.
     """
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         # Check org exists
         cursor = await asyncio.to_thread(
@@ -1770,20 +1787,21 @@ async def clear_prompt_override(
             org_id=org_id,
         )
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)
 
 
 @router.get("/{org_id}/prompt-override")
 async def get_prompt_override(
     org_id: int,
     user: dict = Depends(require_role("member")),
+    db: sqlite3.Connection = Depends(get_db),
 ):
     """Get the effective prompt version for an org (override or global active).
 
     Does not require org admin/owner — any org member can read the effective version.
     """
-    pool = get_pool(str(settings.sqlite_path))
-    conn = await pool.get_connection_async()
+    conn = db  # request-scoped Depends(get_db) connection (#798 AC4)
     try:
         # Check org exists
         cursor = await asyncio.to_thread(
@@ -1825,4 +1843,5 @@ async def get_prompt_override(
             org_id=org_id,
         )
     finally:
-        pool.release_connection(conn)
+        pass  # conn is the request-scoped Depends(get_db) connection;
+        # the dependency releases it (#798 AC4)

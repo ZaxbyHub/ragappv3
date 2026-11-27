@@ -41,7 +41,6 @@ from fastapi import HTTPException  # noqa: E402
 from starlette.requests import Request  # noqa: E402
 
 from app.api import deps as deps_mod
-from app.api.routes import organizations as orgs_mod  # noqa: E402
 from app.api.routes.organizations import (  # noqa: E402
     TransferOwnershipRequest,
     transfer_ownership,
@@ -169,10 +168,8 @@ def test_delete_user_racing_ownership_transfer_is_refused(tmp_path: Path) -> Non
 
     facade = _MultiConnPool(real_pool)
     saved_deps_get_pool = deps_mod.get_pool
-    saved_orgs_get_pool = orgs_mod.get_pool
     saved_data_dir = settings.data_dir
     deps_mod.get_pool = lambda _p: facade
-    orgs_mod.get_pool = lambda _p: facade
     settings.data_dir = tmp_path
 
     real_to_thread = asyncio.to_thread
@@ -186,12 +183,17 @@ def test_delete_user_racing_ownership_transfer_is_refused(tmp_path: Path) -> Non
         # then run the original call. Every other to_thread passes through.
         if getattr(func, "__name__", "") == "_vaults_orphaned_by_user_delete" and not race["fired"]:
             race["fired"] = True
-            await transfer_ownership(
-                ORG_ID,
-                TransferOwnershipRequest(new_owner_user_id=VICTIM_USER_ID),
-                user=OWNER,
-                _csrf_token="t",
-            )
+            race_conn = await facade.get_connection_async()
+            try:
+                await transfer_ownership(
+                    ORG_ID,
+                    TransferOwnershipRequest(new_owner_user_id=VICTIM_USER_ID),
+                    user=OWNER,
+                    _csrf_token="t",
+                    db=race_conn,
+                )
+            finally:
+                facade.release_connection(race_conn)
         return await real_to_thread(func, *args, **kwargs)
 
     outcome: dict = {}
@@ -216,7 +218,6 @@ def test_delete_user_racing_ownership_transfer_is_refused(tmp_path: Path) -> Non
     finally:
         asyncio.to_thread = real_to_thread
         deps_mod.get_pool = saved_deps_get_pool
-        orgs_mod.get_pool = saved_orgs_get_pool
         settings.data_dir = saved_data_dir
         for conn in list(facade._out):
             try:

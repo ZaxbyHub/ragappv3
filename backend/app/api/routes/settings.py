@@ -104,6 +104,7 @@ class SettingsUpdate(BaseModel):
     instant_memory_context_top_k: Optional[int] = None
     instant_max_tokens: Optional[int] = None
     thinking_max_tokens: Optional[int] = None
+    assistant_message_max_chars: Optional[int] = None
     instant_enable_thinking: Optional[bool] = None
     thinking_request_timeout_seconds: Optional[float] = None
     editorial_request_timeout_seconds: Optional[float] = None
@@ -169,6 +170,13 @@ class SettingsUpdate(BaseModel):
     multimodal_impl_version: Optional[str] = None
     # Issue #462 — query-time retrieval-first VLM master switch (default off).
     multimodal_query_vision_enabled: Optional[bool] = None
+
+    @field_validator("assistant_message_max_chars")
+    @classmethod
+    def validate_assistant_message_max_chars(cls, v):
+        if v is not None and v < 1:
+            raise ValueError("assistant_message_max_chars must be a positive integer")
+        return v
 
     @field_validator("chunk_size")
     @classmethod
@@ -737,6 +745,7 @@ ALLOWED_FIELDS = [
     "instant_memory_context_top_k",
     "instant_max_tokens",
     "thinking_max_tokens",
+    "assistant_message_max_chars",
     "instant_enable_thinking",
     "thinking_request_timeout_seconds",
     "editorial_request_timeout_seconds",
@@ -1024,6 +1033,7 @@ class SettingsResponse(BaseModel):
     instant_memory_context_top_k: int = 2
     instant_max_tokens: int = 4096
     thinking_max_tokens: int = 32768
+    assistant_message_max_chars: int
     instant_enable_thinking: bool = False
     thinking_request_timeout_seconds: float = 300.0
     editorial_request_timeout_seconds: float = 300.0
@@ -1196,6 +1206,7 @@ def _build_settings_dict() -> dict:
         "instant_memory_context_top_k": settings.instant_memory_context_top_k,
         "instant_max_tokens": settings.instant_max_tokens,
         "thinking_max_tokens": settings.thinking_max_tokens,
+        "assistant_message_max_chars": settings.assistant_message_max_chars,
         "instant_enable_thinking": settings.instant_enable_thinking,
         "thinking_request_timeout_seconds": settings.thinking_request_timeout_seconds,
         "editorial_request_timeout_seconds": settings.editorial_request_timeout_seconds,

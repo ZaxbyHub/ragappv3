@@ -20,7 +20,7 @@ import sqlite3
 from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.api.deps import (
     get_current_active_user,
@@ -32,9 +32,21 @@ from app.config import settings
 from app.limiter import limiter
 from app.security import csrf_protect
 from app.services.eval_metrics import citation_validity, fact_coverage
+from app.utils.sqlite_errors import is_unique_violation
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+# Report notes are provenance records, not prompt-input hot paths. A generous
+# independent cap leaves room for two full accepted notes and their attributions;
+# overflow is rejected explicitly rather than destroying submitted text.
+QUALITY_REPORT_NOTE_MAX_CHARS = 1_000_000
+_NOTE_ATTRIBUTION_RESERVE = len(" (submitted by user 999999)") + len(" || ")
+
+
+def _note_body_limit() -> int:
+    """Bound one accepted note so two notes plus attributions fit the cap."""
+    return (QUALITY_REPORT_NOTE_MAX_CHARS - 2 * _NOTE_ATTRIBUTION_RESERVE) // 2
 
 #: Structured report categories (issue #237). A generic thumbs-down counter
 #: is insufficient — each category routes to a different repair path.
@@ -101,6 +113,20 @@ class QualityReportRequest(BaseModel):
     category: str
     note: Optional[str] = None
 
+    @field_validator("note")
+    @classmethod
+    def validate_note_separator(cls, value: Optional[str]) -> Optional[str]:
+        """Reserve the separator and bound the note against the live cap."""
+        if value is None:
+            return value
+        if " || " in value:
+            raise ValueError("note must not contain the reserved separator ' || '")
+        if len(value) > _note_body_limit():
+            raise ValueError(
+                f"note exceeds the live bound of {_note_body_limit()} characters"
+            )
+        return value
+
 
 class ConvertReportRequest(BaseModel):
     """Body for POST /quality/reports/{report_id}/convert."""
@@ -124,9 +150,92 @@ class EvalCaseCompareRequest(BaseModel):
 
 
 _REPORT_COLS = (
-    "id", "session_id", "message_id", "category", "note", "turn_id", "seq",
-    "config_ref", "source_file_hashes", "created_at",
+    "id",
+    "session_id",
+    "message_id",
+    "category",
+    "note",
+    "turn_id",
+    "seq",
+    "config_ref",
+    "source_file_hashes",
+    "created_at",
 )
+
+
+def _merge_report_note(existing: str, incoming: str, submitter_id: int) -> str:
+    """Fold a differing re-submitted note into the canonical note (#1201 AC3).
+
+    Uses the repo's existing ` || ` note-convention and attributes only the
+    newly submitted note; repeat submissions of the same note are no-ops.
+    """
+    if not incoming or incoming == existing:
+        return existing
+    parts = [part for part in (existing or "").split(" || ") if part.strip()]
+    cap = QUALITY_REPORT_NOTE_MAX_CHARS
+    suffix = f" (submitted by user {submitter_id})"
+    attributed = f"{incoming}{suffix}"
+    if attributed in parts:
+        return existing or ""
+    parts.insert(0, attributed)
+    return _fit_note_parts(parts, cap)
+
+
+def _fit_note_parts(parts, cap: int) -> str:
+    """Return the full canonical note or reject overflow without changing it."""
+    merged = " || ".join(parts)
+    if len(merged) <= cap:
+        return merged
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            f"quality report note exceeds report-note cap ({cap} characters); "
+            "submit a shorter note"
+        ),
+    )
+
+
+def _merge_note_or_missing(conn, row_id: int, incoming: str, user_id: int) -> bool:
+    """Return False when the canonical report vanished during the merge."""
+    try:
+        _merge_report_note_cas(conn, row_id, incoming, user_id)
+        return True
+    except LookupError:
+        return False
+
+
+def _merge_report_note_cas(conn, row_id: int, incoming: str, user_id: int) -> str:
+    """Fold a note into a canonical row with compare-and-swap retries.
+
+    A stale reader cannot overwrite a concurrent merge: the UPDATE carries the
+    note value that was read, and a failed CAS re-reads before retrying.
+    """
+    for _ in range(8):
+        result = conn.execute(
+            "SELECT note FROM quality_reports WHERE id = ?", (row_id,)
+        )
+        row = result.fetchone()
+        if row is None:
+            raise LookupError(f"quality report {row_id} vanished during merge")
+        old_value = row[0]  # keep SQL NULL intact for the comparison
+        old = old_value or ""
+        merged = _merge_report_note(old, incoming, user_id)
+        if merged == old and (old_value is not None or not incoming):
+            return old
+        if old_value is None:
+            update = conn.execute(
+                "UPDATE quality_reports SET note = ? WHERE id = ? AND note IS NULL",
+                (merged, row_id),
+            )
+        else:
+            update = conn.execute(
+                "UPDATE quality_reports SET note = ? WHERE id = ? AND note = ?",
+                (merged, row_id, old_value),
+            )
+        if update.rowcount:
+            conn.commit()
+            return merged
+    raise RuntimeError("quality report note merge lost too many races")
 
 
 def _row_get(row: Any, col: str) -> Any:
@@ -145,7 +254,9 @@ def _report_row_to_dict(row: Any) -> Dict[str, Any]:
         "seq": _row_get(row, "seq"),
         "provenance": {
             "config_ref": _row_get(row, "config_ref"),
-            "source_file_hashes": json.loads(_row_get(row, "source_file_hashes") or "[]"),
+            "source_file_hashes": json.loads(
+                _row_get(row, "source_file_hashes") or "[]"
+            ),
         },
         "created_at": _row_get(row, "created_at"),
     }
@@ -211,9 +322,7 @@ async def submit_quality_report(
     )
     msg_row = await asyncio.to_thread(msg_result.fetchone)
     if msg_row is None:
-        raise HTTPException(
-            status_code=404, detail="Message not found in this session"
-        )
+        raise HTTPException(status_code=404, detail="Message not found in this session")
 
     config_ref = await asyncio.to_thread(_config_ref)
     # msg_row columns (positional): 0=id, 1=turn_id, 2=seq, 3=sources
@@ -233,6 +342,22 @@ async def submit_quality_report(
     )
     existing_row = await asyncio.to_thread(existing_result.fetchone)
     if existing_row is not None:
+        if not await asyncio.to_thread(
+            _merge_note_or_missing,
+            conn,
+            _row_get(existing_row, "id"),
+            body.note or "",
+            user["id"],
+        ):
+            raise HTTPException(status_code=404, detail="Quality report not found")
+        updated_result = await asyncio.to_thread(
+            conn.execute,
+            "SELECT * FROM quality_reports WHERE id = ?",
+            (_row_get(existing_row, "id"),),
+        )
+        existing_row = await asyncio.to_thread(updated_result.fetchone)
+        if existing_row is None:
+            raise HTTPException(status_code=404, detail="Quality report not found")
         return _report_row_to_dict(existing_row)
     try:
         cursor = await asyncio.to_thread(
@@ -251,10 +376,29 @@ async def submit_quality_report(
             ),
         )
         await asyncio.to_thread(conn.commit)
-    except sqlite3.IntegrityError:
+    except sqlite3.IntegrityError as exc:
+        await asyncio.to_thread(conn.rollback)
+        if not is_unique_violation(exc):
+            session_result = await asyncio.to_thread(
+                conn.execute,
+                "SELECT 1 FROM chat_sessions WHERE id = ?",
+                (body.session_id,),
+            )
+            if await asyncio.to_thread(session_result.fetchone) is None:
+                raise HTTPException(status_code=404, detail="Session not found")
+            msg_result = await asyncio.to_thread(
+                conn.execute,
+                "SELECT 1 FROM chat_messages WHERE id = ? AND session_id = ?",
+                (body.message_id, body.session_id),
+            )
+            if await asyncio.to_thread(msg_result.fetchone) is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Message not found in this session",
+                )
+            raise
         # A concurrent submission of the same identity won the race (unique
         # index). Roll the failed statement back and return the winner.
-        await asyncio.to_thread(conn.rollback)
         winner_result = await asyncio.to_thread(
             conn.execute,
             "SELECT * FROM quality_reports "
@@ -264,6 +408,22 @@ async def submit_quality_report(
         winner_row = await asyncio.to_thread(winner_result.fetchone)
         if winner_row is None:
             raise
+        if not await asyncio.to_thread(
+            _merge_note_or_missing,
+            conn,
+            _row_get(winner_row, "id"),
+            body.note or "",
+            user["id"],
+        ):
+            raise HTTPException(status_code=404, detail="Quality report not found")
+        updated_result = await asyncio.to_thread(
+            conn.execute,
+            "SELECT * FROM quality_reports WHERE id = ?",
+            (_row_get(winner_row, "id"),),
+        )
+        winner_row = await asyncio.to_thread(updated_result.fetchone)
+        if winner_row is None:
+            raise HTTPException(status_code=404, detail="Quality report not found")
         row = winner_row
     else:
         row_result = await asyncio.to_thread(
@@ -274,7 +434,10 @@ async def submit_quality_report(
         row = await asyncio.to_thread(row_result.fetchone)
     logger.info(
         "Quality report %s submitted (category=%s, session=%s, message=%s)",
-        row[0], body.category, body.session_id, body.message_id,
+        row[0],
+        body.category,
+        body.session_id,
+        body.message_id,
     )
     return _report_row_to_dict(row)
 
@@ -418,10 +581,17 @@ async def convert_report_to_eval_case(
             ),
         )
         await asyncio.to_thread(conn.commit)
-    except sqlite3.IntegrityError:
+    except sqlite3.IntegrityError as exc:
+        await asyncio.to_thread(conn.rollback)
+        if not is_unique_violation(exc):
+            report_result = await asyncio.to_thread(
+                conn.execute, "SELECT 1 FROM quality_reports WHERE id = ?", (report_id,)
+            )
+            if await asyncio.to_thread(report_result.fetchone) is None:
+                raise HTTPException(status_code=404, detail="Quality report not found")
+            raise
         # A concurrent convert of the same report won the race (unique
         # index). Roll back and return the winner's case.
-        await asyncio.to_thread(conn.rollback)
         winner_case_result = await asyncio.to_thread(
             conn.execute,
             "SELECT id, report_id, query, expected_outcome, provenance "
@@ -446,9 +616,7 @@ async def convert_report_to_eval_case(
         (cursor.lastrowid,),
     )
     case = await asyncio.to_thread(case_result.fetchone)
-    logger.info(
-        "Quality report %s converted to eval case %s", report_id, case[0]
-    )
+    logger.info("Quality report %s converted to eval case %s", report_id, case[0])
     return {
         "id": case[0],
         "report_id": case[1],

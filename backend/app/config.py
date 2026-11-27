@@ -633,6 +633,12 @@ class Settings(BaseSettings):
     and prompt cost. Prior-turn history is intentionally NOT bounded by this
     setting (legitimate assistant answers can be long)."""
 
+    assistant_message_max_chars: int = 131072
+    """Floor for the assistant-role body backstop on the two chat write routes.
+    The effective cap is this value or `thinking_max_tokens * 8`, whichever is
+    larger, so it follows the live thinking-mode budget and a legitimate long
+    answer still saves; it is not the LIVE-user cap (#922/#1202)."""
+
     active_user_cache_ttl_seconds: int = 30
     """Time-to-live in seconds for cached active-user lookups in get_current_active_user.
     0 disables the in-memory cache entirely. Positive values must be between 5 and 300
@@ -1897,6 +1903,12 @@ class Settings(BaseSettings):
     def validate_chat_message_max_chars(cls, v: int) -> int:
         """Validate chat_message_max_chars is >= 1."""
         return cls._validate_int_range(v, 1, None, "chat_message_max_chars")
+
+    @field_validator("assistant_message_max_chars", mode="after")
+    @classmethod
+    def validate_assistant_message_max_chars(cls, v: int) -> int:
+        """Validate the assistant backstop floor is >= 1."""
+        return cls._validate_int_range(v, 1, None, "assistant_message_max_chars")
 
     @field_validator("unique_docs_in_top_k", mode="after")
     @classmethod

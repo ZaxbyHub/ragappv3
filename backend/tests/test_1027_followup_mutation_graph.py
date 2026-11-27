@@ -38,9 +38,9 @@ from app.services.authz_policy import (
 
 class _MutationHarness:
     """Full-app harness (test_1025 _InvariantHarness pattern): own temp DB,
-    get_db override, csrf override, users/organizations module get_pool
-    patches (those routes call module-level get_pool(settings.sqlite_path)),
-    settings save/restore, mutable acting-superadmin dict (user id 1)."""
+    get_db override, csrf override, settings save/restore, mutable
+    acting-superadmin dict (user id 1). The org routes take their
+    request-scoped connection through the get_db override (#798 AC4)."""
 
     def __init__(self):
         self.temp_dir = tempfile.mkdtemp(prefix="t1028_")
@@ -66,12 +66,6 @@ class _MutationHarness:
 
         app.dependency_overrides[get_db] = override_get_db
         app.dependency_overrides[csrf_protect] = lambda: "t1028-csrf"
-
-        from app.api.routes import organizations as orgs_module
-        self._mods = (orgs_module,)
-        self._orig_get_pools = [m.get_pool for m in self._mods]
-        for m in self._mods:
-            m.get_pool = lambda path: self.pool
 
         from app.config import settings
 
@@ -177,8 +171,6 @@ class _MutationHarness:
         app.dependency_overrides.pop(get_db, None)
         app.dependency_overrides.pop(get_current_active_user, None)
         app.dependency_overrides.pop(csrf_protect, None)
-        for m, orig in zip(self._mods, self._orig_get_pools):
-            m.get_pool = orig
         for key, value in self._saved.items():
             setattr(self._settings, key, value)
         self.pool.close_all()

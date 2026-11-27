@@ -293,6 +293,7 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             "instant_memory_context_top_k",
             "instant_max_tokens",
             "thinking_max_tokens",
+            "assistant_message_max_chars",
             "instant_enable_thinking",
             # Per-mode HTTP request timeouts (issue #652)
             "thinking_request_timeout_seconds",
@@ -1284,14 +1285,12 @@ async def lifespan(app: FastAPI):
 
         await drain_inflight_upload_commits()
     except Exception as exc:
-        # Shutdown must still close the pool; record why the drain failed.
+        # The finalizer gate below decides whether the pool can close; record
+        # why the upload drain could not settle first.
         logger.warning(
             "Upload commit drain failed during shutdown: %s", type(exc).__name__
         )
-    try:
-        app.state.db_pool.close_all()
-    except Exception:
-        pass
+    await _finalize_turns_and_close_pool(app)
     try:
         from app.services.auth_service import _auth_executor
         _auth_executor.shutdown(wait=False)
@@ -1307,3 +1306,41 @@ async def lifespan(app: FastAPI):
     with contextlib_suppress(Exception):
         from app.services import redis_io
         redis_io.shutdown_executor()
+
+
+async def _finalize_turns_and_close_pool(app) -> None:
+    """Drain durable turn finalizers, then close the pool only when safe.
+
+    Keeping this decision in one runtime-testable function makes an
+    unconditional close (or a close that races a live finalizer) observable
+    instead of relying on source-order inspection alone.
+    """
+    turn_finalizers_drained = False
+    try:
+        # Issue #1202: cancellation finalizes run on a worker; drain them before
+        # the pool becomes unusable, or an interrupted turn can be lost.
+        from app.api.routes.chat import (
+            TURN_FINALIZE_DRAIN_TIMEOUT_SECONDS,
+            TURN_PRODUCER_SHUTDOWN_TIMEOUT_SECONDS,
+            _turn_registry,
+            shutdown_turn_finalizers,
+        )
+
+        # Cancel live stream producers first so their cancellation backstops
+        # submit before the gate closes. Retirement is bounded; the drain runs
+        # in a worker so the event loop never blocks on future completion.
+        producers = [
+            getattr(entry, "task", None)
+            for entry in list(_turn_registry().values())
+        ]
+        turn_finalizers_drained = await shutdown_turn_finalizers(
+            producers,
+            TURN_PRODUCER_SHUTDOWN_TIMEOUT_SECONDS,
+            TURN_FINALIZE_DRAIN_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Durable turn finalizer shutdown check failed: %s", type(exc).__name__
+        )
+    if turn_finalizers_drained:
+        app.state.db_pool.close_all()

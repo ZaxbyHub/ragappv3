@@ -30,16 +30,16 @@ from typing import Iterable, List, Tuple
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.DOTALL | re.IGNORECASE)
 _LHS_RHS_RE = re.compile(r"_lhs.*?_rhs", re.DOTALL)
 # Match unterminated <think> from a stripped close tag (e.g. partial chunk leak)
-_UNTERMINATED_THINK_TAIL_RE = re.compile(r"<think\b[^>]*>.*\Z", re.DOTALL | re.IGNORECASE)
+_UNTERMINATED_THINK_TAIL_RE = re.compile(
+    r"<think\b[^>]*>.*\Z", re.DOTALL | re.IGNORECASE
+)
 # Thinking Process: ... </think>  (qwen3.5-122b style)
 _THINKING_PROCESS_BLOCK_RE = re.compile(
     r"Thinking Process:.*?</think>\s*", re.DOTALL | re.IGNORECASE
 )
 # Defensive: orphan "Thinking Process:" prefix at start with no close tag —
 # strip the leading line up to a blank line if present.
-_THINKING_PROCESS_PREFIX_RE = re.compile(
-    r"^Thinking Process:[^\n]*\n", re.IGNORECASE
-)
+_THINKING_PROCESS_PREFIX_RE = re.compile(r"^Thinking Process:[^\n]*\n", re.IGNORECASE)
 # Answer wrapper TAGS (issue #1153 AC1): some models wrap the final answer in
 # ``<answer>...</answer>`` elements. Unlike thinking blocks (removed with their
 # content), only the TAGS are stripped — the inner text IS the answer. Matches
@@ -57,27 +57,65 @@ def _strip_answer_tags(text: str) -> str:
     Applied to the WHOLE run (not line-by-line) so a wrapper tag that spans
     lines is still removed.
     """
-    return _ANSWER_WRAPPER_CLOSE_RE.sub(
-        "", _ANSWER_WRAPPER_OPEN_RE.sub("", text)
-    )
+    return _ANSWER_WRAPPER_CLOSE_RE.sub("", _ANSWER_WRAPPER_OPEN_RE.sub("", text))
+
+
+_QUOTE_PREFIX_RE = re.compile(r">(?:[ \t]?>[ \t]?)*[ \t]?")
+_LIST_PREFIX_RE = re.compile(r"(?:[-*+]|\d{1,9}[.)])[ \t]+")
+_WRAPPER_PREFIX_RE = re.compile(r"(?:<answer\b[^>]*>|</answer\s*>)+", re.IGNORECASE)
+
+
+def _container_line(core: str):
+    """Parse one line into `(rest, quoted, listed, bare_indent, prefix_len, marked)`.
+
+    Wrapper tags and container markers may be interleaved in either order. `rest`
+    is what remains after all of them and the whitespace are stripped, so the
+    fence marker can be matched uniformly; `marked` says a wrapper or container
+    was consumed (a plain indent is not marked). `prefix_len` locates the marker
+    inside `core`, which lets the span start at the marker when a wrapper tag
+    shares the opener line.
+    """
+    stripped = core.lstrip(" \t")
+    bare_indent = len(core) - len(stripped)
+    quoted = listed = marked = False
+    while True:
+        match = _WRAPPER_PREFIX_RE.match(stripped)
+        if match:
+            # A wrapper tag may be separated from the container/fence marker
+            # by spaces or tabs (e.g. `<answer> ``` `); consume them too.
+            stripped = stripped[match.end() :].lstrip(" \t")
+            marked = True
+            continue
+        match = _QUOTE_PREFIX_RE.match(stripped)
+        if match:
+            stripped = stripped[match.end() :].lstrip(" \t")
+            quoted = marked = True
+            continue
+        match = _LIST_PREFIX_RE.match(stripped)
+        if match:
+            stripped = stripped[match.end() :].lstrip(" \t")
+            listed = marked = True
+            continue
+        break
+    return stripped, quoted, listed, bare_indent, len(core) - len(stripped), marked
 
 
 def _find_code_fence_spans(text: str) -> List[Tuple[int, int]]:
     """Return the ``(start, end)`` char offsets of fenced code blocks.
 
-    Honours the CommonMark rules that matter for protecting literal markup:
-    - an opening fence is 3+ backticks or tildes, indented at most 3 spaces;
-      a backtick opener's info string may not itself contain a backtick, so
-      `` ```a`b `` is NOT a fence and does not shield the rest of the text;
-    - a closing fence is the same marker character, at least as long as the
-      opener, with only trailing spaces/tabs — so a longer closer (```` for a
-      ``` block) terminates it, and a line with any other content does not;
-    - an unterminated fence runs to the end of the text.
+    A fence may sit in a block quote (nested quotes, indentation after the
+    marker, CRLF) or in a list item, and a wrapper tag may sit before or after
+    the container markers on the opener line. A quoted fence closes only on a
+    quoted line and a list fence only inside the item; when in doubt the fence
+    stays open, protecting rather than stripping. Plain fences keep the original
+    CommonMark rules: 3+ backticks/tildes, at most three spaces of indentation, a
+    bare closer of the same marker and at least the opener's length, an invalid
+    backtick info string, and an unterminated fence running to the end of the
+    text. A trailing ``\r`` from CRLF is ignored for detection but kept in the
+    returned offsets.
 
-    Line endings are tolerated (a trailing ``\\r`` from CRLF is ignored for
-    detection but preserved in the returned offsets). Indentation is matched
-    against spaces/tabs only — a non-breaking space or other character in the
-    closer keeps the fence open, so protected content is never released early.
+    Remaining limitation: nested list containers with lazy continuation lines,
+    and a wrapper tag sitting on the closing fence line.
     """
     spans: List[Tuple[int, int]] = []
     pos = 0
@@ -85,31 +123,48 @@ def _find_code_fence_spans(text: str) -> List[Tuple[int, int]]:
     fence_char = ""
     fence_len = 0
     fence_start = 0
+    fence_quoted = False
+    fence_listed = False
     for line in text.split("\n"):
         line_start = pos
         core = line.rstrip("\r")  # CRLF: drop the CR, keep everything else
-        stripped = core.lstrip(" \t")  # up to 3 leading spaces/tabs are indent
-        indent = len(core) - len(stripped)
+        rest, quoted, listed, bare_indent, prefix_len, marked = _container_line(core)
         if not in_fence:
-            if indent <= 3:
-                open_match = _OPEN_FENCE_RE.match(stripped)
-                if open_match:
-                    marker = open_match.group(1)
-                    info = stripped[len(marker):]
-                    if marker[0] == "`" and "`" in info:
-                        pass  # invalid backtick opener — not a fence
-                    else:
-                        in_fence = True
-                        fence_char = marker[0]
-                        fence_len = len(marker)
-                        fence_start = line_start
-        elif indent <= 3 and stripped and re.fullmatch(
-            rf"{re.escape(fence_char)}{{{fence_len},}}[ \t]*", stripped
-        ):
-            # Closing fence: protect through the end of this line (the "\n"
-            # separator belongs to the following text, not the fence).
-            spans.append((fence_start, line_start + len(core)))
-            in_fence = False
+            if bare_indent > 3:
+                pos = line_start + len(line) + 1
+                continue
+            open_match = _OPEN_FENCE_RE.match(rest)
+            if open_match:
+                marker = open_match.group(1)
+                info = rest[len(marker) :]
+                if marker[0] == "`" and "`" in info:
+                    pass  # invalid backtick opener — not a fence
+                else:
+                    in_fence = True
+                    fence_char = marker[0]
+                    fence_len = len(marker)
+                    fence_start = line_start + (prefix_len if marked else 0)
+                    fence_quoted = quoted
+                    fence_listed = listed
+        else:
+            closer = (
+                bool(rest)
+                and re.fullmatch(
+                    rf"{re.escape(fence_char)}{{{fence_len},}}[ \t]*", rest
+                )
+                is not None
+            )
+            if fence_quoted:
+                context_ok = quoted
+            elif fence_listed:
+                context_ok = listed or bare_indent > 0
+            else:
+                # A plain fence closes only on a genuinely plain closer: a `>`
+                # or list marker on the line is fenced content, not a closer.
+                context_ok = bare_indent <= 3 and not marked
+            if closer and context_ok:
+                spans.append((fence_start, line_start + len(core)))
+                in_fence = False
         pos = line_start + len(line) + 1
     if in_fence:
         spans.append((fence_start, len(text)))
@@ -125,9 +180,9 @@ def _strip_answer_wrappers_outside_code_fences(text: str) -> str:
     permanently rewrite historical messages. Only the wrapper tags outside
     fences are removed (issue #1153 AC1).
 
-    Known limitation: fences nested inside block quotes / list items, and a
-    wrapper tag sitting on the same line as a fence marker, are not handled —
-    the rare cases where this matters are documented rather than special-cased.
+    Block quotes and list items are handled by the fence scanner; remaining
+    limitation: nested list containers with lazy continuation lines, and a
+    wrapper tag sitting on the closing fence line.
     """
     spans = _find_code_fence_spans(text)
     if not spans:
