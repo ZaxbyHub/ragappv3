@@ -421,8 +421,21 @@ class TestZeroBudgetPoolClose(unittest.IsolatedAsyncioTestCase):
         class _App:
             state = _State()
 
-        drained, pool_closed = await _finalize_turns_and_close_pool(
-            _App(), remaining=lambda: 0.0
+        # The close branch is entered only when the finalizer drain
+        # SUCCEEDED, so the drain is forced true here (and asserted below) —
+        # otherwise the test could pass without ever reaching the zero-budget
+        # branch it is meant to protect.
+        with unittest.mock.patch(
+            "app.api.routes.chat.shutdown_turn_finalizers",
+            new=unittest.mock.AsyncMock(return_value=True),
+        ):
+            drained, pool_closed = await _finalize_turns_and_close_pool(
+                _App(), remaining=lambda: 0.0
+            )
+        self.assertTrue(
+            drained,
+            "the finalizer drain must have succeeded for the close branch "
+            "to be reachable at all",
         )
         self.assertEqual(
             calls, [], "an exhausted budget must not close the pool at all"
