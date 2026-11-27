@@ -145,8 +145,13 @@ class TestLintRunLifecycle(unittest.TestCase):
             "(no suppressed duplicates)",
         )
 
-        # Remove the underlying issue: open rows for issues that went away
-        # must transition to 'resolved' (not linger, not be deleted).
+        # Remove the underlying issue: rows for issues that went away must
+        # transition to the reconciler's system 'auto_resolved' status (not
+        # linger open, not be deleted) — they survive as linter-owned
+        # history (#791; status + survival pinned by issue #934 item 7).
+        open_ids = [f.id for f in findings2]
+        # Non-vacuity: the per-id auto_resolved loop below must check rows.
+        self.assertTrue(open_ids)
         self.conn.execute("DELETE FROM wiki_claims WHERE vault_id = 1")
         self.conn.commit()
         findings3 = self.linter.run_lint(1)
@@ -155,6 +160,16 @@ class TestLintRunLifecycle(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(total_open, len(findings3))
         self.assertEqual(total_open, 0, "no open findings should remain after the issue is gone")
+        # The previously-open rows survive the resolve pass as auto_resolved
+        # (plus the dismissed target, which the pass must not touch).
+        rows = self.conn.execute(
+            "SELECT id, status FROM wiki_lint_findings WHERE vault_id = 1"
+        ).fetchall()
+        by_id = {row["id"]: row["status"] for row in rows}
+        self.assertEqual(len(rows), len(open_ids) + 1)
+        self.assertEqual(by_id[target.id], "dismissed")
+        for finding_id in open_ids:
+            self.assertEqual(by_id[finding_id], "auto_resolved")
 
     def test_duplicate_alias_detection(self):
         self.store.upsert_entity(vault_id=1, canonical_name="AFOMIS", aliases=["AirForce Med"])

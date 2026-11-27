@@ -33,9 +33,10 @@ the lifespan module and the PR body — the composed shutdown envelope is:
 
     enforced: 20 s (uvicorn request drain) + 65 s (lifespan aggregate) + 15 s (turn-finalizer drain) = 100 s; allowance: 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 35 s; total 135 s
 
-(the 65 s is the 60 s lifespan aggregate plus the 5 s outer cap on the
-processor stop; the 15 s is the turn-finalizer drain's 5 s producer
-retirement plus its 10 s drain.)
+(the 65 s is the 60 s lifespan aggregate plus the 5 s slack the residency
+settle or the processor stop may take past it - never both, they share the
+deadline; the 15 s is the turn-finalizer drain's 5 s producer retirement
+plus its 10 s drain.)
 
 `scripts/check_p03_shutdown_envelope.py` owns that arithmetic: it reads
 every ENFORCED term from the code that enforces it (the Dockerfile CMD's
@@ -126,18 +127,41 @@ path is named as the deliberate exception).
 
 **Windows graceful stop (#799 AC4).** start-services.ps1 launches the
 backend through `scripts/win_grouped_backend.py` (CREATE_NEW_PROCESS_GROUP
-so uvicorn is a group leader; pid + approximate FILETIME start marker in
-`.cache/backend.pid`). stop-services.ps1 (and start-services' own
+so the launched process is a group leader; pid + approximate FILETIME start
+marker in `.cache/backend.pid`). stop-services.ps1 (and start-services' own
 Stop-ProcessOnPort) verify the marker (pid AND start time — a reused PID
 fails the gate to the ungrouped fallback), then
 `scripts/win_send_ctrl_break.py` — a sacrificial sender that detaches its
 own console, attaches to the backend's, and delivers a TARGETED CTRL_BREAK
-to the nonzero group — waits up to 140 s (above the 135 s natural worst
-case), and only then force-stops.
+to the nonzero group — waits up to 140 s (above the 135 s composed
+envelope), and only then force-stops. The graceful path belongs to the
+BACKEND port only: the frontend and Ollama processes get the immediate force
+stop they had at base (they are not signal-handling console apps).
+
+**The venv shape.** On Windows a venv's `Scripts\python.exe` is a REDIRECTOR
+that starts the real interpreter as a CHILD, so the process that owns the
+backend port is a DESCENDANT of the process the launcher spawned (the group
+leader the marker names). The marker check therefore accepts the port owner
+when it is the marked process OR a descendant of it (a bounded parent-chain
+walk), and the CTRL_BREAK is sent to the MARKED GROUP id —
+`GenerateConsoleCtrlEvent`'s group argument must be the group leader.
+Without that, the documented venv setup silently degraded to a 15 s idle
+wait and a force-kill, and the lifespan shutdown never ran.
+
 CPython maps CTRL_BREAK to SIGBREAK; uvicorn handles SIGBREAK. Host-verified
-end to end: graceful exit in 0.4 s with the full lifespan shutdown sequence
-(including the bounded tail exit) in the backend log; the sender and the
-non-group wrapper parent survived.
+end to end in BOTH interpreter configurations:
+- a BASE interpreter (`C:\Python311\python.exe`): graceful exit in 0.4 s
+  with the full lifespan shutdown sequence (including the bounded tail exit)
+  in the backend log; the sender and the non-group wrapper parent survived;
+- the DOCUMENTED venv setup (`backend\venv\Scripts\python.exe`), stopped
+  by the REAL `stop-services.ps1`: the stop script reported "sent graceful
+  CTRL_BREAK to grouped backend (group 16656, owner PID 26652)" — the
+  group and the port owner are different processes, exactly the redirector
+  shape — then "stopped gracefully"; the backend log carries the whole
+  lifespan shutdown sequence ending in "ragapp: bounded tail exit —
+  critical shutdown complete (pool_closed=True); skipping non-critical
+  executor joins", and the port was released.
+  (transcript: repro/ac4-venv-stop.log, repro/ac4-venv-backend-err.log)
 
 **Lifecycle resilience fixes (#799).** The editorial client is constructed
 inside `_prime_editorial`'s try (a misconfigured pair is contained with a

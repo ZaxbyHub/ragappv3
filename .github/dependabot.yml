@@ -17,6 +17,31 @@ updates:
       - dependency-name: "numpy"
         update-types:
           - "version-update:semver-minor"
+      # torch pins these Linux CUDA wheels exactly, directly or through
+      # cuda-toolkit's extras (torch 2.15.0: cuda-toolkit==13.2.2,
+      # nvidia-cudnn-cu13==9.26.0.51, ...), so a standalone bump of any of
+      # them is unsatisfiable (PR #1195). They move only when torch moves;
+      # revisit on each torch bump. nvidia-nvjitlink / nvidia-cuda-cccl are
+      # range-constrained, so they are deliberately NOT listed.
+      - dependency-name: "cuda-toolkit"
+      - dependency-name: "nvidia-cublas"
+      - dependency-name: "nvidia-cuda-cupti"
+      - dependency-name: "nvidia-cuda-nvrtc"
+      - dependency-name: "nvidia-cuda-runtime"
+      - dependency-name: "nvidia-cudnn-cu13"
+      - dependency-name: "nvidia-cufft"
+      - dependency-name: "nvidia-cufile"
+      - dependency-name: "nvidia-cusolver"
+      - dependency-name: "nvidia-cusparse"
+      - dependency-name: "nvidia-cusparselt-cu13"
+      - dependency-name: "nvidia-nccl-cu13"
+      - dependency-name: "nvidia-nvshmem-cu13"
+      - dependency-name: "nvidia-nvtx"
+      # sympy 1.14.0 (via torch) requires mpmath<1.4 (PR #1195). Lift this
+      # when a sympy release allows mpmath 1.4.
+      - dependency-name: "mpmath"
+        versions:
+          - ">=1.4"
     groups:
       python-minor-patch:
         update-types:
@@ -33,6 +58,19 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    # Held bumps (PR #1124, PR #1212): each one breaks the grouped PR, so the
+    # other minor/patch bumps never land.
+    # - oxc-transform-react: @vitejs/plugin-react 6.3.0 declares the peer
+    #   ">=0.152.0 <0.157.0", so npm's peer resolution (`npm ci`) fails with
+    #   ERESOLVE on 0.157+. Lift this when plugin-react widens the peer (#1190).
+    # - @radix-ui/react-dialog: 1.3.1 fails the k08-evidence-sheet-snap e2e
+    #   spec 8/8 (#1060). 1.2.0 introduced the multi-aria-describedby change,
+    #   so the hold starts at 1.2.0. Lift this when #1060 lands.
+    ignore:
+      - dependency-name: "oxc-transform-react"
+        versions: [">=0.157.0"]
+      - dependency-name: "@radix-ui/react-dialog"
+        versions: [">=1.2.0"]
     groups:
       npm-minor-patch:
         update-types:
@@ -65,6 +103,27 @@ updates:
     # dependabot-core ignore_condition.rb); pinned verbatim by the
           - "version-update:semver-major"
           # Pinned verbatim by the frozen AC9 acceptance check's spelling;
+    cooldown:
+      default-days: 14
+
+  # Docker Compose image pins (issue #750, T1-04-K-05): the digest pins in
+  # docker-compose.yml (harrier-embed, reranker, redis) are only updated by
+  # this ecosystem — the `docker` entries above scan Dockerfiles and never
+  # touch compose files, while docker-compose.yml's own comments promise
+  # dependabot digest PRs. Same semver-major ignore + 14-day cooldown
+  # posture as the `docker` entries. NOTE: check_runtime_contract only gates
+  # the Dockerfile FROM pins (DOCKERFILE_SURFACES / ALLOWED_DIGESTS); no CI
+  # gate pins or checks the freshness of these compose `image:` digest values
+  # (test_i03_compose_contracts only asserts harrier-embed stays
+  # digest-pinned), so this entry is their only automated freshness guard.
+  - package-ecosystem: "docker-compose"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
     cooldown:
       default-days: 14
 

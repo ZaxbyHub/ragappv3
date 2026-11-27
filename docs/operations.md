@@ -210,6 +210,21 @@ roles, not capacity claims.
 - Corrupt/missing metrics: telemetry shards are rebuildable caches — delete
   the registry dir contents and restart; no user data is involved.
 
+## Container log retention
+
+- Every `docker-compose.yml` service runs `restart: unless-stopped`, so
+  unbounded container logs would grow until the Docker host's disk fills
+  (issue #750). All four services inherit the `x-logging` anchor:
+  `json-file` driver with `max-size: 10m` and `max-file: 5` — a hard
+  ceiling of 50 MiB per service (~200 MiB for the full stack).
+- Rotation discards only the OLDEST files: current errors always land in
+  the live log file. Raise the limits per service (override the
+  `logging:` block) rather than removing them; to silence a chatty
+  service, lower its `LOG_LEVEL` instead of shrinking retention.
+- `docker compose logs` shows only what the retained files hold; for longer
+  history, ship container logs to an off-host log collector before
+  rotation drops them (out of scope for the bundled stack).
+
 ## Scheduled backups
 
 - One-shot consistent set (safe while the app runs — WAL-safe SQLite

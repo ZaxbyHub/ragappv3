@@ -65,9 +65,10 @@ logger = logging.getLogger(__name__)  # noqa: E402
 # them; the two ALLOWANCE terms (the executor-join tail and the
 # interpreter teardown) are bounded by NO code:
 #   enforced: 20 s (uvicorn request drain) + 65 s (lifespan aggregate) + 15 s (turn-finalizer drain) = 100 s; allowance: 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 35 s; total 135 s
-# (the 65 s is this 60 s budget plus the 5 s outer cap on the processor
-# stop; the 15 s is the turn-finalizer drain's 5 s producer retirement plus
-# its 10 s drain.) The 135 s composed envelope sits below the 140 s native
+# (the 65 s is this 60 s budget plus the 5 s slack the residency settle or
+# the processor stop may take past it - never both, they share the deadline;
+# the 15 s is the turn-finalizer drain's 5 s producer retirement plus its
+# 10 s drain.) The 135 s composed envelope sits below the 140 s native
 # stop wait and the 150 s compose grace, so a shutdown that stays inside
 # the enforced 100 s is never force-killed mid-flight.
 # scripts/check_p03_shutdown_envelope.py owns that arithmetic: it reads
@@ -75,13 +76,15 @@ logger = logging.getLogger(__name__)  # noqa: E402
 # surface stops quoting this line.
 _SHUTDOWN_BUDGET_SECONDS = 60.0
 
-# The extra cap the lifespan puts on the background processor's stop: the
-# processor's own aggregate drain is given the REMAINING budget plus this
-# slack, so the composed process envelope stays inside one derivable
-# worst case. Named (not inlined) so the envelope contract gate
+# The extra slack the lifespan may take PAST its aggregate deadline: the
+# residency settle and the background processor's drain each get the REMAINING
+# budget plus this slack. The two uses never stack -- they share the one
+# deadline (a settle that takes the slack leaves _remaining() at 0, and the
+# processor stop is then skipped) -- so the envelope's "65 s (lifespan
+# aggregate)" term is exact. Named (not inlined) so the envelope contract gate
 # (scripts/check_p03_shutdown_envelope.py) reads this number from the code
 # that enforces it instead of restating it.
-_PROCESSOR_STOP_CAP_SECONDS = 5.0
+_SHUTDOWN_SLACK_SECONDS = 5.0
 
 
 # ── Persisted-settings replay decoding (issue #494 CONFIG-003) ──────────────
@@ -1388,7 +1391,7 @@ async def lifespan(app: FastAPI):
             rt.cancel()
         if not pending_settle:
             return
-        settle_budget = _remaining() + 5.0
+        settle_budget = _remaining() + _SHUTDOWN_SLACK_SECONDS
         # An external cancellation of THIS task propagates out of the wait
         # (it is not our own budget expiring): swallowing it would strand
         # the shutdown.
@@ -1479,7 +1482,7 @@ async def lifespan(app: FastAPI):
             await _stop_stage(
                 "background processor stop",
                 lambda: app.state.background_processor.stop(timeout=remaining_budget),
-                timeout=remaining_budget + _PROCESSOR_STOP_CAP_SECONDS,
+                timeout=remaining_budget + _SHUTDOWN_SLACK_SECONDS,
             )
         else:
             logger.warning(

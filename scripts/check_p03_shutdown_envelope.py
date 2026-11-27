@@ -12,7 +12,7 @@ The derivation has two halves, and this gate keeps them apart:
 * ENFORCED terms — each one is read from the code that enforces it, so
   the gate cannot assert a number the runtime does not implement:
   the Dockerfile's operative uvicorn grace, the lifespan module's
-  shutdown budget and processor-stop cap, and the turn-finalizer
+  shutdown budget and deadline slack, and the turn-finalizer
   drain's own constants;
 * ALLOWANCE terms — the executor-join tail and the interpreter
   teardown are NOT bounded by any code (the abandoned-parse worker is
@@ -77,8 +77,8 @@ _CMD_RE = re.compile(r"^\s*CMD\s", re.MULTILINE)
 _LIFESPAN_BUDGET_RE = re.compile(
     r"^_SHUTDOWN_BUDGET_SECONDS\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*$", re.MULTILINE
 )
-_PROCESSOR_CAP_RE = re.compile(
-    r"^_PROCESSOR_STOP_CAP_SECONDS\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*$", re.MULTILINE
+_SLACK_RE = re.compile(
+    r"^_SHUTDOWN_SLACK_SECONDS\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*$", re.MULTILINE
 )
 _TURN_CONST_RE = re.compile(
     r"^(TURN_(?:PRODUCER_SHUTDOWN|FINALIZE_DRAIN)_TIMEOUT_SECONDS)\s*=\s*"
@@ -165,12 +165,12 @@ def _enforced_components() -> list[tuple[str, float]]:
     budget = _LIFESPAN_BUDGET_RE.search(lifespan)
     if budget is None:
         raise ValueError("backend/app/lifespan.py has no _SHUTDOWN_BUDGET_SECONDS")
-    cap = _PROCESSOR_CAP_RE.search(lifespan)
-    if cap is None:
+    slack = _SLACK_RE.search(lifespan)
+    if slack is None:
         raise ValueError(
-            "backend/app/lifespan.py has no _PROCESSOR_STOP_CAP_SECONDS"
+            "backend/app/lifespan.py has no _SHUTDOWN_SLACK_SECONDS"
         )
-    lifespan_aggregate = float(budget.group(1)) + float(cap.group(1))
+    lifespan_aggregate = float(budget.group(1)) + float(slack.group(1))
 
     chat = _read(_CHAT)
     turn = dict(

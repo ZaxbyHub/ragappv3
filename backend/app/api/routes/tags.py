@@ -67,8 +67,16 @@ class TagUpdateRequest(BaseModel):
 
 class TagAssignRequest(BaseModel):
     vault_id: int
-    file_ids: list[int] = Field(..., min_length=1)
-    tag_ids: list[int] = Field(..., min_length=1)
+    # Both batch axes are bounded (issue #800 AC6, via #1187): unbounded
+    # file_ids accepted a 40,000-id batch that reached assign_tags, whose
+    # vault-filtering IN-scan then exceeded SQLite's 32766 host-parameter
+    # limit. The file ceiling matches FolderMoveRequest (aligned with the
+    # documents per-page ceiling of 1000 the UI selects against). The tag
+    # ceiling is a request-size bound, not a per-vault tag-count cap (tag
+    # creation is uncapped): it keeps the files x tags INSERT loop at most
+    # 100,000 pairs per request. Both stay far under the host-parameter limit.
+    file_ids: list[int] = Field(..., min_length=1, max_length=1000)
+    tag_ids: list[int] = Field(..., min_length=1, max_length=100)
 
 
 class DocumentTagsSetRequest(BaseModel):

@@ -3341,7 +3341,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1572         _auth_executor.shutdown(wait=False)\n1573     except Exception:\n1574         pass\n1575     with contextlib_suppress(Exception):\n",
+      "code": "1575         _auth_executor.shutdown(wait=False)\n1576     except Exception:\n1577         pass\n1578     with contextlib_suppress(Exception):\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3352,10 +3352,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1573,
+      "line_number": 1576,
       "line_range": [
-        1573,
-        1574
+        1576,
+        1577
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",

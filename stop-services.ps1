@@ -27,24 +27,62 @@ Write-Output "  Pass -StopOllama to stop Ollama."
 # parent's console is never touched and there is nothing to restore) and only
 # when the pid marker proves the owner is our grouped backend (pid + start
 # time); anything else takes the bounded wait + force fallback.
+# The marker names the GROUP LEADER the launcher spawned, with its
+# wall-clock start stamp. On Windows a venv's Scripts\python.exe is a
+# REDIRECTOR that starts the real interpreter as a CHILD, so the process that
+# owns the backend port is a DESCENDANT of the marked process. Both the
+# marker match and the CTRL_BREAK target depend on that distinction.
+function Get-BackendGroupMarker {
+    $markerPath = Join-Path $RepoRoot ".cache\backend.pid"
+    if (-not (Test-Path -LiteralPath $markerPath)) { return $null }
+    try {
+        $parts = (Get-Content -LiteralPath $markerPath -ErrorAction Stop) -split '\s+'
+        $markedPid = [int]$parts[0]
+        $markedTicks = [math]::Floor([double]$parts[1])
+    } catch { return $null }
+    if ($markedPid -le 0) { return $null }
+    return @{ Pid = $markedPid; Ticks = $markedTicks }
+}
+
+function Test-ProcessDescendsFrom {
+    # True when $ChildPid is $AncestorPid or one of its descendants (bounded
+    # walk up the parent chain). Used for the venv-redirector case: the port
+    # owner is the redirector's child.
+    param([int]$ChildPid, [int]$AncestorPid, [int]$MaxDepth = 8)
+    $current = $ChildPid
+    for ($i = 0; $i -lt $MaxDepth; $i++) {
+        if ($current -eq $AncestorPid) { return $true }
+        $info = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $current" -ErrorAction SilentlyContinue
+        if ($null -eq $info -or $null -eq $info.ParentProcessId) { return $false }
+        $parent = [int]$info.ParentProcessId
+        if ($parent -le 0 -or $parent -eq $current) { return $false }
+        $current = $parent
+    }
+    return $false
+}
+
 function Stop-BackendProcessGracefully {
     param($Proc, [string]$Label)
-    $markerPath = Join-Path $RepoRoot ".cache\backend.pid"
     $grouped = $false
-    if (Test-Path -LiteralPath $markerPath) {
-        try {
-            $parts = (Get-Content -LiteralPath $markerPath -ErrorAction Stop) -split '\s+'
-            $markedPid = [int]$parts[0]
-            $markedTicks = [math]::Floor([double]$parts[1])
-            if ($markedPid -eq $Proc.Id -and $null -ne $Proc.StartTime) {
+    $groupPid = 0
+    $marker = Get-BackendGroupMarker
+    if ($null -ne $marker) {
+        # The port owner is the marked process itself, or (a venv
+        # redirector) its DESCENDANT.
+        if ($marker.Pid -eq $Proc.Id -or (Test-ProcessDescendsFrom $Proc.Id $marker.Pid)) {
+            $markedProc = Get-Process -Id $marker.Pid -ErrorAction SilentlyContinue
+            if ($null -ne $markedProc -and $null -ne $markedProc.StartTime) {
                 # .NET FILETIME tolerance: the wrapper stamps wall-clock at
                 # spawn; allow 60 s of skew. A reused PID is minutes apart.
-                $liveTicks = [math]::Floor($Proc.StartTime.ToFileTime())
-                if ([math]::Abs($liveTicks - $markedTicks) -lt 600000000) {
+                # The check is on the MARKED process (the group leader),
+                # which is the process the wrapper stamped.
+                $liveTicks = [math]::Floor($markedProc.StartTime.ToFileTime())
+                if ([math]::Abs($liveTicks - $marker.Ticks) -lt 600000000) {
                     $grouped = $true
+                    $groupPid = $marker.Pid
                 }
             }
-        } catch { $grouped = $false }
+        }
     }
     if ($grouped) {
         # Sacrificial sender: scripts/win_send_ctrl_break.py detaches ITS OWN
@@ -53,8 +91,12 @@ function Stop-BackendProcessGracefully {
         $Sender = Join-Path $RepoRoot "scripts\win_send_ctrl_break.py"
         $SenderVenvPy = Join-Path $RepoRoot "backend\venv\Scripts\python.exe"
         $SenderPy = if ($env:BACKEND_PYTHON) { $env:BACKEND_PYTHON } elseif (Test-Path $SenderVenvPy) { $SenderVenvPy } else { "python" }
-        Start-Process $SenderPy -ArgumentList ($Sender, "$($Proc.Id)") -WindowStyle Hidden | Out-Null
-        Write-Output "  ${Label}: sent graceful CTRL_BREAK to grouped backend (PID $($Proc.Id)); waiting..."
+        # The CTRL_BREAK goes to the GROUP id (the group leader the marker
+        # names) -- GenerateConsoleCtrlEvent's group argument must be the
+        # group leader, and with a venv that is the redirector, not the port
+        # owner.
+        Start-Process $SenderPy -ArgumentList ($Sender, "$groupPid") -WindowStyle Hidden | Out-Null
+        Write-Output "  ${Label}: sent graceful CTRL_BREAK to grouped backend (group $groupPid, owner PID $($Proc.Id)); waiting..."
         # 140 s > the composed shutdown envelope, so the force fallback
         # never fires before a graceful shutdown that stayed inside the
         # envelope's ENFORCED 100 s completes. The derivation, quoted
@@ -80,7 +122,8 @@ function Stop-BackendProcessGracefully {
 function Stop-ProcessOnPort {
     param(
         [string]$Port,
-        [string]$Label
+        [string]$Label,
+        [switch]$Graceful
     )
 
     $connections = Get-NetTCPConnection -LocalPort ([int]$Port) -ErrorAction SilentlyContinue
@@ -95,12 +138,20 @@ function Stop-ProcessOnPort {
         if ($proc) {
             if ($seen.ContainsKey($proc.Id)) { continue }
             $seen[$proc.Id] = $true
-            Stop-BackendProcessGracefully $proc "$Port ($Label)"
+            if ($Graceful) {
+                Stop-BackendProcessGracefully $proc "$Port ($Label)"
+            } else {
+                # Only the backend is a signal-handling console app; the
+                # frontend/Ollama processes get the immediate force stop they
+                # had at base (a bounded wait bought nothing for them).
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                Write-Output "  $Port ($Label): force-stopped (PID $($proc.Id))"
+            }
         }
     }
 }
 
-Stop-ProcessOnPort $BackendPort "Backend"
+Stop-ProcessOnPort $BackendPort "Backend" -Graceful
 Stop-ProcessOnPort $FrontendPort "Frontend"
 
 if ($StopEmbedding) {
