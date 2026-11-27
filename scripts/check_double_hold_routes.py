@@ -21,11 +21,12 @@ Contracts enforced:
       ``Depends(get_current...)``-shaped call NOT in the classified sets
       (holding or non-holding) is reported as a violation naming the
       handler. KNOWN LIMITATIONS of the scanned lane (deliberate for this
-      gate's first rung; widening is tracked follow-up work): router-level
+      gate's first rung; widening is NOT tracked anywhere): router-level
       ``APIRouter(dependencies=[...])`` attachments, ``Annotated[..., Depends(...)]``
       parameters, alias-imported names, ``head``/``options``/``trace``/
       ``api_route`` decorators, and pool acquisitions extracted into
-      module-level helpers are NOT scanned — new auth gates should be
+      module-level helpers are NOT scanned (a LIVE instance of that lane is
+      tracked in #1217) — new auth gates should be
       declared as handler-default ``Depends(...)`` calls with classified
       names, and acquisitions belong inside the handler body. A HOLDING
       dependency whose name carries neither the ``require_`` nor the

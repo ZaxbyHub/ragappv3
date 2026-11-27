@@ -327,3 +327,71 @@ def test_attribute_form_dependency_is_scanned():
     )
     violations = guard.scan_source("synthetic.py", src)
     assert any("C-DBLHOLD-1" in v for v in violations), violations
+
+
+def test_second_nested_function_acquisition_still_fires():
+    """A SECOND nested function's acquisition must not be exempt.
+
+    Regression pin: dropping the ``_commit_upload`` name check (or loosening
+    it to any underscore-prefixed name) made every nested function exempt,
+    while a stray acquisition placed directly in the handler body did not
+    detect it. The stray acquisition must live in a second nested function.
+    """
+    src = (
+        "from fastapi import APIRouter, Depends\n"
+        "router = APIRouter()\n"
+        "\n"
+        "@router.post('/x')\n"
+        "async def upload_draft_input(user=Depends(require_role('admin'))):\n"
+        "    async def _commit_upload():\n"
+        "        async with db_pool.connection_async() as conn:\n"
+        "            pass\n"
+        "    async def _compensate():\n"
+        "        async with db_pool.connection_async() as conn:\n"
+        "            pass\n"
+        "    return 1\n"
+    )
+    violations = guard.scan_source("draft_room.py", src)
+    assert any("C-DBLHOLD-1" in v for v in violations), violations
+
+
+def test_call_attribute_depends_form_is_scanned():
+    """``Depends(module.callable(...))`` resolves to the callable's name.
+
+    Regression pin: dropping the call-attribute branch of the dependency
+    resolver left ``Depends(deps.require_role('admin'))`` unscanned.
+    """
+    src = (
+        "from fastapi import APIRouter, Depends\n"
+        "import app.api.deps as deps\n"
+        "router = APIRouter()\n"
+        "\n"
+        "@router.get('/x')\n"
+        "async def h(user=Depends(deps.require_role('admin'))):\n"
+        "    conn = await pool.get_connection_async()\n"
+        "    return 1\n"
+    )
+    violations = guard.scan_source("synthetic.py", src)
+    assert any("C-DBLHOLD-1" in v for v in violations), violations
+
+
+def test_draft_room_exception_is_file_scoped():
+    """The exception is keyed by (file, handler) — not by handler alone.
+
+    Regression pin: keying the exception by handler name only would exempt
+    an ``upload_draft_input`` in a DIFFERENT file, where the nested
+    ``_commit_upload`` exemption must not apply.
+    """
+    src = (
+        "from fastapi import APIRouter, Depends\n"
+        "router = APIRouter()\n"
+        "\n"
+        "@router.post('/x')\n"
+        "async def upload_draft_input(user=Depends(require_role('admin'))):\n"
+        "    async def _commit_upload():\n"
+        "        async with db_pool.connection_async() as conn:\n"
+        "            pass\n"
+        "    return 1\n"
+    )
+    violations = guard.scan_source("other.py", src)
+    assert any("C-DBLHOLD-1" in v for v in violations), violations

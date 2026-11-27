@@ -53,7 +53,7 @@
   total, the ci.yml step included)
   (`AGENTS.md`, `docs/engineering/conventions.md`,
   `docs/engineering/testing.md`, `CONTRIBUTING.md`, the
-  `ci-compatibility-audit` and `ci-fix-monitor` skills); contract tests (21) in
+  `ci-compatibility-audit` and `ci-fix-monitor` skills); contract tests (24) in
   `backend/tests/test_double_hold_guardrail.py`.
 
 ## Why
@@ -86,4 +86,6 @@ guardrail).
   holding/non-holding sets. Router-level `APIRouter(dependencies=[...])`,
   `Annotated`-style params, `head`/`options` decorators, and acquisitions
   extracted into module-level helpers are outside the scan (documented in
-  the script; widening is tracked follow-up work).
+  the script). The helper-extraction lane has a LIVE instance, tracked in
+  #1217; the remaining lanes are known limitations with no live instance and
+  no tracker.
