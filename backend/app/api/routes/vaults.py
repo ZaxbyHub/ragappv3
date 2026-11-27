@@ -1367,13 +1367,22 @@ async def delete_vault(
     # deletion. Gated on the DELETE's own rowcount so a concurrent delete
     # that already removed the row records nothing (review F-031a).
     if deleted_vault_rows > 0:
-        await drain_audit(safe_record_security_event(
-            conn,
-            event_type="vault.deleted",
-            actor=user,
-            request=http_request,
-            metadata={"vault_id": vault_id, "name": vault_name},
-        ))
+        # Recovery-critical (#854/#799 shutdown gate): the post-commit audit
+        # tail is a durable write that absorbs cancellation through the
+        # shared drain. It sits on the REQUEST path, so it can outlive the
+        # request (a client disconnect cancels the await, the shielded task
+        # keeps writing) — the bounded tail exit must not fire while it is
+        # live.
+        from app.services.shutdown_gate import critical_shutdown_work
+
+        async with critical_shutdown_work("vault-committed-audit"):
+            await drain_audit(safe_record_security_event(
+                conn,
+                event_type="vault.deleted",
+                actor=user,
+                request=http_request,
+                metadata={"vault_id": vault_id, "name": vault_name},
+            ))
     if commit_cancelled:
         # The cancellation absorbed at the commit await wins only now, after
         # the mandatory audit tail — before the best-effort vector

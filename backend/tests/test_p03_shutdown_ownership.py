@@ -18,6 +18,7 @@ Covers the pieces the frozen acceptance checks do not pin directly:
 import asyncio
 import os
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -151,6 +152,7 @@ class TestRegistrationMapPin(unittest.TestCase):
         ("backend/app/api/routes/documents.py", "document-upload-artifact-cleanup"): 2,
         ("backend/app/api/routes/documents.py", "document-upload-compensation"): 2,
         ("backend/app/api/routes/vaults.py", "vault-rollback-restore"): 3,
+        ("backend/app/api/routes/vaults.py", "vault-committed-audit"): 1,
         ("backend/app/services/draft_promotion.py", "draft-promotion-compensation"): 1,
         ("backend/app/api/routes/memories.py", "memory-transaction"): 1,
         ("backend/app/api/routes/chat.py", "turn-finalizer-drain"): 1,
@@ -185,6 +187,94 @@ class TestRegistrationMapPin(unittest.TestCase):
             "registration ARM is a shutdown-gate coverage decision (update "
             "the map AND the 4.2 census together)",
         )
+
+
+class TestSharedMaintenanceSlice(unittest.IsolatedAsyncioTestCase):
+    """The maintenance slice is ONE shared budget, not one per call (#854).
+
+    The four shutdown-critical maintenance calls (ingest lease release,
+    reindex lease release, parked-retry reset) each get the shared slice
+    computed once at stop() entry: three simultaneously-slow calls must
+    cost ONE slice (worst case timeout + slice), not three. A per-call
+    slice would let stop() run timeout + 3*slice and outrun the lifespan
+    wrapper's remaining+5 bound.
+    """
+
+    BUDGET = 1.0
+    SLICE = 1.0  # min(5.0, BUDGET)
+
+    def _build(self, cls):
+        from types import SimpleNamespace
+
+        class _P(cls):
+            def __init__(self):
+                self.queue = asyncio.Queue()
+                self.enrichment_queue = asyncio.Queue()
+                self.atom_enrichment_queue = asyncio.Queue()
+                self.shutdown_event = asyncio.Event()
+                self.processor = SimpleNamespace(
+                    vector_store=SimpleNamespace(
+                        flush_optimize=self._fast_flush
+                    ),
+                    pool=None,
+                )
+                self._worker_tasks = ()
+                self._enrichment_worker_task = None
+                self._vector_delete_sweep_task = None
+                self._reindex_worker_task = None
+                self._ingest_lease_enabled = True
+                self._reindex_lease_enabled = True
+                self._running = True
+
+            async def _fast_flush(self):
+                return None
+
+            async def _wait_ingest_jobs_settled(self):
+                return None
+
+            def _release_all_ingest_leases(self):
+                # Production calls this SYNCHRONOUSLY through
+                # asyncio.to_thread — a coroutine here would be created and
+                # never awaited (the repo's #565 gate catches exactly that).
+                time.sleep(5.0)
+                return 0
+
+            def _release_reindex_leases(self):
+                time.sleep(5.0)
+                return 0
+
+            async def _reset_parked_retry_files(self, file_ids):
+                # Production awaits this one directly (it is a coroutine).
+                await asyncio.sleep(5.0)
+
+            def _parked_retry_file_ids(self, ticket):
+                return [1]
+
+            def _mark_running_reindex_jobs_interrupted(self, reason):
+                return None
+
+        proc = _P()
+        # A non-empty retry backlog arms the third maintenance call.
+        proc._retry_backlog = asyncio.Queue()
+        proc._retry_backlog.put_nowait(object())
+        return proc
+
+    async def test_three_slow_maintenance_calls_cost_one_slice(self):
+        from app.services.background_tasks import BackgroundProcessor
+
+        proc = self._build(BackgroundProcessor)
+        started = time.monotonic()
+        await asyncio.wait_for(proc.stop(timeout=self.BUDGET), timeout=30)
+        elapsed = time.monotonic() - started
+        bound = self.BUDGET + self.SLICE + 0.5  # one shared slice + margin
+        self.assertLessEqual(
+            elapsed,
+            bound,
+            f"three simultaneously-slow maintenance calls took {elapsed:.2f}s "
+            f"(bound {bound:.2f}s) — the slice is being granted per call, not "
+            f"shared",
+        )
+        self.assertFalse(proc._running)
 
 
 class TestExecutorRecreateOnDemand(unittest.IsolatedAsyncioTestCase):

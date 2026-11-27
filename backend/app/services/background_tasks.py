@@ -3437,20 +3437,34 @@ class BackgroundProcessor:
                     stage,
                 )
 
+        # Shared maintenance budget: the shutdown-critical "hand the leases
+        # back" sweeps (ingest lease release, reindex lease release, parked-
+        # retry reset) are single fast UPDATEs that must not be STARVED when
+        # the drain phases consumed the whole budget
+        # (test_559_lease_integration: a 3 s quiescence wait burning the
+        # full budget must still release the lease). ONE slice is reserved
+        # when the maintenance phase STARTS and shared by every maintenance
+        # call — a per-call slice would let three slow calls consume three
+        # slices (worst case timeout + 3*slice), breaking the ONE-aggregate-
+        # deadline contract and outrunning the lifespan wrapper's
+        # remaining+5 bound. The slice is capped at the timeout itself so a
+        # tiny test budget cannot stretch far past its own scale.
+        maintenance_deadline: float | None = None
+
         async def _bounded_call(awaitable, stage: str):
             # Result-returning twin of _bounded for the maintenance calls
-            # whose outcome is logged. These are the shutdown-critical
-            # "hand the leases back" sweeps: a single fast UPDATE that must
-            # not be STARVED when the drain phases consumed the whole
-            # budget (test_559_lease_integration: a 3 s quiescence wait
-            # burning the full budget must still release the lease). A
-            # small reserved slice keeps them running while preserving
-            # boundedness: worst case stop() takes timeout + slice, and the
-            # slice is capped at the timeout itself so a tiny test budget
-            # cannot stretch far past its own scale.
-            slice_s = min(5.0, timeout)
+            # whose outcome is logged. The stage gets whatever is left of
+            # the aggregate deadline; when that is exhausted it falls back
+            # to the SHARED slice (never a fresh one) — so the lease hand-
+            # back still happens, and the composed cost is at most
+            # timeout + slice.
+            nonlocal maintenance_deadline
+            now = time.monotonic()
+            if maintenance_deadline is None:
+                maintenance_deadline = now + min(5.0, timeout)
+            budget = max(0.0, max(deadline, maintenance_deadline) - now)
             try:
-                return await asyncio.wait_for(awaitable, timeout=max(remaining(), slice_s))
+                return await asyncio.wait_for(awaitable, timeout=budget)
             except asyncio.TimeoutError:
                 logger.warning(
                     "Shutdown stage '%s' exceeded the aggregate stop() budget; "

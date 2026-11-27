@@ -1441,7 +1441,9 @@ async def lifespan(app: FastAPI):
         await drain_inflight_upload_commits()
 
     await _stop_stage("upload commit drain", _upload_commit_drain)
-    turn_finalizers_drained, pool_closed = await _finalize_turns_and_close_pool(app)
+    turn_finalizers_drained, pool_closed = await _finalize_turns_and_close_pool(
+        app, remaining=_remaining
+    )
     try:
         from app.services.auth_service import _auth_executor
         _auth_executor.shutdown(wait=False)
@@ -1521,7 +1523,7 @@ def _bounded_tail_exit(turn_finalizers_drained: bool, pool_closed: bool) -> bool
     return False
 
 
-async def _finalize_turns_and_close_pool(app) -> tuple[bool, bool]:
+async def _finalize_turns_and_close_pool(app, remaining=None) -> tuple[bool, bool]:
     """Drain durable turn finalizers, then close the pool only when safe.
 
     Keeping this decision in one runtime-testable function makes an
@@ -1529,6 +1531,15 @@ async def _finalize_turns_and_close_pool(app) -> tuple[bool, bool]:
     instead of relying on source-order inspection alone. Returns
     ``(turn_finalizers_drained, pool_closed)`` so the bounded tail exit can
     consume the authoritative state (#799/#854) instead of inferring it.
+
+    ``pool_closed`` is True ONLY when ``close_all()`` actually completed:
+    the close is a synchronous callable that drains the pool under its lock
+    (and shuts the checkout executor), so it can block briefly on an
+    in-flight checkout. It runs on a worker under the remaining aggregate
+    budget — an unbounded call here would be the one stage that can hold
+    the shutdown past the envelope and keep the tail gate unreachable. A
+    timed-out close leaves ``pool_closed`` False, so the gate never fires
+    on a pool that was not actually closed.
     """
     turn_finalizers_drained = False
     pool_closed = False
@@ -1559,6 +1570,25 @@ async def _finalize_turns_and_close_pool(app) -> tuple[bool, bool]:
             "Durable turn finalizer shutdown check failed: %s", type(exc).__name__
         )
     if turn_finalizers_drained:
-        app.state.db_pool.close_all()
-        pool_closed = True
+        try:
+            close_budget = remaining() if remaining is not None else None
+            if close_budget is not None and close_budget > 0:
+                await asyncio.wait_for(
+                    asyncio.to_thread(app.state.db_pool.close_all),
+                    timeout=close_budget,
+                )
+            else:
+                app.state.db_pool.close_all()
+            pool_closed = True
+        except asyncio.TimeoutError:
+            # The close did not complete inside the aggregate budget; the
+            # pool is NOT marked closed, so the bounded tail exit cannot
+            # fire. close_all is idempotent-safe for a later retry by the
+            # interpreter teardown (a second close finds an empty pool).
+            logger.warning(
+                "Pool close exceeded the aggregate shutdown budget; "
+                "continuing shutdown (pool not marked closed)"
+            )
+        except Exception:
+            logger.warning("Pool close failed during shutdown", exc_info=True)
     return turn_finalizers_drained, pool_closed
