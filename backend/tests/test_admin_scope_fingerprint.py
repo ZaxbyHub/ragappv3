@@ -26,10 +26,10 @@ completely:
 import hashlib
 import re
 import sqlite3
-import tempfile
-from pathlib import Path
-from unittest.mock import patch
 
+import pytest
+from c04_fixtures import _ADMIN_TOKEN as SEEDED_ADMIN_TOKEN
+from c04_fixtures import seeded_env  # noqa: F401 (consumed via usefixtures)
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -43,8 +43,6 @@ from app.security import admin_scope_fingerprint
 # "csrf", which would otherwise opt the module into real enforcement).
 CSRF_TEST_POLICY = "naive"
 
-ADMIN_TOKEN = "test-admin-key"  # Set by conftest.py pytest_configure
-
 _HEX16 = re.compile(r"^[0-9a-f]{16}$")
 
 # sha256("admin:config,admin:users").hexdigest()[:16]
@@ -53,22 +51,6 @@ _FIXED_A = "e212fd4a49f9ab57"
 _FIXED_B = "554f0701a721d9f4"
 # sha256(b"").hexdigest()[:16]
 _EMPTY = "e3b0c44298fc1c14"
-
-_SERVICE_ACCOUNTS_DDL = """
-PRAGMA journal_mode=WAL;
-CREATE TABLE IF NOT EXISTS service_accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    key_hash TEXT NOT NULL UNIQUE,
-    scopes TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    last_rotated_at TEXT,
-    revoked_at TEXT,
-    created_by TEXT,
-    previous_key_hash TEXT,
-    previous_key_expires_at TEXT
-);
-"""
 
 
 def test_fingerprint_is_16_lowercase_hex_on_actual_output(monkeypatch):
@@ -138,72 +120,48 @@ def test_empty_scope_value(monkeypatch):
     assert admin_scope_fingerprint("never-configured") == _EMPTY
 
 
+@pytest.mark.usefixtures("seeded_env")
 def test_service_account_created_by_equals_fingerprint():
     """``created_by`` persisted by POST /api/service-accounts is exactly
     ``admin_scope_fingerprint(<creating admin token>)``.
 
     The route and the audit-redaction migration both call the helper, but
     nothing asserted the join (issue #945 residual gap 3). This issues a
-    real creation request against a temporary database and compares the
-    stored column with the helper's output for the same admin token.
+    real creation request against a temporary, fully migrated database and
+    compares the stored column with the helper's output for the same admin
+    token.
+
+    ``c04_fixtures.seeded_env`` points ``settings.data_dir`` (so
+    ``settings.sqlite_path``) at a temp directory, maps its admin token to
+    ``["admin:config"]`` server-side, and drains and closes this run's pool
+    entry on teardown, so the route's real ``get_pool`` checkout lands on
+    the temp database and no open connection outlives the test.
     """
-    with tempfile.TemporaryDirectory() as temp_dir:
-        db_path = str(Path(temp_dir) / "app.db")
-        conn = sqlite3.connect(db_path)
-        conn.executescript(_SERVICE_ACCOUNTS_DDL)
-        conn.commit()
+    db_path = str(settings.sqlite_path)
+    app = FastAPI()
+    app.include_router(service_accounts_router, prefix="/api")
+    expected = admin_scope_fingerprint(SEEDED_ADMIN_TOKEN)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/service-accounts",
+            json={"name": "fingerprint-eq-probe", "scopes": ["documents:read"]},
+            headers={"Authorization": f"Bearer {SEEDED_ADMIN_TOKEN}"},
+        )
+
+    assert response.status_code == 201, response.text
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT created_by FROM service_accounts"
+            " WHERE name = 'fingerprint-eq-probe'"
+        ).fetchone()
+    finally:
         conn.close()
-
-        app = FastAPI()
-        app.include_router(service_accounts_router, prefix="/api")
-
-        from app.models.database import SQLiteConnectionPool, _pool_cache
-
-        _pool_cache.clear()
-        pool = SQLiteConnectionPool(db_path, max_size=1)
-
-        def _get_pool(path, **kw):
-            return pool
-
-        try:
-            with patch("app.models.database.get_pool", side_effect=_get_pool):
-                with patch.object(settings, "data_dir", Path(temp_dir)):
-                    with patch.object(settings, "admin_secret_token", ADMIN_TOKEN):
-                        with patch.object(
-                            settings,
-                            "admin_token_scopes",
-                            {ADMIN_TOKEN: ["admin:config"]},
-                        ):
-                            expected = admin_scope_fingerprint(ADMIN_TOKEN)
-                            client = TestClient(app)
-                            response = client.post(
-                                "/api/service-accounts",
-                                json={
-                                    "name": "fingerprint-eq-probe",
-                                    "scopes": ["documents:read"],
-                                },
-                                headers={
-                                    "Authorization": f"Bearer {ADMIN_TOKEN}"
-                                },
-                            )
-                            client.close()
-        finally:
-            _pool_cache.clear()
-            pool.close_all()
-
-        assert response.status_code == 201, response.text
-        conn = sqlite3.connect(db_path)
-        try:
-            row = conn.execute(
-                "SELECT created_by FROM service_accounts"
-                " WHERE name = 'fingerprint-eq-probe'"
-            ).fetchone()
-        finally:
-            conn.close()
-        assert row is not None, "service-account row missing"
-        # Equality with the helper for the SAME creating admin token...
-        assert row[0] == expected
-        # ...and with the documented formula for that token's scope set.
-        assert row[0] == _FIXED_B
-        # The secret token itself is never persisted in the audit column.
-        assert row[0] != ADMIN_TOKEN
+    assert row is not None, "service-account row missing"
+    # Equality with the helper for the SAME creating admin token...
+    assert row[0] == expected
+    # ...and with the documented formula for that token's scope set.
+    assert row[0] == _FIXED_B
+    # The secret token itself is never persisted in the audit column.
+    assert row[0] != SEEDED_ADMIN_TOKEN

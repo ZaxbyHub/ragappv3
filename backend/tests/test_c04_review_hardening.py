@@ -8,8 +8,10 @@ A/B resolver tuple (a re-raising exposure handler must fail), the
 disabled-mode composition (a newline must not satisfy AC8's intent),
 and the fingerprint helper's shape. The mutating-route CSRF-retention
 pin moved to ``tests/test_c04_prompts_read_csrf.py`` (issue #945 AC2's
-dedicated file); the fingerprint pins were superseded by the dedicated
-``tests/test_admin_scope_fingerprint.py`` (issue #945 AC3).
+dedicated file). The complete direct pins on the fingerprint helper
+(charset, literal digest, order independence, empty scope, service-account
+equality) live in ``tests/test_admin_scope_fingerprint.py`` (issue #945
+AC3); the weaker shape pin below is retained.
 
 The seeded_env/prompts_client fixtures come from the shared home
 backend/tests/c04_fixtures.py (issues #946/#900: one guarded-teardown
