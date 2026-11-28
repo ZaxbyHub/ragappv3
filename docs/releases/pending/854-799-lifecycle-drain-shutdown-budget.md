@@ -180,7 +180,15 @@ call moved inside its owning try with a None-guarded finally.
 **Readiness truth (#799).** A FAILED upload migration (the "continuing
 anyway" path) now records `app.state.upload_migration_ok = False` and
 `/api/healthz` reports 503 with "upload migration failed at startup";
-absent attribute stays inert.
+absent attribute stays inert. The readiness signal covers that RAISED
+path only: a per-file migration error (a copy, a size mismatch, a row
+update) is LOGGED at ERROR but is not reflected in readiness, because the
+migration result's failure list also carries benign skips (an unknown
+vault, an orphaned file, an existing destination) and the `.migrated`
+backups of already-migrated files, so it cannot be used as a readiness
+signal. Surfacing those per-file errors in readiness needs a separate
+`errors` field on the migration result and a readiness policy decision
+(maintainer decision, tracked as an open item on the PR).
 
 **Operator guidance and warning truth.** The FTS-missing error no longer
 points at the nonexistent `VectorStore._ensure_fts_index()` — it names the

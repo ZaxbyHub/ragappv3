@@ -837,7 +837,13 @@ async def lifespan(app: FastAPI):
         # attribute and reports degraded (503) when a migration FAILED while
         # the app deliberately continued ("continuing anyway" must stay
         # observable to the health probe that exists to surface exactly
-        # this degradation).
+        # this degradation). The readiness signal covers that RAISED path
+        # only: a PER-FILE migration error (a copy, a size mismatch, a row
+        # update) is logged at ERROR by the migration helper but is not
+        # reflected in readiness, because the migration result's failure list
+        # also carries benign skips (an unknown vault, an orphaned file, an
+        # existing destination) and the .migrated backups of files that
+        # already migrated -- it cannot be used as a readiness signal.
         app.state.upload_migration_ok = True
         logger.info(
             "Upload migration finished in %.1fs",

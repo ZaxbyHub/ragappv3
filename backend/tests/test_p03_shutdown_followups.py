@@ -211,8 +211,15 @@ def _load_sender_with_fake_kernel32(*, attach_ok: bool, event_ok: bool):
             return 1 if event_ok else 0
 
     fake = _FakeKernel32()
-    original = ctypes.WinDLL
+    # `ctypes.WinDLL` and `ctypes.get_last_error` are WINDOWS-ONLY
+    # attributes: reading them on Linux raises AttributeError, so both are
+    # installed and restored through getattr (never a direct read).
+    sentinel = object()
+    original_windll = getattr(ctypes, "WinDLL", sentinel)
+    original_get_last_error = getattr(ctypes, "get_last_error", sentinel)
     ctypes.WinDLL = lambda *args, **kwargs: fake
+    if original_get_last_error is sentinel:
+        ctypes.get_last_error = lambda: 0
     try:
         spec = importlib.util.spec_from_file_location(
             "win_send_ctrl_break_under_test",
@@ -221,7 +228,20 @@ def _load_sender_with_fake_kernel32(*, attach_ok: bool, event_ok: bool):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     finally:
-        ctypes.WinDLL = original
+        if original_windll is sentinel:
+            try:
+                del ctypes.WinDLL
+            except AttributeError:
+                pass
+        else:
+            ctypes.WinDLL = original_windll
+        if original_get_last_error is sentinel:
+            try:
+                del ctypes.get_last_error
+            except AttributeError:
+                pass
+        else:
+            ctypes.get_last_error = original_get_last_error
     return module
 
 class TestWindowsSenderAndMarker(unittest.TestCase):

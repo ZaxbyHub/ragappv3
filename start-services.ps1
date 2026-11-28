@@ -138,8 +138,9 @@ function Stop-BackendProcessGracefully {
         # never receives the pid (verified with a PowerShell probe).
         $QuotedSender = '"{0}"' -f $Sender
         $SenderProc = Start-Process $SenderPy -ArgumentList @($QuotedSender, "$groupPid") -WindowStyle Hidden -Wait -PassThru
-        if ($SenderProc.ExitCode -ne 0) {
-            Write-Output "  ${Label}: the CTRL_BREAK sender reported exit code $($SenderProc.ExitCode) (attach or event delivery failed); the graceful window still applies"
+        $SenderFailed = $SenderProc.ExitCode -ne 0
+        if ($SenderFailed) {
+            Write-Output "  ${Label}: the CTRL_BREAK sender reported exit code $($SenderProc.ExitCode) (attach or event delivery failed); the signal was NOT delivered"
         }
         Write-Output "  ${Label}: sent graceful CTRL_BREAK to grouped backend (group $groupPid, owner PID $($Proc.Id)); waiting..."
         # 140 s > the composed shutdown envelope, so the force fallback
@@ -149,7 +150,11 @@ function Stop-BackendProcessGracefully {
         # fragment and stop-services.ps1:
         #   enforced: 20 s (uvicorn request drain) + 65 s (lifespan aggregate) + 15 s (turn-finalizer drain) = 100 s; allowance: 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 35 s; total 135 s
         # scripts/check_p03_shutdown_envelope.py owns that arithmetic.
-        if (-not $Proc.WaitForExit(140000)) {
+        # A FAILED signal delivery means no graceful shutdown was started:
+        # waiting the whole 140 s graceful window buys nothing, so fall back
+        # to the short bounded wait and then force-stop.
+        $WaitMs = if ($SenderFailed) { 15000 } else { 140000 }
+        if (-not $Proc.WaitForExit($WaitMs)) {
             Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
             Write-Output "  ${Label}: graceful window expired; force-stopped (PID $($Proc.Id))"
         } else {

@@ -3833,6 +3833,12 @@ class BackgroundProcessor:
             "_retry_scheduler_task",
             "_orphan_rescan_task",
             "_ingest_janitor_task",
+            # The pre-drain tasks the sequence owns as well: an outside
+            # cancellation can land BETWEEN their cancellation steps, so
+            # the finalizer must cover them too.
+            "_startup_recovery_task",
+            "_jobs_migration_task",
+            "_artifact_sweep_tasks",
         ):
             owned = getattr(self, attr, None)
             if owned is None:
