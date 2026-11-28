@@ -57,18 +57,41 @@ def hash_password(plain_password: str) -> str:
     return pwd_context.hash(plain_password)
 
 
+# Legacy bcrypt hash idents. bcrypt only ever hashes the first 72 bytes of a
+# secret; bcrypt 4.x silently ignored the rest, bcrypt 5.x raises ValueError.
+_LEGACY_BCRYPT_PREFIXES = ("$2a$", "$2b$", "$2y$")
+_BCRYPT_MAX_SECRET_BYTES = 72
+
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a password against its hash."""
+    """Verify a password against its hash.
+
+    Legacy bcrypt hashes (issue #1235): a hash stored under bcrypt 4.x from a
+    password longer than 72 UTF-8 bytes covers only the first 72 bytes, so the
+    bcrypt fallback below checks exactly those bytes, as bcrypt 4.x did. A
+    password that differs from the original only after byte 72 therefore
+    matches such a hash; that is inherent to the stored hash, not new here.
+    The login route replaces legacy hashes with argon2id over the full
+    password on the first successful login. The cut never applies to argon2id.
+    """
     try:
         # Try passlib first — handles argon2id, bcrypt, and all schemes registered
         return pwd_context.verify(plain_password, hashed_password)
     except Exception:
         logger.warning("passlib verification failed, falling back to bcrypt")
-    # Fallback to bcrypt directly if passlib fails (handles bcrypt version issues)
+    # Fallback to bcrypt directly, for bcrypt-format hashes only (handles
+    # bcrypt version issues). Anything else fails closed.
+    if not (
+        isinstance(hashed_password, str)
+        and hashed_password.startswith(_LEGACY_BCRYPT_PREFIXES)
+    ):
+        logger.error("Password verification failed: unrecognized hash format")
+        return False
     try:
         import bcrypt
 
-        return bcrypt.checkpw(plain_password.encode(), hashed_password.encode())
+        secret = plain_password.encode("utf-8")[:_BCRYPT_MAX_SECRET_BYTES]
+        return bcrypt.checkpw(secret, hashed_password.encode())
     except Exception:
         logger.error("Password verification failed", exc_info=True)
         return False
