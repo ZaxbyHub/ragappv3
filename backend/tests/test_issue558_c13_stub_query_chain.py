@@ -79,6 +79,13 @@ async def test_stub_query_chain_runs_on_builder_without_never_awaited_warning():
     store = VectorStore.__new__(VectorStore)
     store.table = table
 
+    # Flush foreign garbage OUTSIDE the capture window (issue #1226): earlier
+    # tests on the same xdist worker can leave un-awaited AsyncMock coroutines
+    # in reference cycles, and finalizing them inside the block below would
+    # attribute their warnings to this test. Recorded and discarded.
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        gc.collect()
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         result = await store.has_parent_window_text_sample()
@@ -88,12 +95,20 @@ async def test_stub_query_chain_runs_on_builder_without_never_awaited_warning():
     # (a) The sentinel is found — only the primary query path returns True
     # here (the fallback window has no sentinel row).
     assert result is True
-    # (b) No never-awaited coroutine was destroyed.
+    # (b) No never-awaited coroutine from THIS test's chain was destroyed.
+    # Only coroutines created by the test's own doubles count (issue #1226):
+    # a regression to the base chain abandons ``_StubTable.search``'s
+    # coroutine (the RED signal), while foreign mock garbage names
+    # ``AsyncMockMixin._execute_mock_call`` and must not fail this test.
     never_awaited = [
         w
         for w in caught
         if issubclass(w.category, RuntimeWarning)
         and "never awaited" in str(w.message)
+        and (
+            "_StubTable." in str(w.message)
+            or "_RecordingBuilder." in str(w.message)
+        )
     ]
     assert not never_awaited, [
         str(w.message) for w in never_awaited

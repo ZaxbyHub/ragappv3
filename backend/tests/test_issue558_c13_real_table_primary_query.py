@@ -29,6 +29,19 @@ from app.services.vector_store import VectorStore
 ROW_COUNT = 60
 SENTINEL_INDEX = 55  # beyond the 50-row fallback window
 
+# Coroutine qualnames the code under test can create on the real lancedb
+# table (verified on the CI-pinned lancedb 0.41.0, requirements-lock-ci.txt):
+# the primary chain is ``table.query().where(...).limit(1).to_list()``
+# (``AsyncQueryBase.to_list``) with the ``head(50)`` fallback
+# (``AsyncTable.head``); a regression to the pre-#558 chain abandons the raw
+# ``search()`` coroutine (``AsyncTable.search``). Foreign mock garbage names
+# ``AsyncMockMixin._execute_mock_call`` (issue #1226) and is excluded.
+_OWN_COROUTINE_QUALNAMES = (
+    "AsyncTable.search",
+    "AsyncTable.head",
+    "AsyncQueryBase.to_list",
+)
+
 
 @pytest.mark.asyncio
 async def test_real_table_primary_query_finds_sentinel_beyond_fallback_window(
@@ -52,6 +65,13 @@ async def test_real_table_primary_query_finds_sentinel_beyond_fallback_window(
     store = VectorStore.__new__(VectorStore)
     store.table = table
 
+    # Flush foreign garbage OUTSIDE the capture window (issue #1226): earlier
+    # tests on the same xdist worker can leave un-awaited AsyncMock coroutines
+    # in reference cycles, and finalizing them inside the block below would
+    # attribute their warnings to this test. Recorded and discarded.
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        gc.collect()
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         result = await store.has_parent_window_text_sample()
@@ -59,10 +79,14 @@ async def test_real_table_primary_query_finds_sentinel_beyond_fallback_window(
         gc.collect()
 
     assert result is True
+    # Only never-awaited coroutines from the code under test's own chain
+    # count (issue #1226): foreign mock garbage names
+    # ``AsyncMockMixin._execute_mock_call`` and must not fail this test.
     never_awaited = [
         w
         for w in caught
         if issubclass(w.category, RuntimeWarning)
         and "never awaited" in str(w.message)
+        and any(q in str(w.message) for q in _OWN_COROUTINE_QUALNAMES)
     ]
     assert not never_awaited, [str(w.message) for w in never_awaited]
