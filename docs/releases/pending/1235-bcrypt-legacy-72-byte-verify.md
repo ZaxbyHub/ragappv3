@@ -9,7 +9,9 @@ already on master and is not caused by the passlib 1.9.5 bump).
 the first verifier. Its direct-`bcrypt` fallback now:
 
 - runs only for bcrypt-format hashes (`$2a$`, `$2b$`, `$2y$`); any other hash
-  that passlib could not verify fails closed with `False`, as before;
+  that passlib could not verify fails closed with `False`. One narrowing: a
+  `$2x$` hash, which passlib cannot create and this app never writes,
+  previously verified through the raw-bcrypt fallback and now fails closed;
 - passes the first 72 bytes of the UTF-8 encoded password to
   `bcrypt.checkpw`, which is exactly the secret bcrypt 4.x hashed when the
   legacy hash was stored. The cut is by bytes, so it can split a multibyte
@@ -26,7 +28,7 @@ hash-time policy only (it is already `False` by default and does not change
 what is passed to the backend on verify; verified by probe). So users whose
 legacy bcrypt hash came from a password over 72 bytes got a 401 on every
 login. The password policy allows 128 characters, and non-ASCII passwords pass
-72 bytes at 18 to 37 characters (four- to two-byte characters).
+72 bytes at 19 to 37 characters (four- to two-byte characters).
 
 ## Security notes
 
