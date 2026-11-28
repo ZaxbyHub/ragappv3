@@ -119,6 +119,23 @@ class TestStopReachesTerminalStateWhenCancelled(unittest.IsolatedAsyncioTestCase
         processor._queued_file_ids = {"b"}
         processor._reindex_job_ids = {"c"}
 
+        # The pre-drain tasks the shutdown sequence owns as well: an outside
+        # cancellation can land BETWEEN their cancellation steps, so the
+        # finalizer must cancel them too (the owned-task list is the
+        # contract here, and each category must be discriminated).
+        owned_tasks = {
+            "_startup_recovery_task": asyncio.create_task(
+                asyncio.sleep(3600)
+            ),
+            "_jobs_migration_task": asyncio.create_task(asyncio.sleep(3600)),
+            "_artifact_sweep_tasks": [
+                asyncio.create_task(asyncio.sleep(3600)),
+                asyncio.create_task(asyncio.sleep(3600)),
+            ],
+        }
+        for attr, task in owned_tasks.items():
+            setattr(processor, attr, task)
+
         # A stage that never finishes: the shape in which an outside
         # cancellation lands inside the shutdown sequence.
         async def _never_finishes():
@@ -147,6 +164,23 @@ class TestStopReachesTerminalStateWhenCancelled(unittest.IsolatedAsyncioTestCase
             "the ownership registries must be cleared even on the "
             "cancellation path",
         )
+        # EVERY owned task category must be cancelled on the cancellation
+        # path: a task left running outlives the shutdown envelope and
+        # keeps its resources (a lease, a file handle) past the exit.
+        flat_tasks = []
+        for attr, task in owned_tasks.items():
+            flat_tasks.extend(task if isinstance(task, list) else [task])
+        for attr, task in owned_tasks.items():
+            tasks = task if isinstance(task, list) else [task]
+            for index, owned in enumerate(tasks):
+                self.assertTrue(
+                    owned.cancelled(),
+                    f"{attr}[{index}] must be cancelled by the finalizer: "
+                    "an outside cancellation lands before the sequence's own "
+                    "cancellation steps, so the finalizer is the only thing "
+                    "that can stop the still-owned task",
+                )
+        await asyncio.gather(*flat_tasks, return_exceptions=True)
 
 
 class TestDeclinedTailLogNamesTheBlockedWorkflow(unittest.IsolatedAsyncioTestCase):
