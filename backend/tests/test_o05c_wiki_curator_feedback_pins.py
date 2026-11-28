@@ -48,6 +48,7 @@ from app.services.circuit_breaker import is_outage_status  # noqa: E402
 from app.services.wiki_compiler import (  # noqa: E402
     _CURATOR_OFFLOAD_EXECUTOR,
     WikiCompiler,
+    _get_curator_offload_executor,
 )
 from app.services.wiki_curator import (  # noqa: E402
     _CURATOR_SYSTEM_PROMPT,
@@ -433,7 +434,12 @@ class TestSerializationPremises(unittest.TestCase):
             "app.services.wiki_compiler.WikiCurator"
         ) as cur_ctor, patch(
             "app.services.wiki_compiler._CURATOR_OFFLOAD_EXECUTOR",
-            wraps=_CURATOR_OFFLOAD_EXECUTOR,
+            # The LIVE executor, resolved at patch time: the module global
+            # is recreated on demand after a lifespan shutdown, so the
+            # import-time object can be a DEAD pool by the time this test
+            # runs (a submit to it raises and leaves the curate coroutine
+            # never awaited - the #565 gate's failure).
+            wraps=_get_curator_offload_executor(),
         ) as spy:
             cur_ctor.return_value.curate = _fake_curate
             # Plain sync context: no running event loop in this thread --

@@ -37,16 +37,16 @@ committed baseline JSON is the source of truth, this table must match it):
 |----------|-------|
 | HIGH     | 6     |
 | MEDIUM   | 63    |
-| LOW      | 58    |
-| **Total**| **127** |
+| LOW      | 52    |
+| **Total**| **121** |
 
-across 30 files under `backend/app`. The dominant finding families are:
+across 29 files under `backend/app`. The dominant finding families are:
 
 | Bandit ID | Meaning | Count |
 |-----------|---------|-------|
 | B608 | Hardcoded SQL expressions (string-built queries) | 63 |
 | B105 | Hardcoded password / secret string | 31 |
-| B110 | `try/except/pass` (errors swallowed) | 22 |
+| B110 | `try/except/pass` (errors swallowed) | 16 |
 | B324 | Weak hashlib import/use | 6 |
 | others | misc | 5 |
 

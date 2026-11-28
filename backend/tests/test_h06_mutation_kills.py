@@ -177,17 +177,18 @@ def test_org_member_removal_mutant_is_killed(tmp_path):
 def test_lifespan_shutdown_stop_mutant_is_killed(tmp_path):
     """#743 AC3: skipping background_processor.stop() in lifespan shutdown.
 
-    Replaces the ``await app.state.background_processor.stop()`` line in
-    app/lifespan.py with ``pass``; every tests/*lifespan*.py file (resolved
-    by glob in the copy, so new lifespan test files count) must fail at
-    least one test.
+    Replaces the ``await asyncio.wait_for(
+    app.state.background_processor.stop(timeout=remaining_budget), ...)`` call
+    in app/lifespan.py (#854 shape: bounded call with the remaining budget)
+    with ``pass``; every tests/*lifespan*.py file (resolved by glob in the
+    copy, so new lifespan test files count) must fail at least one test.
     """
     copy_root = _prepare_copy(tmp_path)
     _mutate(
         copy_root,
         "app/lifespan.py",
-        "        await app.state.background_processor.stop()",
-        "        pass",
+        "app.state.background_processor.stop(timeout=remaining_budget),",
+        "asyncio.sleep(0),",
     )
     suite = sorted(
         f"tests/{path.name}"

@@ -21,6 +21,13 @@ param(
 
 $ErrorActionPreference = "SilentlyContinue"
 
+# The CTRL_BREAK sender's OWN failure codes (2 = usage, 3 = the console
+# attach failed, 4 = the event delivery failed). Only these mean the
+# signal was NOT delivered; any other non-zero status is UNKNOWN and the
+# full graceful window applies (a shortened window could force-kill a
+# graceful shutdown that is still inside the enforced envelope).
+$SENDER_DELIVERY_FAILURE_CODES = @(2, 3, 4)
+
 $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path
 $BackendDir = Join-Path $RepoRoot "backend"
 $FrontendDir = Join-Path $RepoRoot "frontend"
@@ -49,21 +56,180 @@ function Test-LocalPort {
     return [bool](Get-NetTCPConnection -LocalPort ([int]$Port) -ErrorAction SilentlyContinue)
 }
 
+# Graceful stop (#799 AC4/#854): taskkill-without-/F and Stop-Process-without-
+# -Force do NOT deliver a Python signal for console apps (CTRL_CLOSE_EVENT is
+# unmapped by CPython), so the only sound native mechanism is a targeted
+# CTRL_BREAK to the backend's process GROUP (created at launch with
+# CREATE_NEW_PROCESS_GROUP): CPython maps it to SIGBREAK, uvicorn handles
+# SIGBREAK, and the lifespan shutdown sequence runs. The signal dance runs in
+# a SACRIFICIAL CHILD powershell (FreeConsole before AttachConsole, so the
+# parent's console is never touched and there is nothing to restore) and only
+# when the pid marker proves the owner is our grouped backend (pid + start
+# time); anything else takes the bounded wait + force fallback.
+# The marker names the GROUP LEADER the launcher spawned, with its
+# wall-clock start stamp. On Windows a venv's Scripts\python.exe is a
+# REDIRECTOR that starts the real interpreter as a CHILD, so the process that
+# owns the backend port is a DESCENDANT of the marked process. Both the
+# marker match and the CTRL_BREAK target depend on that distinction.
+function Get-BackendGroupMarker {
+    $markerPath = Join-Path $RepoRoot ".cache\backend.pid"
+    if (-not (Test-Path -LiteralPath $markerPath)) { return $null }
+    try {
+        $parts = (Get-Content -LiteralPath $markerPath -ErrorAction Stop) -split '\s+'
+        $markedPid = [int]$parts[0]
+        $markedTicks = [math]::Floor([double]$parts[1])
+    } catch { return $null }
+    if ($markedPid -le 0) { return $null }
+    return @{ Pid = $markedPid; Ticks = $markedTicks }
+}
+
+function Test-ProcessDescendsFrom {
+    # True when $ChildPid is $AncestorPid or one of its descendants (bounded
+    # walk up the parent chain). Used for the venv-redirector case: the port
+    # owner is the redirector's child.
+    param([int]$ChildPid, [int]$AncestorPid, [int]$MaxDepth = 8)
+    $current = $ChildPid
+    for ($i = 0; $i -lt $MaxDepth; $i++) {
+        if ($current -eq $AncestorPid) { return $true }
+        $info = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $current" -ErrorAction SilentlyContinue
+        if ($null -eq $info -or $null -eq $info.ParentProcessId) { return $false }
+        $parent = [int]$info.ParentProcessId
+        if ($parent -le 0 -or $parent -eq $current) { return $false }
+        $current = $parent
+    }
+    return $false
+}
+
+function Stop-BackendProcessGracefully {
+    param($Proc, [string]$Label)
+    $grouped = $false
+    $groupPid = 0
+    $marker = Get-BackendGroupMarker
+    if ($null -ne $marker) {
+        # The port owner is the marked process itself, or (a venv
+        # redirector) its DESCENDANT.
+        if ($marker.Pid -eq $Proc.Id -or (Test-ProcessDescendsFrom $Proc.Id $marker.Pid)) {
+            $markedProc = Get-Process -Id $marker.Pid -ErrorAction SilentlyContinue
+            if ($null -ne $markedProc -and $null -ne $markedProc.StartTime) {
+                # .NET FILETIME tolerance: the wrapper stamps wall-clock at
+                # spawn; allow 60 s of skew. A reused PID is minutes apart.
+                # The check is on the MARKED process (the group leader),
+                # which is the process the wrapper stamped.
+                $liveTicks = [math]::Floor($markedProc.StartTime.ToFileTime())
+                if ([math]::Abs($liveTicks - $marker.Ticks) -lt 600000000) {
+                    $grouped = $true
+                    $groupPid = $marker.Pid
+                }
+            }
+        }
+    }
+    if ($grouped) {
+        # Sacrificial sender: scripts/win_send_ctrl_break.py detaches ITS OWN
+        # console, attaches to the backend's, sends the targeted CTRL_BREAK,
+        # and exits — the parent script's console is never touched.
+        $Sender = Join-Path $RepoRoot "scripts\win_send_ctrl_break.py"
+        $SenderVenvPy = Join-Path $RepoRoot "backend\venv\Scripts\python.exe"
+        $SenderPy = if ($env:BACKEND_PYTHON) { $env:BACKEND_PYTHON } elseif (Test-Path $SenderVenvPy) { $SenderVenvPy } else { "python" }
+        # The CTRL_BREAK goes to the GROUP id (the group leader the marker
+        # names) -- GenerateConsoleCtrlEvent's group argument must be the
+        # group leader, and with a venv that is the redirector, not the port
+        # owner.
+        # The sender path is path-valued: quote it (Windows PowerShell 5.1
+        # splits an unquoted -ArgumentList element on spaces). -Wait -PassThru
+        # lets the script SEE the sender's exit status, so a failed attach or
+        # a failed CTRL_BREAK is reported instead of silently waiting out the
+        # whole graceful window.
+        # The quoted path and the pid must be SEPARATE array elements:
+        # `@('"{0}"' -f $Sender, "$groupPid")` makes the pid a FORMAT
+        # OPERAND, so the array collapses to one element and the sender
+        # never receives the pid (verified with a PowerShell probe).
+        $QuotedSender = '"{0}"' -f $Sender
+        $SenderProc = Start-Process $SenderPy -ArgumentList @($QuotedSender, "$groupPid") -WindowStyle Hidden -Wait -PassThru
+        $SenderExit = $SenderProc.ExitCode
+        # Only the sender's OWN failure codes mean the signal was NOT
+        # delivered. Any other non-zero status is UNKNOWN (e.g. the
+        # interpreter's exit-time flush failure, 120) and the signal may
+        # well have been delivered, so the FULL graceful window applies:
+        # shortening it could force-kill a graceful shutdown that is still
+        # inside the enforced envelope.
+        $SenderFailed = $SenderExit -in $SENDER_DELIVERY_FAILURE_CODES
+        if ($SenderFailed) {
+            Write-Output "  ${Label}: the CTRL_BREAK sender reported exit code $SenderExit (attach or event delivery failed); the signal was NOT delivered"
+        } elseif ($SenderExit -ne 0) {
+            Write-Output "  ${Label}: the CTRL_BREAK sender reported exit code $SenderExit, which is not one of its own status codes ($($SENDER_DELIVERY_FAILURE_CODES -join ', ')); the delivery status is UNKNOWN, so the full graceful window applies"
+        }
+        Write-Output "  ${Label}: sent graceful CTRL_BREAK to grouped backend (group $groupPid, owner PID $($Proc.Id)); waiting..."
+        # 140 s > the composed shutdown envelope, so the force fallback
+        # never fires before a graceful shutdown that stayed inside the
+        # envelope's ENFORCED 100 s completes. The derivation, quoted
+        # VERBATIM by docker-compose.yml, the lifespan module, the release
+        # fragment and stop-services.ps1:
+        #   enforced: 20 s (uvicorn request drain) + 65 s (lifespan aggregate) + 15 s (turn-finalizer drain) = 100 s; allowance: 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 35 s; total 135 s
+        # scripts/check_p03_shutdown_envelope.py owns that arithmetic.
+        # The two windows are NAMED: the envelope gate reads
+        # $GracefulWindowMs (the force-stop deadline the envelope bounds)
+        # and $FailedSignalWaitMs (a different path, below), so a literal
+        # inside a WaitForExit call can never be mistaken for the other.
+        $GracefulWindowMs = 140000
+        # A FAILED signal delivery means no graceful shutdown was started:
+        # waiting the whole 140 s graceful window buys nothing, so fall back
+        # to the short bounded wait and then force-stop.
+        $FailedSignalWaitMs = 15000
+        $WaitMs = if ($SenderFailed) { $FailedSignalWaitMs } else { $GracefulWindowMs }
+        if (-not $Proc.WaitForExit($WaitMs)) {
+            Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
+            Write-Output "  ${Label}: graceful window expired; force-stopped (PID $($Proc.Id))"
+        } else {
+            Write-Output "  ${Label}: stopped gracefully (PID $($Proc.Id))"
+        }
+    } else {
+        Write-Output "  ${Label}: no grouped-backend marker match (PID $($Proc.Id)); bounded wait + force"
+        if (-not $Proc.WaitForExit(15000)) {
+            Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
+            Write-Output "  ${Label}: force-stopped (PID $($Proc.Id))"
+        }
+    }
+}
+
 function Stop-ProcessOnPort {
-    param([string]$Port)
+    param([string]$Port, [switch]$Graceful)
     $connections = Get-NetTCPConnection -LocalPort ([int]$Port) -ErrorAction SilentlyContinue
+    $seen = @{}
     foreach ($connection in $connections) {
         $proc = Get-Process -Id $connection.OwningProcess -ErrorAction SilentlyContinue
         if ($proc) {
-            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            if ($seen.ContainsKey($proc.Id)) { continue }
+            $seen[$proc.Id] = $true
+            if ($Graceful) {
+                Stop-BackendProcessGracefully $proc "port $Port"
+            } else {
+                # Only the backend is a signal-handling console app; the
+                # frontend process gets the immediate force stop it had at
+                # base (a bounded wait bought nothing for it).
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                Write-Output "  port ${Port}: force-stopped (PID $($proc.Id))"
+            }
         }
     }
 }
 
 if ($StopExisting) {
-    Stop-ProcessOnPort $BackendPort
+    Stop-ProcessOnPort $BackendPort -Graceful
     Stop-ProcessOnPort $FrontendPort
     Start-Sleep -Seconds 2
+}
+
+# A SECOND launch while the backend port is already held must not run: the
+# grouped wrapper writes the pid marker right after spawning, so the new
+# (failing) child would overwrite the live backend's marker and the stop
+# path would fall back to the force branch. Without -StopExisting the
+# operator asked to keep what is running.
+$BackendPortHeld = [bool](Get-NetTCPConnection -LocalPort ([int]$BackendPort) -ErrorAction SilentlyContinue)
+if ($BackendPortHeld) {
+    Write-Output "  ${BackendPort} (Backend): already in use - skipping the backend launch (use -StopExisting to replace it)"
+    $SkipBackendLaunch = $true
+} else {
+    $SkipBackendLaunch = $false
 }
 
 if (-not $SkipOllama) {
@@ -143,10 +309,37 @@ if (-not $SkipEmbedding) {
     }
 }
 
-Start-Process $BackendPython `
-    -ArgumentList "-m","uvicorn","app.main:app","--host","0.0.0.0","--port",$BackendPort,"--no-access-log" `
-    -WorkingDirectory $BackendDir `
-    -WindowStyle Hidden
+# Backend launch (#799 AC4/AC5, #854 envelope): the uvicorn args carry the
+# integer request-drain bound (keep in sync with Dockerfile CMD and
+# docker-compose.yml's derivation), and the process is started through the
+# scripts/win_grouped_backend.py wrapper that spawns the backend with CREATE_NEW_PROCESS_GROUP so
+# the uvicorn python becomes a process-GROUP leader (pgid == pid) sharing the
+# wrapper's console — stop-services.ps1 then delivers a TARGETED
+# CTRL_BREAK to that nonzero group id for a graceful native stop. The
+# wrapper records the child pid + an approximate .NET FILETIME start stamp
+# so the stop script can verify ownership (a reused PID mismatches the
+# live process start time and takes the ungrouped fallback).
+# RAGAPP_BOUNDED_EXIT=1 (inherited by the child only for this launch)
+# enables the lifespan's bounded tail exit — same contract as the Dockerfile.
+$BackendArgs = @("-m","uvicorn","app.main:app","--host","0.0.0.0","--port",$BackendPort,"--no-access-log","--timeout-graceful-shutdown","20")
+if (-not $SkipBackendLaunch) {
+    $env:RAGAPP_BOUNDED_EXIT = "1"
+    $env:RAGAPP_MARKER_DIR = $RepoRoot
+    # Windows PowerShell 5.1 joins -ArgumentList array elements with spaces
+    # and does NOT quote them, so a path-valued element (a repo root
+    # containing a space) is split into two argv entries and the interpreter
+    # exits before it starts. Every path-valued element therefore carries
+    # embedded quotes.
+    $WrapperScript = Join-Path $RepoRoot "scripts\win_grouped_backend.py"
+    $QuotedWrapper = '"{0}"' -f $WrapperScript
+    $QuotedBackendPython = '"{0}"' -f $BackendPython
+    Start-Process $BackendPython `
+        -ArgumentList (@($QuotedWrapper, $QuotedBackendPython) + $BackendArgs) `
+        -WorkingDirectory $BackendDir `
+        -WindowStyle Hidden
+    $env:RAGAPP_BOUNDED_EXIT = $null
+    $env:RAGAPP_MARKER_DIR = $null
+}
 
 # Use cmd /c to avoid npm .cmd being opened in Notepad by Start-Process.
 Start-Process cmd `

@@ -278,6 +278,8 @@ python scripts/check_l09_skill_trigger_paths.py  # generated skill trigger globs
 python scripts/check_l09_index_assets.py   # %BASE_URL% links in index.html exist under public/
 python scripts/check_l09_memory_response_fields.py   # no phantom fields in AddMemoryResponse vs the backend MemoryResponse
 python scripts/check_n05_draftclaim_nullable.py   # DraftClaim TS nullability matches the backend claim model
+python scripts/check_p03_graceful_shutdown.py     # the bounded uvicorn grace and the compose stop grace
+python scripts/check_p03_shutdown_envelope.py     # the ONE shutdown-envelope derivation and its force limits
 ```
 
 **Closure evidence gate** (from repo root; standalone workflow

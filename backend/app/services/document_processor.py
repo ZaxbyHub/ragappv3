@@ -1200,6 +1200,24 @@ class ParseInFlightError(DocumentProcessingError):
 # to_thread work that also shares the default pool (issue #703 review).
 _PARSE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ingest-parse")
 
+
+def _get_parse_executor() -> ThreadPoolExecutor:
+    """Recreate-on-demand accessor for the parse executor.
+
+    The lifespan shutdown shuts this executor down (``wait=False,
+    cancel_futures=True``) so queued parses never extend interpreter exit;
+    mirroring the wiki-lint accessor convention
+    (``app.api.routes.wiki._get_wiki_lint_executor``, PR #1113 N-05a), a
+    shut-down executor is replaced with a FRESH one so the next lifespan
+    entry in the same interpreter (tests, embedded runs) can still parse.
+    """
+    global _PARSE_EXECUTOR
+    if getattr(_PARSE_EXECUTOR, "_shutdown", False) is True:
+        _PARSE_EXECUTOR = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="ingest-parse"
+        )
+    return _PARSE_EXECUTOR
+
 _PARSE_IN_FLIGHT_GUARD = threading.Lock()
 _PARSE_IN_FLIGHT: set = set()
 
@@ -1282,7 +1300,7 @@ async def _parse_with_deadline(
     # its cancel() is the precise queued-vs-running discriminator the
     # timeout handler needs (issue #703 owner review). The asyncio-side
     # future reads cancelled in both cases once wait_for cancels it.
-    concurrent = _PARSE_EXECUTOR.submit(_tracked)
+    concurrent = _get_parse_executor().submit(_tracked)
     fut = asyncio.wrap_future(concurrent)
     try:
         return await asyncio.wait_for(

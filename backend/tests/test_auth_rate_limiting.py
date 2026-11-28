@@ -237,12 +237,17 @@ class TestMainPySecurityWarnings(unittest.TestCase):
         cls.src = _read_file(MAIN_PY)
 
     def test_jwt_default_key_warning(self):
-        """main.py must warn when jwt_secret_key is using default value."""
-        self.assertIn("jwt_secret_key", self.src, "main.py must check jwt_secret_key")
-        self.assertRegex(
+        """#799 AC9: the JWT-default warning was UNREACHABLE and is removed.
+
+        USERS_ENABLED=True + default JWT refuses to construct Settings, and
+        USERS_ENABLED=False never evaluated the warning's guard, so no
+        runtime state could produce it. main.py must not carry the dead
+        block (its text is also a frozen stale-string target, C8).
+        """
+        self.assertNotIn(
+            "jwt_secret_key is using the default value",
             self.src,
-            r"SECURITY WARNING.*jwt_secret_key",
-            "main.py must log a SECURITY WARNING about jwt_secret_key default",
+            "the unreachable JWT-default warning must not exist",
         )
 
     def test_cors_wildcard_warning(self):

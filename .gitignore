@@ -97,3 +97,6 @@ frontend/reports/
 
 # fetch-fonts staging residue (issue #780 review: a hard-killed run must not be committable)
 frontend/src/assets/fonts/*.part
+
+# Runtime pid marker written by start-services.ps1 group wrapper (#799/#854)
+.cache/

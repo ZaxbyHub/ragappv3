@@ -939,14 +939,17 @@ async def _promote(
             exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
         )
 
-        cleanup_ok = await _compensate_shielded(
-            db_pool,
-            background_processor=background_processor,
-            promotion_id=promotion_id,
-            file_id=file_id,
-            dest_path=dest_path,
-            enqueued_file_id=enqueued_file_id,
-        )
+        from app.services.shutdown_gate import critical_shutdown_work
+
+        async with critical_shutdown_work("draft-promotion-compensation"):
+            cleanup_ok = await _compensate_shielded(
+                db_pool,
+                background_processor=background_processor,
+                promotion_id=promotion_id,
+                file_id=file_id,
+                dest_path=dest_path,
+                enqueued_file_id=enqueued_file_id,
+            )
 
         if is_control_flow:
             raise

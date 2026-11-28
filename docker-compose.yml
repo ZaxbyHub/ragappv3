@@ -130,14 +130,42 @@ services:
     container_name: knowledgevault
     restart: unless-stopped
     logging: *default-logging
-    # Shutdown budget (issue #700, T1-04-S2-02): BackgroundProcessor.stop()
-    # applies its 60 s timeout PER DRAIN PHASE (queues, enrichment, atoms,
-    # lease settle) and the final optimize is unbounded, so the composed
-    # worst case exceeds 4x60 s. 90 s covers the common single-phase drain;
-    # a busy multi-phase shutdown can still be SIGKILLed (tracked follow-up
-    # for a composed stop() budget). Keep this >= stop()'s per-phase timeout
-    # when changing either.
-    stop_grace_period: 90s
+    # Shutdown budget (issues #700/#854/#799 — derivation, keep in sync with
+    # Dockerfile CMD and lifespan._SHUTDOWN_BUDGET_SECONDS): uvicorn drains
+    # in-flight requests for 20 s (--timeout-graceful-shutdown), the lifespan
+    # then runs its whole shutdown sequence under ONE 60 s aggregate budget
+    # (_SHUTDOWN_BUDGET_SECONDS: email, residency, watcher, four processor
+    # stops — stop() itself aggregates its drain phases inside its slice, plus
+    # one shared maintenance slice — admission, store/pool closes, the
+    # upload-commit drain), and the bounded tail exit ends the process at
+    # completion, skipping the non-critical executor joins. The turn-finalizer
+    # drain keeps its OWN enforced budget (5 s producer retirement + 10 s
+    # drain) OUTSIDE that 60 s.
+    #
+    # ONE derivation, quoted VERBATIM by both .ps1 scripts, the lifespan
+    # module, the release fragment and the PR body — the composed
+    # shutdown envelope:
+    #   enforced: 20 s (uvicorn request drain) + 65 s (lifespan aggregate) + 15 s (turn-finalizer drain) = 100 s; allowance: 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 35 s; total 135 s
+    # (the 65 s is the 60 s lifespan aggregate plus the 5 s slack the
+    # residency settle or the processor stop may take past it - never both,
+    # they share the deadline; the 15 s is the turn-finalizer drain's 5 s
+    # producer retirement plus its 10 s drain.)
+    # The three ENFORCED terms are bounded by the code that implements
+    # them; the two ALLOWANCE terms (the executor-join tail and the
+    # interpreter teardown) are bounded by NO code - they are the slack
+    # the force limits leave for the paths nothing else bounds.
+    # scripts/check_p03_shutdown_envelope.py owns this arithmetic: it reads
+    # every enforced term from the code that enforces it and fails when a
+    # surface stops quoting this line.
+    # This 150 s grace and the 140 s native stop wait are both strictly
+    # above the composed envelope, so a shutdown that stays inside the
+    # enforced 100 s is never force-killed mid-flight. State B - a
+    # critical-incomplete shutdown (live-turn
+    # finalizer timeout with the pool deliberately open per #1202, or upload
+    # compensation still in flight per PRR-020) - intentionally continues
+    # past this envelope until the critical work finishes or this grace
+    # force-cuts it: the deliberate data-safety preference over a hard exit.
+    stop_grace_period: 150s
     ports:
       - "${PORT:-9090}:9090"
     volumes:
@@ -431,8 +459,9 @@ services:
     healthcheck:
       # Readiness probe (/api/healthz) instead of the always-200 liveness
       # route (/health): the backend healthcheck now fails on a failed startup
-      # migration, a vector-store model mismatch, or recent pool saturation
-      # (issue #550). /health stays pure liveness.
+      # migration, a failed upload migration at startup, a vector-store model
+      # mismatch, or recent pool saturation (issue #550). /health stays pure
+      # liveness.
       test: ["CMD-SHELL", "python -c \"import urllib.request; exit(0 if urllib.request.urlopen('http://localhost:9090/api/healthz').getcode() == 200 else 1)\""]
       interval: 30s
       timeout: 10s

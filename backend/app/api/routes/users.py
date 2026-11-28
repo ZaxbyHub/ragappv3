@@ -1107,121 +1107,27 @@ async def delete_user(
             )
 
         finalize_task: asyncio.Future | None = None
-        try:
-            delete_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="user_delete"
-            )
-            delete_future = delete_executor.submit(_delete_user_row)
-            await asyncio.wrap_future(delete_future)
-        except HTTPException:
-            # transaction_context already rolled the transaction back; a late
-            # refusal restores the tombstoned Draft Room bytes (see the purge
-            # preparation above for the ordering contract). Issue #1036 AC4:
-            # the restore is DRAINED — a cancellation delivered at this await
-            # must not strand the tombstones; it propagates only after the
-            # restore completes.
-            if draft_purge_plan is not None:
-                restore_cancelled, restore_error = await _drain(
-                    asyncio.ensure_future(
-                        asyncio.to_thread(
-                            draft_deletion.restore_purge, draft_purge_plan
-                        )
+        # Recovery-critical registration (#799/#854 shutdown gate): from the
+        # delete submission through settlement, exceptional rollback/restore,
+        # and BOTH committed-finalization paths (cancelled and normal), this
+        # request runs a durability protocol that absorbs cancellation — the
+        # bounded tail exit must not fire while any of it is live.
+        from app.services.shutdown_gate import critical_shutdown_work
+
+        async with critical_shutdown_work("user-delete-durability"):
+            try:
+                    delete_executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="user_delete"
                     )
-                )
-                if restore_error is not None and not isinstance(
-                    restore_error, asyncio.CancelledError
-                ):
-                    logger.error(
-                        "draft_room_user_purge_restore_failed user_id=%s reason=%s",
-                        user_id,
-                        type(restore_error).__name__,
-                    )
-                if restore_cancelled:
-                    raise asyncio.CancelledError
-            raise
-        except (sqlite3.Error, OSError, RuntimeError) as e:
-            if draft_purge_plan is not None:
-                restore_cancelled, restore_error = await _drain(
-                    asyncio.ensure_future(
-                        asyncio.to_thread(
-                            draft_deletion.restore_purge, draft_purge_plan
-                        )
-                    )
-                )
-                if restore_error is not None and not isinstance(
-                    restore_error, asyncio.CancelledError
-                ):
-                    logger.error(
-                        "draft_room_user_purge_restore_failed user_id=%s reason=%s",
-                        user_id,
-                        type(restore_error).__name__,
-                    )
-                if restore_cancelled:
-                    raise asyncio.CancelledError
-            logger.exception("Error deleting user %d", user_id)
-            raise HTTPException(
-                status_code=500, detail="Failed to delete user"
-            ) from e
-        except BaseException:
-            # Issue #1019 backstop: every exception class the two handlers
-            # above do not name (asyncio.CancelledError on client
-            # disconnect, KeyboardInterrupt, any other exception type), plus
-            # cancellation of the await while the worker runs detached.
-            # Settlement is observed through the worker-side event — never by
-            # re-awaiting the future, which would re-raise the worker's own
-            # exception and replace this one before the restore could run.
-            # A cancelled (never-entered) work item has no event to wait
-            # for: nothing ran, so the rows trivially survived. A submission
-            # failure means the item never existed at all — the same
-            # disposition, and the wait below is skipped for it too.
-            # Issue #1031: the settlement wait itself is DRAINED — a second
-            # cancellation delivered while it is pending must not exit this
-            # arm before the committed check below (plan-critic round 1
-            # finding 3). The EVENT is the truth, never any single wait
-            # task: a settle-wait task that fails or is cancelled (loop
-            # shutdown) is re-created until the worker actually settles, so
-            # a failed wait can never be mistaken for an observed
-            # non-commit (review lane finding: the discarded drain tuple
-            # previously let the arm roll back and release the connection
-            # while the worker was still inside its transaction).
-            if delete_future is not None and not delete_future.cancelled():
-                while not delete_settled.is_set():
-                    settle_wait_task: asyncio.Future = asyncio.ensure_future(
-                        asyncio.to_thread(delete_settled.wait)
-                    )
-                    await _drain(settle_wait_task)
-            if not delete_outcome["committed"]:
-                # Restore whenever a commit was never proven. The rollback
-                # covers a BaseException raised inside the worker that
-                # skipped transaction_context's `except Exception` rollback;
-                # it is guarded so a cleanup failure cannot replace the
-                # primary exception. Issue #1036 AC4: the WHOLE recovery
-                # sequence (rollback + restore_purge) is DRAINED with
-                # cancellation deferred until the sequence completes — a
-                # second cancellation delivered at either await is absorbed
-                # and re-raised only AFTER the restore, never between the
-                # two steps (plan-critic round 2, finding 5).
-                recovery_cancelled = False
-                try:
-                    if conn.in_transaction:
-                        rollback_cancelled, rollback_error = await _drain(
-                            asyncio.ensure_future(
-                                asyncio.to_thread(lambda: conn.rollback())
-                            )
-                        )
-                        recovery_cancelled = recovery_cancelled or rollback_cancelled
-                        if rollback_error is not None and not isinstance(
-                            rollback_error, asyncio.CancelledError
-                        ):
-                            logger.warning(
-                                "draft_room_user_delete_rollback_failed user_id=%s",
-                                user_id,
-                            )
-                except Exception:
-                    logger.warning(
-                        "draft_room_user_delete_rollback_failed user_id=%s",
-                        user_id,
-                    )
+                    delete_future = delete_executor.submit(_delete_user_row)
+                    await asyncio.wrap_future(delete_future)
+            except HTTPException:
+                # transaction_context already rolled the transaction back; a late
+                # refusal restores the tombstoned Draft Room bytes (see the purge
+                # preparation above for the ordering contract). Issue #1036 AC4:
+                # the restore is DRAINED — a cancellation delivered at this await
+                # must not strand the tombstones; it propagates only after the
+                # restore completes.
                 if draft_purge_plan is not None:
                     restore_cancelled, restore_error = await _drain(
                         asyncio.ensure_future(
@@ -1230,7 +1136,6 @@ async def delete_user(
                             )
                         )
                     )
-                    recovery_cancelled = recovery_cancelled or restore_cancelled
                     if restore_error is not None and not isinstance(
                         restore_error, asyncio.CancelledError
                     ):
@@ -1239,72 +1144,175 @@ async def delete_user(
                             user_id,
                             type(restore_error).__name__,
                         )
-                if recovery_cancelled:
-                    # The recovery completed; now the absorbed cancellation
-                    # propagates (never swallowed — same contract as the
-                    # committed-path finalization).
-                    raise asyncio.CancelledError
-            else:
-                # Issue #1031: the delete COMMITTED even though this request
-                # is being cancelled — the audit event, cache invalidation
-                # and purge finalization must still run before the original
-                # exception propagates. Drained so a second cancellation
-                # cannot skip it; a finalization failure is logged, never a
-                # replacement for the propagating exception.
-                if finalize_task is None:
-                    finalize_task = asyncio.ensure_future(
-                        _finalize_committed_delete()
+                    if restore_cancelled:
+                        raise asyncio.CancelledError
+                raise
+            except (sqlite3.Error, OSError, RuntimeError) as e:
+                if draft_purge_plan is not None:
+                    restore_cancelled, restore_error = await _drain(
+                        asyncio.ensure_future(
+                            asyncio.to_thread(
+                                draft_deletion.restore_purge, draft_purge_plan
+                            )
+                        )
                     )
-                finalize_cancelled, finalize_error = await _drain(finalize_task)
-                if finalize_error is not None:
-                    logger.warning(
-                        "user_delete_finalize_failed user_id=%s reason=%s",
-                        user_id,
-                        type(finalize_error).__name__,
-                    )
-                elif finalize_cancelled:
-                    # The original cancellation below already propagates;
-                    # this records that the drain absorbed additional
-                    # cancellations during the bookkeeping itself.
-                    logger.info(
-                        "user_delete_finalize_absorbed_cancellation user_id=%s",
-                        user_id,
-                    )
-            raise
-        finally:
-            # After any observed settlement the worker thread is already
-            # done, so no join is needed; in the disclosed second-cancellation
-            # residual the thread finishes its single item on its own. A
-            # construction failure leaves nothing to shut down.
-            if delete_executor is not None:
-                delete_executor.shutdown(wait=False)
+                    if restore_error is not None and not isinstance(
+                        restore_error, asyncio.CancelledError
+                    ):
+                        logger.error(
+                            "draft_room_user_purge_restore_failed user_id=%s reason=%s",
+                            user_id,
+                            type(restore_error).__name__,
+                        )
+                    if restore_cancelled:
+                        raise asyncio.CancelledError
+                logger.exception("Error deleting user %d", user_id)
+                raise HTTPException(
+                    status_code=500, detail="Failed to delete user"
+                ) from e
+            except BaseException:
+                # Issue #1019 backstop: every exception class the two handlers
+                # above do not name (asyncio.CancelledError on client
+                # disconnect, KeyboardInterrupt, any other exception type), plus
+                # cancellation of the await while the worker runs detached.
+                # Settlement is observed through the worker-side event — never by
+                # re-awaiting the future, which would re-raise the worker's own
+                # exception and replace this one before the restore could run.
+                # A cancelled (never-entered) work item has no event to wait
+                # for: nothing ran, so the rows trivially survived. A submission
+                # failure means the item never existed at all — the same
+                # disposition, and the wait below is skipped for it too.
+                # Issue #1031: the settlement wait itself is DRAINED — a second
+                # cancellation delivered while it is pending must not exit this
+                # arm before the committed check below (plan-critic round 1
+                # finding 3). The EVENT is the truth, never any single wait
+                # task: a settle-wait task that fails or is cancelled (loop
+                # shutdown) is re-created until the worker actually settles, so
+                # a failed wait can never be mistaken for an observed
+                # non-commit (review lane finding: the discarded drain tuple
+                # previously let the arm roll back and release the connection
+                # while the worker was still inside its transaction).
+                if delete_future is not None and not delete_future.cancelled():
+                    while not delete_settled.is_set():
+                        settle_wait_task: asyncio.Future = asyncio.ensure_future(
+                            asyncio.to_thread(delete_settled.wait)
+                        )
+                        await _drain(settle_wait_task)
+                if not delete_outcome["committed"]:
+                    # Restore whenever a commit was never proven. The rollback
+                    # covers a BaseException raised inside the worker that
+                    # skipped transaction_context's `except Exception` rollback;
+                    # it is guarded so a cleanup failure cannot replace the
+                    # primary exception. Issue #1036 AC4: the WHOLE recovery
+                    # sequence (rollback + restore_purge) is DRAINED with
+                    # cancellation deferred until the sequence completes — a
+                    # second cancellation delivered at either await is absorbed
+                    # and re-raised only AFTER the restore, never between the
+                    # two steps (plan-critic round 2, finding 5).
+                    recovery_cancelled = False
+                    try:
+                        if conn.in_transaction:
+                            rollback_cancelled, rollback_error = await _drain(
+                                asyncio.ensure_future(
+                                    asyncio.to_thread(lambda: conn.rollback())
+                                )
+                            )
+                            recovery_cancelled = recovery_cancelled or rollback_cancelled
+                            if rollback_error is not None and not isinstance(
+                                rollback_error, asyncio.CancelledError
+                            ):
+                                logger.warning(
+                                    "draft_room_user_delete_rollback_failed user_id=%s",
+                                    user_id,
+                                )
+                    except Exception:
+                        logger.warning(
+                            "draft_room_user_delete_rollback_failed user_id=%s",
+                            user_id,
+                        )
+                    if draft_purge_plan is not None:
+                        restore_cancelled, restore_error = await _drain(
+                            asyncio.ensure_future(
+                                asyncio.to_thread(
+                                    draft_deletion.restore_purge, draft_purge_plan
+                                )
+                            )
+                        )
+                        recovery_cancelled = recovery_cancelled or restore_cancelled
+                        if restore_error is not None and not isinstance(
+                            restore_error, asyncio.CancelledError
+                        ):
+                            logger.error(
+                                "draft_room_user_purge_restore_failed user_id=%s reason=%s",
+                                user_id,
+                                type(restore_error).__name__,
+                            )
+                    if recovery_cancelled:
+                        # The recovery completed; now the absorbed cancellation
+                        # propagates (never swallowed — same contract as the
+                        # committed-path finalization).
+                        raise asyncio.CancelledError
+                else:
+                    # Issue #1031: the delete COMMITTED even though this request
+                    # is being cancelled — the audit event, cache invalidation
+                    # and purge finalization must still run before the original
+                    # exception propagates. Drained so a second cancellation
+                    # cannot skip it; a finalization failure is logged, never a
+                    # replacement for the propagating exception.
+                    if finalize_task is None:
+                        finalize_task = asyncio.ensure_future(
+                            _finalize_committed_delete()
+                        )
+                    finalize_cancelled, finalize_error = await _drain(finalize_task)
+                    if finalize_error is not None:
+                        logger.warning(
+                            "user_delete_finalize_failed user_id=%s reason=%s",
+                            user_id,
+                            type(finalize_error).__name__,
+                        )
+                    elif finalize_cancelled:
+                        # The original cancellation below already propagates;
+                        # this records that the drain absorbed additional
+                        # cancellations during the bookkeeping itself.
+                        logger.info(
+                            "user_delete_finalize_absorbed_cancellation user_id=%s",
+                            user_id,
+                        )
+                raise
+            finally:
+                # After any observed settlement the worker thread is already
+                # done, so no join is needed; in the disclosed second-cancellation
+                # residual the thread finishes its single item on its own. A
+                # construction failure leaves nothing to shut down.
+                if delete_executor is not None:
+                    delete_executor.shutdown(wait=False)
 
-        # Issue #1031: the post-commit bookkeeping runs as one at-most-once
-        # DRAINED task on the normal path too — a cancellation delivered
-        # during the commit_purge or audit awaits previously skipped the
-        # remaining steps. `_drain` reports whether a cancellation was
-        # absorbed; the delete succeeded, so cancellation propagates only
-        # AFTER the bookkeeping completes (never swallowed — plan-critic
-        # round 2 findings 4 and 6).
-        if finalize_task is None:
-            finalize_task = asyncio.ensure_future(_finalize_committed_delete())
-        finalize_cancelled, finalize_error = await _drain(finalize_task)
-        if finalize_error is not None:
-            logger.warning(
-                "user_delete_finalize_failed user_id=%s reason=%s",
-                user_id,
-                type(finalize_error).__name__,
-            )
-            if isinstance(finalize_error, asyncio.CancelledError):
-                # A cancellation raised INSIDE the finalization (e.g. a
-                # scripted commit_purge cancel) is a cancellation-class
-                # event: propagate it after logging, never convert the
-                # request into a silent 200.
-                finalize_cancelled = True
-        if finalize_cancelled:
-            raise asyncio.CancelledError
+            # Issue #1031: the post-commit bookkeeping runs as one at-most-once
+            # DRAINED task on the normal path too — a cancellation delivered
+            # during the commit_purge or audit awaits previously skipped the
+            # remaining steps. `_drain` reports whether a cancellation was
+            # absorbed; the delete succeeded, so cancellation propagates only
+            # AFTER the bookkeeping completes (never swallowed — plan-critic
+            # round 2 findings 4 and 6).
+            if finalize_task is None:
+                finalize_task = asyncio.ensure_future(_finalize_committed_delete())
+            finalize_cancelled, finalize_error = await _drain(finalize_task)
+            if finalize_error is not None:
+                logger.warning(
+                    "user_delete_finalize_failed user_id=%s reason=%s",
+                    user_id,
+                    type(finalize_error).__name__,
+                )
+                if isinstance(finalize_error, asyncio.CancelledError):
+                    # A cancellation raised INSIDE the finalization (e.g. a
+                    # scripted commit_purge cancel) is a cancellation-class
+                    # event: propagate it after logging, never convert the
+                    # request into a silent 200.
+                    finalize_cancelled = True
+            if finalize_cancelled:
+                raise asyncio.CancelledError
 
-        return {"message": "User deleted", "user_id": user_id}
+            return {"message": "User deleted", "user_id": user_id}
     finally:
         pass  # conn is the request-scoped Depends(get_db) connection;
         # the dependency releases it (#798 AC4)

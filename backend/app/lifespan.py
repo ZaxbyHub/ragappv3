@@ -54,6 +54,41 @@ from app.utils.request_context import JsonFormatter, RequestIdFilter
 
 logger = logging.getLogger(__name__)  # noqa: E402
 
+# Aggregate process-shutdown budget (#799/#854, plan rev 7-10): one deadline
+# covering every lifespan shutdown stage (email, residency, watcher, the
+# four processor stops, admission, store/pool closes, the upload-commit and
+# turn-finalizer gates).
+#
+# The process envelope's ONE derivation, quoted VERBATIM by
+# docker-compose.yml, both .ps1 scripts, the release fragment and the PR
+# body. The three ENFORCED terms are bounded by the code that implements
+# them; the two ALLOWANCE terms (the executor-join tail and the
+# interpreter teardown) are bounded by NO code:
+#   enforced: 20 s (uvicorn request drain) + 65 s (lifespan aggregate) + 15 s (turn-finalizer drain) = 100 s; allowance: 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 35 s; total 135 s
+# (the 65 s is this 60 s budget plus the 5 s slack the residency settle or
+# the processor stop may take past it - never both, they share the deadline;
+# the 15 s is the turn-finalizer drain's 5 s producer retirement plus its
+# 10 s drain.) The 135 s composed envelope sits below the 140 s native
+# stop wait and the 150 s compose grace, so a shutdown that stays inside
+# the enforced 100 s is never force-killed mid-flight IN STATE A (the
+# bounded tail exit fired). In State B the tail exit is skipped while a
+# recovery-critical workflow is in flight: the process then exits through the
+# normal path and the outer grace MAY terminate it.
+# scripts/check_p03_shutdown_envelope.py owns that arithmetic: it reads
+# every enforced term from the code that enforces it and fails when a
+# surface stops quoting this line.
+_SHUTDOWN_BUDGET_SECONDS = 60.0
+
+# The extra slack the lifespan may take PAST its aggregate deadline: the
+# residency settle and the background processor's drain each get the REMAINING
+# budget plus this slack. The two uses never stack -- they share the one
+# deadline (a settle that takes the slack leaves _remaining() at 0, and the
+# processor stop is then skipped) -- so the envelope's "65 s (lifespan
+# aggregate)" term is exact. Named (not inlined) so the envelope contract gate
+# (scripts/check_p03_shutdown_envelope.py) reads this number from the code
+# that enforces it instead of restating it.
+_SHUTDOWN_SLACK_SECONDS = 5.0
+
 
 # ── Persisted-settings replay decoding (issue #494 CONFIG-003) ──────────────
 # Typed converters for ``settings_kv`` values, derived from the Settings field
@@ -153,6 +188,16 @@ def _create_llm_clients() -> "tuple[LLMClient | None, LLMClient | None]":
             "Thinking chat model not configured; chat is disabled until an "
             "endpoint is set (Settings -> Models or OLLAMA_CHAT_URL/CHAT_MODEL)"
         )
+    except URLBlocked as e:
+        # Environment-shaped failure (#799 AC3): the constructor runs the
+        # live-DNS assert_url_safe, so a blocked/unresolvable endpoint must
+        # degrade the client instead of failing startup — same degraded
+        # state as "not configured" until an operator fixes the endpoint.
+        logger.warning(
+            "Thinking chat endpoint rejected by the SSRF guard; chat is "
+            "disabled until the endpoint is fixed: %s",
+            e,
+        )
     try:
         instant = create_instant_client()
     except ModelNotConfiguredError:
@@ -160,6 +205,12 @@ def _create_llm_clients() -> "tuple[LLMClient | None, LLMClient | None]":
             "Instant chat model not configured; instant mode is disabled "
             "until an endpoint is set (Settings -> Models or "
             "INSTANT_CHAT_URL/INSTANT_CHAT_MODEL)"
+        )
+    except URLBlocked as e:
+        logger.warning(
+            "Instant chat endpoint rejected by the SSRF guard; instant mode "
+            "is disabled until the endpoint is fixed: %s",
+            e,
         )
     return thinking, instant
 def _validate_setting_value(key: str, value) -> bool:
@@ -558,8 +609,9 @@ async def validate_fts_index(table) -> bool:
         if not fts_index_exists:
             logger.error(
                 "Hybrid search is enabled but the FTS index is missing on the 'text' column. "
-                "FTS search will not function. Create the index with "
-                "VectorStore._ensure_fts_index() or rebuild the table."
+                "FTS search will not function. Trigger a full reindex from the "
+                "admin UI (a full reindex recreates the FTS index) or disable "
+                "hybrid search (ENABLE_HYBRID_SEARCH=false)."
             )
         return fts_index_exists
     except Exception as e:
@@ -579,6 +631,15 @@ async def lifespan(app: FastAPI):
     # default WARNING and all app INFO logs were silently dropped. We set the
     # level here and only add a handler if the root has none, so uvicorn's own
     # access/error handlers are left intact.
+    #
+    # Same-process restart hygiene (#799/#854): a previous lifespan entry in
+    # this interpreter may have set the curator shutdown flag / shut its
+    # executor; clear the flag and let the recreate-on-demand accessors
+    # replace any dead executors before startup proceeds.
+    with contextlib_suppress(Exception):
+        from app.services.wiki_compiler import CURATOR_SHUTDOWN
+
+        CURATOR_SHUTDOWN.clear()
     _root_logger = logging.getLogger()
     _root_logger.setLevel(
         getattr(logging, settings.log_level.upper(), logging.INFO)
@@ -772,11 +833,24 @@ async def lifespan(app: FastAPI):
         logger.info("Checking for upload migration...")
         _migration_started = time.monotonic()
         await asyncio.to_thread(migrate_uploads, False)
+        # Record the outcome for readiness (#799 AC6): healthz reads this
+        # attribute and reports degraded (503) when a migration FAILED while
+        # the app deliberately continued ("continuing anyway" must stay
+        # observable to the health probe that exists to surface exactly
+        # this degradation). The readiness signal covers that RAISED path
+        # only: a PER-FILE migration error (a copy, a size mismatch, a row
+        # update) is logged at ERROR by the migration helper but is not
+        # reflected in readiness, because the migration result's failure list
+        # also carries benign skips (an unknown vault, an orphaned file, an
+        # existing destination) and the .migrated backups of files that
+        # already migrated -- it cannot be used as a readiness signal.
+        app.state.upload_migration_ok = True
         logger.info(
             "Upload migration finished in %.1fs",
             time.monotonic() - _migration_started,
         )
     except Exception as e:
+        app.state.upload_migration_ok = False
         logger.warning(f"Upload migration failed (continuing anyway): {e}")
 
     # Dual LLM clients, both operator-configured (no shipped defaults,
@@ -1188,63 +1262,284 @@ async def lifespan(app: FastAPI):
         from app.services.llm_client import create_editorial_client
 
         async def _prime_editorial() -> None:
-            editorial_client = create_editorial_client()
+            # Construction lives INSIDE the try (#799 AC1): a misconfigured
+            # editorial pair must be contained in this task (logged, startup
+            # continues) instead of escaping the task — an escaped exception
+            # is re-raised by the shutdown loop's `await rt` and would skip
+            # every later shutdown stage (the AC2 hazard).
+            editorial_client = None
             try:
+                editorial_client = create_editorial_client()
                 await _prime_residency("Editorial", editorial_client)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — priming must never fail startup
+                logger.warning(
+                    "Editorial residency priming failed (continuing): %s", e
+                )
             finally:
-                await editorial_client.close()
+                if editorial_client is not None:
+                    await editorial_client.close()
 
         residency_tasks.append(asyncio.create_task(_prime_editorial()))
 
     yield
 
-    # Shutdown: stop services, cancel background tasks
+    # Shutdown: stop services, cancel background tasks — under ONE aggregate
+    # process-shutdown budget (#799/#854). Every stage below runs through
+    # _stop_stage with the REMAINING budget; an exhausted budget skips the
+    # stage with a warning instead of an unbounded await. Only
+    # BackgroundProcessor.stop() takes a timeout argument (the sibling
+    # processors' stop() methods take none); everything else is wrapped.
+    _shutdown_deadline = time.monotonic() + _SHUTDOWN_BUDGET_SECONDS
+
+    def _remaining() -> float:
+        return max(0.0, _shutdown_deadline - time.monotonic())
+
+    # Abandoned shutdown stages are RETAINED until they finish: an
+    # unreferenced task can be garbage-collected while it is still running,
+    # so a strong reference keeps it alive until its done callback drops
+    # it. The set lives in this lifespan's scope, so it dies with it.
+    _detached_stages: set[asyncio.Task] = set()
+
+    async def _stop_stage(name: str, factory, timeout: float | None = None):
+        """Await one shutdown stage under the remaining process budget.
+
+        ``factory`` is a zero-arg callable returning the awaitable, so the
+        coroutine is only created when the stage actually runs. ``timeout``
+        overrides the budget (the background processor's stop gets the
+        remaining budget plus its own documented cap).
+
+        The bound does NOT depend on the stage's cooperation. The stage
+        runs as a task and is waited for with ``asyncio.wait``, which
+        returns the still-pending set instead of forwarding the wait;
+        ``asyncio.wait_for`` forwards the timeout's cancellation INTO the
+        stage and then WAITS for that cancellation to land, so a stage
+        that suppresses or delays its cancellation would hold the whole
+        shutdown past the aggregate budget (the same defect class the
+        residency settle had). A stage that overruns is CANCELLED — asked
+        to stop — and left detached: the shutdown continues without it,
+        and its late outcome is logged rather than awaited.
+        """
+        budget = _remaining() if timeout is None else timeout
+        if budget <= 0:
+            logger.warning(
+                "Shutdown stage '%s' skipped: aggregate budget exhausted",
+                name,
+            )
+            return None
+        try:
+            task = asyncio.ensure_future(factory())
+        except Exception:  # noqa: BLE001 — a stage that cannot even start never skips the rest
+            logger.warning("Shutdown stage '%s' failed", name, exc_info=True)
+            return None
+
+        try:
+            done, pending = await asyncio.wait({task}, timeout=budget)
+        except asyncio.CancelledError:
+            # THIS task was cancelled (an external cancel, not the
+            # budget expiring): the stage is asked to stop and the
+            # cancellation propagates.
+            task.cancel()
+            raise
+        if pending:
+            # The stage overran: ask it to stop, keep a strong reference
+            # until it finishes, and report a late failure instead of
+            # letting it surface as an unretrieved-exception warning.
+            task.cancel()
+            _detached_stages.add(task)
+            task.add_done_callback(_detached_stages.discard)
+            task.add_done_callback(
+                lambda finished, stage_name=name: _log_detached_failure(
+                    stage_name, finished
+                )
+            )
+            logger.warning(
+                "Shutdown stage '%s' exceeded the aggregate shutdown budget; "
+                "continuing shutdown (it was asked to stop and is detached)",
+                name,
+            )
+            return None
+        try:
+            return task.result()
+        except asyncio.CancelledError:
+            # The stage itself was cancelled (and honoured it): that is
+            # not THIS task's cancellation, so it is absorbed — unless the
+            # enclosing scope is being cancelled, which must propagate.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            return None
+        except Exception:  # noqa: BLE001 — one stage's failure never skips the rest
+            logger.warning("Shutdown stage '%s' failed", name, exc_info=True)
+        return None
+
     # Stop email ingestion service
     if app.state.email_service:
-        await app.state.email_service.stop_polling()
-    for rt in residency_tasks:
-        rt.cancel()
-        try:
-            await rt
-        except asyncio.CancelledError:
-            pass
+        await _stop_stage("email stop_polling", app.state.email_service.stop_polling)
+    async def _settle_residency_tasks() -> None:
+        # One aggregate-bounded settle (#799 AC2 + #854): the whole loop runs
+        # under ONE budget (the remaining process budget plus its documented
+        # 5 s slack), and each task's outcome is absorbed — a task that DIED
+        # with a natural exception is contained (the processor stops,
+        # admission release, store/pool closes below stay reachable) instead
+        # of skipping the whole shutdown chain.
+        #
+        # The bound must NOT depend on the residency tasks' COOPERATION.
+        # Awaiting a task DIRECTLY makes the current task's cancellation
+        # FORWARD into it: when the enclosing budget expires,
+        # task.cancel() cancels the residency task, and a task that
+        # suppresses that cancellation never completes — the await never
+        # returns, the enclosing scope never regains control, and the whole
+        # shutdown hangs until the outer force boundary. asyncio.wait()
+        # waits for the set with a timeout and returns the still-pending
+        # set instead, so a task that refuses to die costs the settle its
+        # budget and nothing more.
+        pending_settle: set[asyncio.Task] = set(residency_tasks)
+        for rt in pending_settle:
+            rt.cancel()
+        if not pending_settle:
+            return
+        settle_budget = _remaining() + _SHUTDOWN_SLACK_SECONDS
+        # An external cancellation of THIS task propagates out of the wait
+        # (it is not our own budget expiring): swallowing it would strand
+        # the shutdown.
+        settled, pending_settle = await asyncio.wait(
+            pending_settle, timeout=settle_budget
+        )
+        for rt in settled:
+            # Retrieve each settled task's outcome: a task that DIED with a
+            # natural exception must be absorbed here (AC2) so the rest of
+            # the shutdown chain stays reachable.
+            try:
+                await rt
+            except asyncio.CancelledError:
+                # The task ended CANCELLED (we asked for that). This is NOT
+                # the current task's own cancellation, so it is absorbed —
+                # unless the enclosing scope is being cancelled, which must
+                # propagate so the shutdown can continue. asyncio counts the
+                # cancellations requested on the current task, so
+                # cancelling() tells the two apart.
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+            except Exception as e:  # noqa: BLE001 — AC2 absorb
+                logger.warning(
+                    "Residency task ended with exception at shutdown "
+                    "(continuing): %s",
+                    e,
+                )
+        if pending_settle:
+            # PROCESS-LEVEL INVARIANT (disclosed, #799/#854): the shutdown
+            # SEQUENCE stays bounded — this settle ended on its own budget
+            # and the stages below keep running. The PROCESS EXIT is
+            # bounded by two mechanisms, and this warning names the one
+            # that applies:
+            #   * State A — the bounded tail exit fires (the registry is
+            #     empty, the finalizers drained, the upload registry
+            #     empty — the pool state is not a condition) and
+            #     os._exit ends the process, so a detached task never
+            #     delays the exit;
+            #   * State B — the tail exit declines (a critical workflow is
+            #     still in flight, so the pool is deliberately left open),
+            #     the event loop's teardown then waits for this task, and
+            #     the PROCESS-LEVEL FORCE BOUNDARY ends the process: the
+            #     compose stop grace (150 s) or the native stop wait
+            #     (140 s), both above the composed envelope.
+            # A task that ignores cancellation can therefore delay the
+            # exit in State B up to that force boundary — it cannot make
+            # the shutdown sequence itself unbounded, and it cannot make
+            # the process outlive the force limits in the shipped launch
+            # configurations.
+            logger.warning(
+                "%d residency task(s) did not settle within the aggregate "
+                "shutdown budget; continuing shutdown (they were asked to "
+                "cancel and are detached; the process-level force boundary "
+                "ends the exit if the bounded tail exit declines)",
+                len(pending_settle),
+            )
+
+    await _settle_residency_tasks()
     # Cancel the periodic memory eviction background task.
     if memory_eviction_task:
         memory_eviction_task.cancel()
-        try:
-            await memory_eviction_task
-        except asyncio.CancelledError:
-            pass
+        await _stop_stage(
+            "memory eviction cancel",
+            lambda: asyncio.gather(memory_eviction_task, return_exceptions=True),
+        )
     # Cancel the one-shot memory embedding backfill task if still running.
     if memory_backfill_task and not memory_backfill_task.done():
         memory_backfill_task.cancel()
-        try:
-            await memory_backfill_task
-        except asyncio.CancelledError:
-            pass
+        await _stop_stage(
+            "memory backfill cancel",
+            lambda: asyncio.gather(memory_backfill_task, return_exceptions=True),
+        )
     # Cancel the periodic memory embed-heal task (issue #937).
     if memory_embed_heal_task and not memory_embed_heal_task.done():
         memory_embed_heal_task.cancel()
-        try:
-            await memory_embed_heal_task
-        except asyncio.CancelledError:
-            pass
+        await _stop_stage(
+            "memory embed-heal cancel",
+            lambda: asyncio.gather(memory_embed_heal_task, return_exceptions=True),
+        )
     if app.state.file_watcher:
-        await app.state.file_watcher.stop()
+        await _stop_stage("file watcher stop", app.state.file_watcher.stop)
     if app.state.background_processor:
-        await app.state.background_processor.stop()
+        # The only stop() that takes a timeout: stop() itself aggregates its
+        # whole composed drain sequence inside the slice it is given (#854).
+        remaining_budget = _remaining()
+        if remaining_budget > 0:
+            await _stop_stage(
+                "background processor stop",
+                lambda: app.state.background_processor.stop(timeout=remaining_budget),
+                timeout=remaining_budget + _SHUTDOWN_SLACK_SECONDS,
+            )
+        else:
+            logger.warning(
+                "Shutdown stage 'background processor stop' skipped: aggregate "
+                "budget exhausted"
+            )
     if getattr(app.state, "wiki_compile_processor", None):
-        await app.state.wiki_compile_processor.stop()
+        await _stop_stage(
+            "wiki compile processor stop",
+            app.state.wiki_compile_processor.stop,
+        )
+    # Curator lifecycle ownership (#799/#854): set the cooperative flag so an
+    # in-flight curate() orchestration aborts at its next call boundary, and
+    # shut the offload executor down so QUEUED orchestration never extends
+    # interpreter exit. The recreate-on-demand accessor keeps a NEXT lifespan
+    # entry in the same interpreter working (wiki-lint convention, PR #1113).
+    with contextlib_suppress(Exception):
+        from app.services.wiki_compiler import (
+            CURATOR_SHUTDOWN,
+            _get_curator_offload_executor,
+        )
+
+        CURATOR_SHUTDOWN.set()
+        _get_curator_offload_executor().shutdown(wait=False, cancel_futures=True)
     if getattr(app.state, "draft_job_processor", None):
-        await app.state.draft_job_processor.stop()
+        await _stop_stage(
+            "draft job processor stop",
+            app.state.draft_job_processor.stop,
+        )
     if getattr(app.state, "kms_compile_processor", None):
-        await app.state.kms_compile_processor.stop()
+        await _stop_stage(
+            "kms compile processor stop",
+            app.state.kms_compile_processor.stop,
+        )
+    # Parse executor lifecycle ownership (#799/#854): cancel queued parses so
+    # they never extend interpreter exit; in-flight parses keep running per
+    # the documented abandoned-thread contract (issue #703) and are skipped
+    # by the bounded tail exit below.
+    with contextlib_suppress(Exception):
+        from app.services.document_processor import _get_parse_executor
+
+        _get_parse_executor().shutdown(wait=False, cancel_futures=True)
     # E3 admission shutdown (issue #518, swarm review F-006): after all
     # background workers have drained, release their admission slots,
     # reject further admits and close a Redis shared store's connection
     # pool. Must run AFTER the processor stop() calls above — those drains
     # hold background leases until they finish.
-    try:
+    async def _admission_shutdown() -> None:
         from app.services.admission import get_admission_controller
 
         controller = get_admission_controller()
@@ -1252,50 +1547,41 @@ async def lifespan(app: FastAPI):
         close = getattr(controller.store, "close", None)
         if close is not None:
             await close()
-    except Exception:
-        logger.exception("Admission shutdown failed")
+
+    await _stop_stage("admission shutdown", _admission_shutdown)
     # Close both underlying LLM clients. The ``llm_client`` attr is an
     # alias of ``thinking_llm_client`` so closing it separately is
-    # unnecessary; ``LLMClient.close()`` is also idempotent.
-    try:
-        await app.state.thinking_llm_client.close()
-    except Exception:
-        pass
-    try:
-        await app.state.instant_llm_client.close()
-    except Exception:
-        pass
-    try:
-        await app.state.embedding_service.close()
-    except Exception:
-        pass
-    try:
-        await app.state.reranking_service.close()
-    except Exception:
-        pass
-    try:
-        app.state.vector_store.close()
-    except Exception:
-        pass
+    # unnecessary; ``LLMClient.close()`` is also idempotent. Unconfigured
+    # boots carry None clients — the getattr guard keeps that inert.
+    for _client_attr in ("thinking_llm_client", "instant_llm_client"):
+        _client = getattr(app.state, _client_attr, None)
+        if _client is not None:
+            await _stop_stage(f"{_client_attr} close", _client.close)
+    for _service_attr in ("embedding_service", "reranking_service"):
+        _service = getattr(app.state, _service_attr, None)
+        if _service is not None:
+            await _stop_stage(f"{_service_attr} close", _service.close)
+    # Synchronous closes run on a worker under the remaining budget (never
+    # wait_for(None) — both are plain functions): handle-close and
+    # lock-scoped operations, fast by construction per the census.
+    await _stop_stage(
+        "vector store close", lambda: asyncio.to_thread(app.state.vector_store.close)
+    )
     # Review PRR-020: let detached upload commit tasks settle (bounded)
     # before the pool closes, so every commit/compensation decides its
     # outcome instead of racing pool closure.
-    try:
+    async def _upload_commit_drain() -> None:
         from app.api.routes.draft_room import drain_inflight_upload_commits
 
         await drain_inflight_upload_commits()
-    except Exception as exc:
-        # The finalizer gate below decides whether the pool can close; record
-        # why the upload drain could not settle first.
-        logger.warning(
-            "Upload commit drain failed during shutdown: %s", type(exc).__name__
-        )
-    await _finalize_turns_and_close_pool(app)
-    try:
+
+    await _stop_stage("upload commit drain", _upload_commit_drain)
+    turn_finalizers_drained, pool_closed = await _finalize_turns_and_close_pool(
+        app, remaining=_remaining
+    )
+    with contextlib_suppress(Exception):
         from app.services.auth_service import _auth_executor
         _auth_executor.shutdown(wait=False)
-    except Exception:
-        pass
     with contextlib_suppress(Exception):
         # PR #1113 (swarm-pr-review N-05a): the wiki lint scan executor is
         # created at routes import time; shut it down with the same
@@ -1307,15 +1593,143 @@ async def lifespan(app: FastAPI):
         from app.services import redis_io
         redis_io.shutdown_executor()
 
+    # Bounded tail exit (#799/#854, plan rev 11): when the production launch
+    # surface opted in, every recovery-critical workflow has completed
+    # (deny-by-default registry empty, turn finalizers drained, upload
+    # registry empty), and logging is flushed, exit NOW instead of joining
+    # whatever non-critical worker threads are alive. The pool state is NOT
+    # a firing condition -- it is a logged cleanup outcome (the process
+    # exit reclaims an unclosed pool's connections). The decision lives in
+    # _bounded_tail_exit so tests drive the REAL gate (os._exit patched)
+    # instead of a re-implementation.
+    _bounded_tail_exit(turn_finalizers_drained, pool_closed)
 
-async def _finalize_turns_and_close_pool(app) -> None:
+
+
+def _log_detached_failure(stage_name: str, finished: asyncio.Future) -> None:
+    """Report a detached shutdown stage's late failure.
+
+    Registered only for a stage that was ABANDONED on timeout: its
+    exception would otherwise surface as an "exception was never
+    retrieved" warning at collection time, with no stage name.
+    """
+    if finished.cancelled():
+        return
+    exc = finished.exception()
+    if exc is not None:
+        logger.warning(
+            "Shutdown stage '%s' failed after the budget expired",
+            stage_name,
+            exc_info=exc,
+        )
+
+def _bounded_tail_exit(turn_finalizers_drained: bool, pool_closed: bool) -> bool:
+    """Run the bounded tail-exit gate; returns True iff os._exit fired.
+
+    Fires only when RAGAPP_BOUNDED_EXIT=1 AND the deny-by-default critical
+    registry is empty AND turn finalizers drained AND the upload-commit
+    registry is empty (read at gate time). Unreadable state counts as
+    pending (never exit on unknown). os._exit skips executor joins and
+    interpreter teardown; there are no app-level atexit registrations.
+    Tests/embedded lifespans never set the env (conftest pops it) and take
+    the normal path.
+
+    ``pool_closed`` is NOT a firing precondition (plan rev 11): it is a
+    RESOURCE-CLEANUP outcome, not a durability condition. The durability
+    conditions are the three registries/states above -- the turn
+    finalizers (the #1202 contract: a live turn's finalizer must be able to
+    finish, which is why the pool is deliberately left open when it did
+    not drain), the upload-commit registry, and the deny-by-default
+    critical-work registry. Exiting with the pool open is safe: the
+    process exit reclaims the connections, SQLite abandons uncommitted
+    work, and committed WAL transactions survive a process crash and are
+    recovered on reopen. Requiring the close would have made the
+    EXHAUSTED-BUDGET path (the #854 stall scenario) fall through to the
+    unbounded executor joins -- and Compose's force kill would then end
+    the process, which frozen AC12 forbids ("in either case the process
+    exits before Compose force-terminates it").
+
+    The pool state is still LOGGED on both the firing and the non-firing
+    paths, so a cleanup that did not complete is visible.
+    """
+    if os.environ.get("RAGAPP_BOUNDED_EXIT") != "1":
+        return False
+    try:
+        from app.api.routes.draft_room import _INFLIGHT_UPLOAD_COMMITS
+        from app.services.shutdown_gate import critical_work_active
+
+        uploads_pending = bool(_INFLIGHT_UPLOAD_COMMITS)
+    except Exception:  # noqa: BLE001 — unreadable state = do not exit
+        uploads_pending = True
+    critical_complete = (
+        turn_finalizers_drained
+        and not uploads_pending
+        and not critical_work_active()
+    )
+    for handler in logging.getLogger().handlers:
+        with contextlib_suppress(Exception):
+            handler.flush()
+    if critical_complete:
+        logging.getLogger().info(
+            "ragapp: bounded tail exit — critical shutdown complete "
+            "(pool_closed=%s); skipping non-critical executor joins",
+            pool_closed,
+        )
+        for handler in logging.getLogger().handlers:
+            with contextlib_suppress(Exception):
+                handler.flush()
+        os._exit(0)
+        return True  # pragma: no cover — os._exit does not return
+    # Name the workflow that is still live: an operator triaging a
+    # force-cut needs to know WHICH recovery protocol was unfinished.
+    critical_work = "unreadable"
+    try:
+        from app.services.shutdown_gate import active_critical_work
+
+        critical_work = ",".join(sorted(active_critical_work())) or "none"
+    except Exception:  # noqa: BLE001 — diagnostics must never raise
+        critical_work = "unreadable"
+    logging.getLogger().info(
+        "ragapp: bounded tail exit SKIPPED — critical work incomplete at "
+        "the tail (finalizers=%s pool_closed=%s uploads_pending=%s "
+        "critical=%s); the normal shutdown path continues (executor joins) "
+        "and the outer force boundary may terminate the process; the "
+        "recovery contracts govern",
+        turn_finalizers_drained,
+        pool_closed,
+        uploads_pending,
+        critical_work,
+    )
+    for handler in logging.getLogger().handlers:
+        with contextlib_suppress(Exception):
+            handler.flush()
+    return False
+
+
+async def _finalize_turns_and_close_pool(app, remaining=None) -> tuple[bool, bool]:
     """Drain durable turn finalizers, then close the pool only when safe.
 
     Keeping this decision in one runtime-testable function makes an
     unconditional close (or a close that races a live finalizer) observable
-    instead of relying on source-order inspection alone.
+    instead of relying on source-order inspection alone. Returns
+    ``(turn_finalizers_drained, pool_closed)`` so the bounded tail exit can
+    consume the authoritative state (#799/#854) instead of inferring it.
+
+    ``pool_closed`` is True ONLY when ``close_all()`` actually completed:
+    the close is a synchronous callable that drains the pool under its lock
+    (and shuts the checkout executor), so it can block briefly on an
+    in-flight checkout. It runs on a worker under the remaining aggregate
+    budget — an unbounded call here would be the one stage that can hold
+    the shutdown past the envelope and keep the tail gate unreachable. A
+    timed-out or skipped close leaves ``pool_closed`` False, which is a
+    RESOURCE-CLEANUP outcome, NOT a firing condition: the tail gate decides
+    on the durability conditions alone (the turn finalizers, the
+    upload-commit registry and the critical-work registry — see
+    ``_bounded_tail_exit``), and the process exit reclaims an unclosed
+    pool's connections.
     """
     turn_finalizers_drained = False
+    pool_closed = False
     try:
         # Issue #1202: cancellation finalizes run on a worker; drain them before
         # the pool becomes unusable, or an interrupted turn can be lost.
@@ -1343,4 +1757,45 @@ async def _finalize_turns_and_close_pool(app) -> None:
             "Durable turn finalizer shutdown check failed: %s", type(exc).__name__
         )
     if turn_finalizers_drained:
-        app.state.db_pool.close_all()
+        close_budget = remaining() if remaining is not None else None
+        if close_budget is None:
+            # No budget supplied (a direct caller with no envelope): the
+            # historical synchronous close.
+            app.state.db_pool.close_all()
+            pool_closed = True
+        elif close_budget > 0:
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(app.state.db_pool.close_all),
+                    timeout=close_budget,
+                )
+                pool_closed = True
+            except asyncio.TimeoutError:
+                # The close did not complete inside the aggregate budget; the
+                # pool is NOT marked closed. That is a RESOURCE-CLEANUP
+                # outcome, not a tail-exit blocker: the gate's decision
+                # turns on the durability conditions alone, and the process
+                # exit reclaims the connections. close_all is
+                # idempotent-safe for a later retry (a second close finds an
+                # empty pool).
+                logger.warning(
+                    "Pool close exceeded the aggregate shutdown budget; "
+                    "continuing shutdown (pool not marked closed)"
+                )
+            except Exception:
+                logger.warning("Pool close failed during shutdown", exc_info=True)
+        else:
+            # The aggregate budget is EXHAUSTED: close_all() takes the pool
+            # lock and can block, so it must never run synchronously on the
+            # event loop here (that would hold the shutdown past the
+            # envelope and keep the tail gate unreachable). The pool is
+            # left open and NOT marked closed — the gate's DECISION does
+            # not depend on it (the durability conditions decide; the
+            # process's own exit reclaims the connections), but the state
+            # is logged so a cleanup that did not complete is visible.
+            logger.warning(
+                "Pool close skipped: the aggregate shutdown budget is "
+                "exhausted; the pool is left open for the process exit "
+                "(not marked closed)"
+            )
+    return turn_finalizers_drained, pool_closed

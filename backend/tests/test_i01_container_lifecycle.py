@@ -7,7 +7,7 @@ Acceptance checks C1/C2/C4/C5 of the #748 remediation plan:
   of a non-exec ``sh -c``.
 - C2 (PRESERVING pin): the ``knowledgevault`` stop grace period must stay
   above the 60 s ``BackgroundProcessor.stop`` drain budget. This landed via
-  issue #700's follow-up (``stop_grace_period: 90s``); the pin keeps it.
+  issue #700's follow-up (``stop_grace_period``); the pin keeps it in step with the value the compose file actually carries.
 - C4: ``knowledgevault`` must wait for a healthy ``harrier-embed`` before
   starting, so the strict TEI model check runs against a ready service.
 - C5: the image command must pin a single uvicorn worker (``--workers 1``)

@@ -475,13 +475,17 @@ async def _default_complete(
         create_thinking_client,
     )
 
-    if logical_mode == "editorial":
-        client = create_editorial_client()
-    else:
-        client = (
-            create_instant_client() if logical_mode == "instant" else create_thinking_client()
-        )
+    # Construction lives INSIDE the try (#799 AC1 class): a factory failure
+    # (misconfigured pair, SSRF-blocked endpoint) must be contained by the
+    # same handler as a start failure instead of escaping the function.
+    client = None
     try:
+        if logical_mode == "editorial":
+            client = create_editorial_client()
+        else:
+            client = (
+                create_instant_client() if logical_mode == "instant" else create_thinking_client()
+            )
         await client.start()
         _assert_redirects_disabled(client)
         # SPEC §9.2: record provider kind/model, never keys or endpoints.
@@ -501,7 +505,8 @@ async def _default_complete(
             "".join(parts), getattr(client, "last_metrics", None) or {}
         )
     finally:
-        await client.close()
+        if client is not None:
+            await client.close()
 
 
 #: Token-provenance labels (issue #1149). Module-level constants rather than

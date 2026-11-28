@@ -131,10 +131,21 @@ USER appuser
 
 EXPOSE 9090
 
+# Bounded tail exit (#799/#854): after every recovery-critical workflow has
+# completed, the lifespan's final step exits immediately instead of joining
+# whatever non-critical worker threads are alive — the only sound way to
+# bound the interpreter-exit join tail. Set ONLY here and in the native
+# launchers; the test suite pops it (conftest) so embedded lifespans never
+# take this path.
+ENV RAGAPP_BOUNDED_EXIT=1
+
 # `exec` makes uvicorn replace sh as PID 1 so `docker stop` delivers SIGTERM and
 # the graceful-shutdown path (queue drain, admission release, final optimize)
 # actually runs instead of being SIGKILLed at the grace-period boundary
 # (issue #748, T1-04-S-01). `--workers 1` pins the single-process topology the
 # app's in-process state assumes: a forwarded WEB_CONCURRENCY>1 cannot silently
 # enable multi-worker mode (uvicorn reads that env only when --workers is absent).
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port 9090 --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\" --no-access-log --workers 1"]
+# `--timeout-graceful-shutdown 20` (integer seconds, #799 AC5) bounds uvicorn's
+# in-flight request drain so open streams cannot hold off lifespan shutdown
+# past the envelope (docker-compose.yml carries the derivation).
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port 9090 --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\" --no-access-log --timeout-graceful-shutdown 20 --workers 1"]

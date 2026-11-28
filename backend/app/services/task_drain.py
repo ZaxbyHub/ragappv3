@@ -72,7 +72,18 @@ async def drain_audit(audit_coro: Coroutine) -> None:
     retried, so it is logged loudly rather than returned silently
     (swarm-pr-review F-06).
     """
-    cancelled, error = await drain_await(asyncio.ensure_future(audit_coro))
+    # The audit write is a DURABILITY unit like the vault committed-audit
+    # arm: the bounded tail exit must not fire while the row is being
+    # written on a checked-out connection the pool close does not touch
+    # (the write would be lost and the security_events row is never
+    # regenerated). Registering here covers EVERY caller of this helper in
+    # one place.
+    from app.services.shutdown_gate import critical_shutdown_work
+
+    async with critical_shutdown_work("security-audit-drain"):
+        cancelled, error = await drain_await(
+            asyncio.ensure_future(audit_coro)
+        )
     if error is not None:
         if isinstance(error, asyncio.CancelledError):
             logger.warning(
@@ -216,13 +227,23 @@ async def drain_commit_audit(
       ``CancelledError`` after the log.
     """
 
+    # The WHOLE unit is recovery-critical work, not just the audit write:
+    # the commit runs BEFORE the audit's own registration, so a registration
+    # that started only at the audit would leave the commit-to-audit window
+    # unprotected (the bounded tail exit could end the process with a
+    # committed mutation whose mandatory audit tail had not been written).
+    from app.services.shutdown_gate import critical_shutdown_work
+
     async def _unit() -> None:
         await asyncio.to_thread(conn.commit)
         if after_commit is not None:
             after_commit()
         await drain_audit(audit_factory())
 
-    cancelled, error = await drain_await(asyncio.ensure_future(_unit()))
+    async with critical_shutdown_work("commit-audit-unit"):
+        cancelled, error = await drain_await(
+            asyncio.ensure_future(_unit())
+        )
     await _settle_drained(cancelled, error, context="commit_audit")
 
 

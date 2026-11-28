@@ -11,7 +11,9 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import List, Optional
@@ -3397,28 +3399,138 @@ class BackgroundProcessor:
         Signals the worker to shut down and waits for it to complete.
         Pending queue items ARE processed before shutdown (up to timeout).
 
+        The ``timeout`` is ONE aggregate deadline for the whole composed
+        shutdown sequence (issue #854): every awaited stage below — the
+        pre-drain task gathers, the four drain phases, the worker/sweep
+        cancellations, the lease-release and retry-reset maintenance calls,
+        and the trailing optimize — runs with the REMAINING budget, so the
+        composed worst case is the deadline itself, not a per-phase multiple
+        of it. The ONE exception is the maintenance block: it reserves a
+        single shared slice (min(5 s, timeout)) when it starts, so the
+        lease hand-back still happens when the drain phases consumed the
+        whole budget — the composed worst case is therefore the deadline
+        PLUS that one slice. A stage whose budget slice expires logs its
+        existing-shaped warning and the sequence proceeds; janitor/
+        startup-recovery backstops own anything left un-finished.
+
+        THE BOUND IS NOT A HARD WALL-CLOCK CEILING. A stage is bounded by
+        ``asyncio.wait_for``, which CANCELS the awaited work and then
+        waits for that cancellation to land: a stage whose cancellation is
+        delayed (a to_thread worker finishing a statement under the SQLite
+        busy_timeout, for example) can hold the sequence past its slice.
+        The delay is bounded by that work, not by this budget. When the
+        CALLER cancels ``stop()`` from outside (the lifespan's
+        ``_stop_stage`` does that when the stage budget expires), the
+        processor still reaches its terminal state: ``_stop_guarded``
+        applies it from a ``finally``. What an outside cancellation can
+        skip is the work that had not finished yet — the lease
+        hand-back and the parked-retry reset — and the janitor and the
+        next startup's recovery own those.
+
         Args:
-            timeout: Maximum time to wait for graceful shutdown (default: 60 seconds)
+            timeout: Aggregate shutdown budget (default: 60 seconds)
         """
         if not self._running:
             logger.warning("Background processor is not running")
             return
+        await self._stop_guarded(self._stop_sequence(timeout))
 
+    async def _stop_guarded(self, sequence) -> None:
+        """Run the shutdown sequence, ALWAYS reaching the terminal state.
+
+        The lifespan's ``_stop_stage`` cancels the stage task when the
+        stage's budget expires, so a cancellation can arrive inside
+        ``stop()`` and abort it. The processor's terminal state (the
+        shutdown event, the remaining task cancellations, the registry
+        clears, the permit release and ``_running = False``) must be
+        applied in that case too: a half-stopped processor keeps its
+        worker threads alive and its write permit held, which would
+        outlive the composed envelope at interpreter exit.
+        """
+        try:
+            await sequence
+        finally:
+            self._finalize_stop_state()
+
+    async def _stop_sequence(self, timeout: float) -> None:
+        """The composed shutdown sequence (the body of the old ``stop()``)."""
         logger.info("Stopping background processor...")
+        deadline = time.monotonic() + timeout
+
+        def remaining() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        async def _bounded(awaitable, stage: str):
+            # Aggregate-budget wrapper (#854): each stage gets only what is
+            # left of the single deadline. Cancellation of the await cannot
+            # kill a to_thread worker; those threads finish on their own
+            # bounded by their SQLite busy_timeout and are skipped by the
+            # bounded tail exit (lifespan shutdown) or joined at interpreter
+            # exit inside the documented envelope.
+            try:
+                await asyncio.wait_for(awaitable, timeout=remaining())
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Shutdown stage '%s' exceeded the aggregate stop() budget; "
+                    "continuing shutdown (backstops own the remainder)",
+                    stage,
+                )
+
+        # Shared maintenance budget: the shutdown-critical "hand the leases
+        # back" sweeps (ingest lease release, reindex lease release, parked-
+        # retry reset) are single fast UPDATEs that must not be STARVED when
+        # the drain phases consumed the whole budget
+        # (test_559_lease_integration: a 3 s quiescence wait burning the
+        # full budget must still release the lease). ONE slice is reserved
+        # when the maintenance phase STARTS and shared by every maintenance
+        # call — a per-call slice would let three slow calls consume three
+        # slices (worst case timeout + 3*slice), breaking the ONE-aggregate-
+        # deadline contract and outrunning the lifespan wrapper's
+        # remaining+5 bound. The slice is capped at the timeout itself so a
+        # tiny test budget cannot stretch far past its own scale.
+        maintenance_deadline: float | None = None
+
+        async def _bounded_call(awaitable, stage: str):
+            # Result-returning twin of _bounded for the maintenance calls
+            # whose outcome is logged. The stage gets whatever is left of
+            # the aggregate deadline; when that is exhausted it falls back
+            # to the SHARED slice (never a fresh one) — so the lease hand-
+            # back still happens, and the composed cost is at most
+            # timeout + slice.
+            nonlocal maintenance_deadline
+            now = time.monotonic()
+            if maintenance_deadline is None:
+                maintenance_deadline = now + min(5.0, timeout)
+            budget = max(0.0, max(deadline, maintenance_deadline) - now)
+            try:
+                return await asyncio.wait_for(awaitable, timeout=budget)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Shutdown stage '%s' exceeded the aggregate stop() budget; "
+                    "continuing shutdown (backstops own the remainder)",
+                    stage,
+                )
+                return None
 
         # Detached startup recovery owns its enqueue side effects. Cancel and
         # await it before queue draining so shutdown cannot race a new enqueue.
         startup_recovery_task = getattr(self, "_startup_recovery_task", None)
         if startup_recovery_task is not None:
             startup_recovery_task.cancel()
-            await asyncio.gather(startup_recovery_task, return_exceptions=True)
+            await _bounded(
+                asyncio.gather(startup_recovery_task, return_exceptions=True),
+                "startup-recovery cancellation",
+            )
             self._startup_recovery_task = None
         # Same for the detached jobs migration (issue #559): short-lived, but
         # shutdown must never race it mid-copy.
         jobs_migration_task = getattr(self, "_jobs_migration_task", None)
         if jobs_migration_task is not None:
             jobs_migration_task.cancel()
-            await asyncio.gather(jobs_migration_task, return_exceptions=True)
+            await _bounded(
+                asyncio.gather(jobs_migration_task, return_exceptions=True),
+                "jobs-migration cancellation",
+            )
             self._jobs_migration_task = None
 
         # The outer recovery task may have been cancelled while a synchronous
@@ -3433,7 +3545,10 @@ class BackgroundProcessor:
             for task in owned_artifact_tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(*owned_artifact_tasks, return_exceptions=True)
+            await _bounded(
+                asyncio.gather(*owned_artifact_tasks, return_exceptions=True),
+                "artifact-sweep cancellation",
+            )
             artifact_sweep_tasks.clear()
 
         # Phase 1: let ingestion workers finish first. They may enqueue
@@ -3441,7 +3556,7 @@ class BackgroundProcessor:
         # until the ingestion queue has drained.
         queue_drained = True
         try:
-            await asyncio.wait_for(self.queue.join(), timeout=timeout)
+            await asyncio.wait_for(self.queue.join(), timeout=remaining())
         except asyncio.TimeoutError:
             queue_drained = False
             logger.warning(
@@ -3450,7 +3565,9 @@ class BackgroundProcessor:
 
         if queue_drained:
             try:
-                await asyncio.wait_for(self.enrichment_queue.join(), timeout=timeout)
+                await asyncio.wait_for(
+                    self.enrichment_queue.join(), timeout=remaining()
+                )
             except asyncio.TimeoutError:
                 logger.warning("Enrichment queue did not drain within timeout")
             # The atom (multimodal) enrichment queue is drained too, so queued
@@ -3458,9 +3575,13 @@ class BackgroundProcessor:
             atom_queue = getattr(self, "atom_enrichment_queue", None)
             if atom_queue is not None:
                 try:
-                    await asyncio.wait_for(atom_queue.join(), timeout=timeout)
+                    await asyncio.wait_for(
+                        atom_queue.join(), timeout=remaining()
+                    )
                 except asyncio.TimeoutError:
-                    logger.warning("Atom enrichment queue did not drain within timeout")
+                    logger.warning(
+                        "Atom enrichment queue did not drain within timeout"
+                    )
         # Phase 1b (issue #559): in lease mode, let workers drain the durable
         # queue before the shutdown flag stops claiming — the graceful
         # analogue of "pending queue items ARE processed before shutdown".
@@ -3470,7 +3591,7 @@ class BackgroundProcessor:
         if getattr(self, "_ingest_lease_enabled", False):
             try:
                 await asyncio.wait_for(
-                    self._wait_ingest_jobs_settled(), timeout=timeout
+                    self._wait_ingest_jobs_settled(), timeout=remaining()
                 )
             except asyncio.TimeoutError:
                 logger.warning(
@@ -3481,26 +3602,50 @@ class BackgroundProcessor:
         if self._worker_tasks:
             for task in self._worker_tasks:
                 task.cancel()
-            await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+            await _bounded(
+                asyncio.gather(*self._worker_tasks, return_exceptions=True),
+                "worker cancellation",
+            )
         if self._enrichment_worker_task:
             self._enrichment_worker_task.cancel()
-            await asyncio.gather(self._enrichment_worker_task, return_exceptions=True)
+            await _bounded(
+                asyncio.gather(
+                    self._enrichment_worker_task, return_exceptions=True
+                ),
+                "enrichment worker cancellation",
+            )
         atom_task = getattr(self, "_atom_enrichment_worker_task", None)
         if atom_task:
             atom_task.cancel()
-            await asyncio.gather(atom_task, return_exceptions=True)
+            await _bounded(
+                asyncio.gather(atom_task, return_exceptions=True),
+                "atom worker cancellation",
+            )
         if self._vector_delete_sweep_task:
             self._vector_delete_sweep_task.cancel()
-            await asyncio.gather(self._vector_delete_sweep_task, return_exceptions=True)
+            await _bounded(
+                asyncio.gather(
+                    self._vector_delete_sweep_task, return_exceptions=True
+                ),
+                "vector delete sweep cancellation",
+            )
         if getattr(self, "_artifact_delete_sweep_task", None):
             self._artifact_delete_sweep_task.cancel()
-            await asyncio.gather(
-                self._artifact_delete_sweep_task, return_exceptions=True
+            await _bounded(
+                asyncio.gather(
+                    self._artifact_delete_sweep_task, return_exceptions=True
+                ),
+                "artifact delete sweep cancellation",
             )
         if self._reindex_worker_task:
             self._reindex_start_gate.set()
             self._reindex_worker_task.cancel()
-            await asyncio.gather(self._reindex_worker_task, return_exceptions=True)
+            await _bounded(
+                asyncio.gather(
+                    self._reindex_worker_task, return_exceptions=True
+                ),
+                "reindex worker cancellation",
+            )
             # Reindex lifecycle ownership (issue #513 W12, legacy mode only):
             # with the worker cancelled, a 'running' job row would be
             # abandoned forever — mark it 'interrupted' (terminal,
@@ -3508,43 +3653,73 @@ class BackgroundProcessor:
             # janitor owns settlement, so the marking is retired here and the
             # held reindex leases are released below instead.
             if not getattr(self, "_reindex_lease_enabled", False):
-                await asyncio.to_thread(
-                    self._mark_running_reindex_jobs_interrupted,
-                    "Interrupted by processor shutdown",
+                await _bounded(
+                    asyncio.to_thread(
+                        self._mark_running_reindex_jobs_interrupted,
+                        "Interrupted by processor shutdown",
+                    ),
+                    "reindex interruption marking",
                 )
         # Deferred-retry scheduler (issue #513 W11): cancel the deliverer, then
         # discard any still-pending tickets with a warning — shutdown never
         # hangs on the backlog and never silently delivers post-stop retries.
         if getattr(self, "_retry_scheduler_task", None):
             self._retry_scheduler_task.cancel()
-            await asyncio.gather(self._retry_scheduler_task, return_exceptions=True)
+            await _bounded(
+                asyncio.gather(
+                    self._retry_scheduler_task, return_exceptions=True
+                ),
+                "retry scheduler cancellation",
+            )
             self._retry_scheduler_task = None
         if getattr(self, "_orphan_rescan_task", None):
             self._orphan_rescan_task.cancel()
-            await asyncio.gather(self._orphan_rescan_task, return_exceptions=True)
+            await _bounded(
+                asyncio.gather(
+                    self._orphan_rescan_task, return_exceptions=True
+                ),
+                "orphan rescan cancellation",
+            )
             self._orphan_rescan_task = None
         if getattr(self, "_ingest_janitor_task", None):
             self._ingest_janitor_task.cancel()
-            await asyncio.gather(self._ingest_janitor_task, return_exceptions=True)
+            await _bounded(
+                asyncio.gather(
+                    self._ingest_janitor_task, return_exceptions=True
+                ),
+                "ingest janitor cancellation",
+            )
             self._ingest_janitor_task = None
         # Shutdown lease release (issue #559): after the workers are gone, a
         # still-'running' ingestion row would wait out the reclaim timeout on
         # the next boot for no reason — hand every lease back immediately.
         if getattr(self, "_ingest_lease_enabled", False):
             try:
-                released = await asyncio.to_thread(self._release_all_ingest_leases)
+                released = await _bounded_call(
+                    asyncio.to_thread(self._release_all_ingest_leases),
+                    "ingest lease release",
+                )
                 if released:
-                    logger.info("Released %d ingestion lease(s) at shutdown", released)
+                    logger.info(
+                        "Released %d ingestion lease(s) at shutdown", released
+                    )
             except Exception:  # noqa: BLE001 — janitor reclaims on next boot
                 logger.warning("Shutdown lease release failed", exc_info=True)
         # Same shutdown release for the reindex queue (issue #559 stage 3).
         if getattr(self, "_reindex_lease_enabled", False):
             try:
-                released = await asyncio.to_thread(self._release_reindex_leases)
+                released = await _bounded_call(
+                    asyncio.to_thread(self._release_reindex_leases),
+                    "reindex lease release",
+                )
                 if released:
-                    logger.info("Released %d reindex lease(s) at shutdown", released)
+                    logger.info(
+                        "Released %d reindex lease(s) at shutdown", released
+                    )
             except Exception:  # noqa: BLE001 — janitor reclaims on next boot
-                logger.warning("Reindex shutdown lease release failed", exc_info=True)
+                logger.warning(
+                    "Reindex shutdown lease release failed", exc_info=True
+                )
         # Guarded like every other lifecycle attribute above: ``stop`` must be
         # safe on partially constructed instances (tests and shutdown paths
         # build minimal processors without running ``__init__``).
@@ -3576,7 +3751,14 @@ class BackgroundProcessor:
                     len(parked_file_ids),
                 )
                 try:
-                    await self._reset_parked_retry_files(parked_file_ids)
+                    # _reset_parked_retry_files is a coroutine: await it
+                    # DIRECTLY under the bounded wrapper (to_thread would
+                    # merely CREATE the coroutine in a worker and drop it —
+                    # the never-awaited warning the b13 gate catches).
+                    await _bounded_call(
+                        self._reset_parked_retry_files(parked_file_ids),
+                        "parked-retry file reset",
+                    )
                 except Exception:  # noqa: BLE001 — best-effort recovery hint
                     logger.warning(
                         "Could not reset parked-retry files at shutdown; "
@@ -3584,7 +3766,13 @@ class BackgroundProcessor:
                         exc_info=True,
                     )
 
-        # Phase 3: Flush optimize on VectorStore if available
+        # Phase 3: Flush optimize on VectorStore if available. The optimize
+        # stays on the MAIN event loop under the remaining budget (#854 /
+        # #799 AC12): flush_optimize serializes on an asyncio write lock
+        # bound to this loop, and the underlying table.optimize() runs on
+        # LanceDB's native async runtime — a timed-out continuation is never
+        # a Python ThreadPoolExecutor worker, so it contributes nothing to
+        # the interpreter-exit join.
         if (
             hasattr(self.processor, "vector_store")
             and self.processor.vector_store is not None
@@ -3593,7 +3781,10 @@ class BackgroundProcessor:
                 from app.config import settings as _settings
 
                 if _settings.optimize_on_shutdown:
-                    await self.processor.vector_store.flush_optimize()
+                    await _bounded(
+                        self.processor.vector_store.flush_optimize(),
+                        "vector store optimize",
+                    )
             except Exception as e:
                 logger.warning("Failed to flush vector store on shutdown: %s", e)
 
@@ -3616,6 +3807,67 @@ class BackgroundProcessor:
         self._write_semaphore = None
         self._running = False
         logger.info("Background processor stopped")
+
+    def _finalize_stop_state(self) -> None:
+        """Apply the processor's terminal state (idempotent).
+
+        Called on the normal shutdown path AND from ``_stop_guarded``'s
+        ``finally``, so an outside cancellation cannot skip it. It SIGNALS
+        the shutdown (the workers must stop), CANCELS the tasks that are
+        still owned, clears the ownership registries, releases the write
+        permit and clears the running flag. The cancellations are issued
+        without awaiting them: the shutdown sequence's own ordered
+        cancellations have already run on the normal path, and on the
+        cancellation path there is no time left to await.
+        """
+        # The terminal state must never raise: a failing shutdown_event.set()
+        # must not abort the cleanup that follows.
+        with suppress(Exception):
+            self.shutdown_event.set()
+        for attr in (
+            "_worker_tasks",
+            "_enrichment_worker_task",
+            "_atom_enrichment_worker_task",
+            "_vector_delete_sweep_task",
+            "_artifact_delete_sweep_task",
+            "_reindex_worker_task",
+            "_retry_scheduler_task",
+            "_orphan_rescan_task",
+            "_ingest_janitor_task",
+            # The pre-drain tasks the sequence owns as well: an outside
+            # cancellation can land BETWEEN their cancellation steps, so
+            # the finalizer must cover them too.
+            "_startup_recovery_task",
+            "_jobs_migration_task",
+            "_artifact_sweep_tasks",
+        ):
+            owned = getattr(self, attr, None)
+            if owned is None:
+                continue
+            tasks = owned if isinstance(owned, (list, tuple, set)) else [owned]
+            for task in tasks:
+                # Best effort: a task whose cancel() raises must not stop
+                # the remaining tasks from being cancelled.
+                with suppress(Exception):
+                    if not task.done():
+                        task.cancel()
+        # partial-construction paths that predate these ownership registries.
+        for state_name in (
+            "_recovery_file_ids",
+            "_queued_file_ids",
+            "_reindex_job_ids",
+        ):
+            state = getattr(self, state_name, None)
+            if state is not None:
+                state.clear()
+        # issue #704 review (PRR-009): release the pool-carried permit so
+        # post-stop writers return to the documented no-serialization
+        # contract instead of acquiring an orphaned loop-bound semaphore.
+        if getattr(self.processor, "pool", None) is not None:
+            self.processor.pool.write_permit = None
+        self.processor._write_semaphore = None
+        self._write_semaphore = None
+        self._running = False
 
     async def enqueue(
         self,

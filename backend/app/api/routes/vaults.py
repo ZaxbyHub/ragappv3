@@ -1317,9 +1317,12 @@ async def delete_vault(
         if commit_error is not None:
             raise commit_error
     except HTTPException:
-        await _drained_vault_recovery(
-            conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
-        )
+        from app.services.shutdown_gate import critical_shutdown_work
+
+        async with critical_shutdown_work("vault-rollback-restore"):
+            await _drained_vault_recovery(
+                conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
+            )
         if commit_cancelled:
             # Review PRR-004: an absorbed cancellation wins even when the
             # arm was entered by a failure — the mandatory recovery above
@@ -1327,9 +1330,12 @@ async def delete_vault(
             raise asyncio.CancelledError
         raise
     except (sqlite3.Error, OSError, RuntimeError):
-        await _drained_vault_recovery(
-            conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
-        )
+        from app.services.shutdown_gate import critical_shutdown_work
+
+        async with critical_shutdown_work("vault-rollback-restore"):
+            await _drained_vault_recovery(
+                conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
+            )
         if commit_cancelled:
             raise asyncio.CancelledError
         logger.exception("Error deleting vault %d", vault_id)
@@ -1345,9 +1351,12 @@ async def delete_vault(
         # by the startup reconcile. The gate is evaluated BEFORE the drained
         # unit starts, so the unit itself never runs post-commit.
         if conn.in_transaction:
-            await _drained_vault_recovery(
-                conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
-            )
+            from app.services.shutdown_gate import critical_shutdown_work
+
+            async with critical_shutdown_work("vault-rollback-restore"):
+                await _drained_vault_recovery(
+                    conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
+                )
         if commit_cancelled:
             raise asyncio.CancelledError
         raise
@@ -1358,13 +1367,22 @@ async def delete_vault(
     # deletion. Gated on the DELETE's own rowcount so a concurrent delete
     # that already removed the row records nothing (review F-031a).
     if deleted_vault_rows > 0:
-        await drain_audit(safe_record_security_event(
-            conn,
-            event_type="vault.deleted",
-            actor=user,
-            request=http_request,
-            metadata={"vault_id": vault_id, "name": vault_name},
-        ))
+        # Recovery-critical (#854/#799 shutdown gate): the post-commit audit
+        # tail is a durable write that absorbs cancellation through the
+        # shared drain. It sits on the REQUEST path, so it can outlive the
+        # request (a client disconnect cancels the await, the shielded task
+        # keeps writing) — the bounded tail exit must not fire while it is
+        # live.
+        from app.services.shutdown_gate import critical_shutdown_work
+
+        async with critical_shutdown_work("vault-committed-audit"):
+            await drain_audit(safe_record_security_event(
+                conn,
+                event_type="vault.deleted",
+                actor=user,
+                request=http_request,
+                metadata={"vault_id": vault_id, "name": vault_name},
+            ))
     if commit_cancelled:
         # The cancellation absorbed at the commit await wins only now, after
         # the mandatory audit tail — before the best-effort vector

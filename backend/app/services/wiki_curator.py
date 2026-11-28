@@ -484,12 +484,30 @@ class WikiCurator:
         semaphore = asyncio.Semaphore(concurrency)
 
         async def _one_chunk(chunk: CuratorChunk) -> tuple[Optional[dict], Optional[str]]:
+            # Cooperative shutdown boundary (#799/#854 lifecycle drain): the
+            # lifespan wiki stage sets CURATOR_SHUTDOWN at shutdown; an
+            # in-flight orchestration aborts at the NEXT call boundary so the
+            # single offload worker is not held past the shutdown envelope.
+            # (None, None) is the established "no claim for this chunk"
+            # outcome — the enclosing job treats it as a skipped chunk,
+            # never a failure (the curator must not fail the job).
+            from app.services.wiki_compiler import CURATOR_SHUTDOWN
+
             prompt = build_user_prompt(
                 [chunk],
                 deterministic_summary=deterministic_summary,
                 existing_entities_brief=existing_entities_brief,
             )
             async with semaphore:
+                # The cooperative shutdown check lives INSIDE the semaphore,
+                # immediately before the propose call: gather() starts every
+                # chunk task at once, so a check made before the semaphore
+                # is passed by every chunk before the flag is ever set and
+                # the abort never fires for an orchestration already
+                # running. Here a chunk that reaches the front of the
+                # queue AFTER the flag is set skips its propose.
+                if CURATOR_SHUTDOWN.is_set():
+                    return (None, None)
                 try:
                     text = await self.client.propose(
                         [
