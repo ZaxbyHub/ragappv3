@@ -179,6 +179,160 @@ class TestTransparentPasswordUpgrade:
         assert password_needs_rehash(new_hash) is False
 
 
+# Issue #1235 fixtures. Both hashes were generated with bcrypt 4.3.0, which
+# silently used only the first 72 bytes of the secret, from the FULL password:
+#   bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt(rounds=4))
+# They are real legacy hashes as stored before the bcrypt 5.0.0 bump, so the
+# tests prove compatibility with what bcrypt 4.x actually wrote, not with an
+# assumption about it. bcrypt 5.0.0 raises ValueError on >72-byte secrets.
+LEGACY_ASCII_80_PASSWORD = "Legacy1" + "x" * 73  # 80 bytes
+LEGACY_ASCII_80_HASH_BCRYPT4 = "$2b$04$rSa1evkYXBKOP6jn7ZIM1ODr.fzsnVPM6YH2PagjUDTtgq2r8XGxS"
+# 4 ASCII bytes + 30 three-byte euro signs = 94 bytes. Byte 72 falls inside
+# the 23rd euro sign (bytes 70-72), so bcrypt 4.x hashed a partial UTF-8
+# sequence: the secret must be cut at byte 72, not at a character boundary.
+LEGACY_MULTIBYTE_PASSWORD = "Pw1x" + "€" * 30
+LEGACY_MULTIBYTE_HASH_BCRYPT4 = "$2b$04$js0LNCOg.gez9aTATYXgeOqPI8xCJuu.Wb4eMoBo/uz/XEiaM9b0e"
+
+
+class TestLegacyBcryptOver72Bytes:
+    """Issue #1235: legacy bcrypt hashes of passwords over 72 UTF-8 bytes."""
+
+    def test_fixture_passwords_exceed_72_bytes(self):
+        """Guard the fixtures themselves so the suite cannot silently stop testing >72."""
+        assert len(LEGACY_ASCII_80_PASSWORD.encode("utf-8")) == 80
+        multibyte = LEGACY_MULTIBYTE_PASSWORD.encode("utf-8")
+        assert len(multibyte) == 94
+        # Byte 72 is mid-character: decoding the first 72 bytes strictly fails.
+        with pytest.raises(UnicodeDecodeError):
+            multibyte[:72].decode("utf-8")
+
+    @pytest.mark.parametrize("ident", ["$2a$", "$2b$", "$2y$"])
+    def test_bcrypt_over_72_bytes_verifies(self, ident):
+        """AC1: a >72-byte password verifies against its bcrypt-4.x legacy hash."""
+        from app.services.auth_service import verify_password
+
+        legacy_hash = ident + LEGACY_ASCII_80_HASH_BCRYPT4[4:]
+        assert verify_password(LEGACY_ASCII_80_PASSWORD, legacy_hash) is True
+
+    def test_bcrypt_over_72_bytes_verifies_freshly_generated_hash(self):
+        """AC1: same result for a hash built under bcrypt 5 from the first 72 bytes."""
+        import bcrypt
+
+        from app.services.auth_service import verify_password
+
+        password = "Fresh9" + "y" * 100  # 106 bytes
+        legacy_hash = bcrypt.hashpw(
+            password.encode("utf-8")[:72], bcrypt.gensalt(rounds=4)
+        ).decode()
+        assert verify_password(password, legacy_hash) is True
+
+    def test_bcrypt_over_72_bytes_multibyte_boundary_verifies(self):
+        """AC1: the cut is at byte 72 even when it splits a UTF-8 character."""
+        from app.services.auth_service import verify_password
+
+        assert (
+            verify_password(LEGACY_MULTIBYTE_PASSWORD, LEGACY_MULTIBYTE_HASH_BCRYPT4)
+            is True
+        )
+        # Changing the character that straddles byte 72 changes bytes 70-71,
+        # which bcrypt 4.x did hash, so this must fail.
+        straddle_changed = "Pw1x" + "€" * 22 + "é" + "€" * 7
+        assert (
+            verify_password(straddle_changed, LEGACY_MULTIBYTE_HASH_BCRYPT4) is False
+        )
+
+    def test_bcrypt_over_72_bytes_wrong_password_rejected(self):
+        """AC2: wrong passwords still fail against a legacy bcrypt hash."""
+        from app.services.auth_service import verify_password
+
+        wrong_candidates = [
+            # >72 bytes, differs inside the first 72 bytes (first character).
+            "M" + LEGACY_ASCII_80_PASSWORD[1:],
+            # >72 bytes, differs at byte 72 (the last hashed byte).
+            LEGACY_ASCII_80_PASSWORD[:71] + "Z" + LEGACY_ASCII_80_PASSWORD[72:],
+            # Exactly the first 71 bytes: one hashed byte short.
+            LEGACY_ASCII_80_PASSWORD[:71],
+            # Short unrelated password.
+            "WrongPass1",
+            # Long unrelated password.
+            "Q" * 128,
+        ]
+        for candidate in wrong_candidates:
+            assert verify_password(candidate, LEGACY_ASCII_80_HASH_BCRYPT4) is False, (
+                f"wrong password of {len(candidate.encode())} bytes must be rejected"
+            )
+
+    def test_bcrypt_password_differing_only_after_byte_72_matches(self):
+        """Inherent to the stored hash: bcrypt 4.x never hashed bytes past 72.
+
+        A password that shares the first 72 bytes matches the legacy hash, exactly
+        as it did before the bcrypt 5 bump. The hash is replaced with argon2id
+        on the first successful login, after which every byte counts.
+        """
+        from app.services.auth_service import verify_password
+
+        same_prefix = LEGACY_ASCII_80_PASSWORD[:72] + "DIFFERENT-TAIL"
+        assert verify_password(same_prefix, LEGACY_ASCII_80_HASH_BCRYPT4) is True
+        # Exactly 72 bytes (the whole hashed secret) also matches.
+        assert (
+            verify_password(LEGACY_ASCII_80_PASSWORD[:72], LEGACY_ASCII_80_HASH_BCRYPT4)
+            is True
+        )
+
+    def test_bcrypt_over_72_bytes_flagged_for_rehash_to_full_length_argon2id(self):
+        """Rehash-on-login: the legacy hash is flagged and the argon2id
+        replacement covers every byte of the password."""
+        from app.services.auth_service import (
+            hash_password,
+            password_needs_rehash,
+            verify_password,
+        )
+
+        assert password_needs_rehash(LEGACY_ASCII_80_HASH_BCRYPT4) is True
+        new_hash = hash_password(LEGACY_ASCII_80_PASSWORD)
+        assert new_hash.startswith("$argon2id$")
+        assert password_needs_rehash(new_hash) is False
+        assert verify_password(LEGACY_ASCII_80_PASSWORD, new_hash) is True
+        tail_changed = LEGACY_ASCII_80_PASSWORD[:72] + "DIFFERENT-TAIL"
+        assert verify_password(tail_changed, new_hash) is False
+
+    def test_argon2id_long_password_is_never_truncated(self):
+        """The 72-byte cut applies to bcrypt only: argon2id checks every byte."""
+        from app.services.auth_service import pwd_context, verify_password
+
+        password = "Argon2Long" + "z" * 100  # 110 bytes
+        argon2_hash = pwd_context.using(schemes=["argon2"]).hash(password)
+        assert argon2_hash.startswith("$argon2id$")
+        assert verify_password(password, argon2_hash) is True
+        for variant in (
+            password[:72],
+            password[:72] + "DIFFERENT-TAIL",
+            password[:-1] + "q",
+        ):
+            assert verify_password(variant, argon2_hash) is False
+
+    def test_malformed_hashes_fail_closed_for_long_passwords(self):
+        """Malformed or unknown hashes return False (never raise, never True)."""
+        from app.services.auth_service import verify_password
+
+        malformed = [
+            "$2b$garbage",
+            "$2b$04$short",
+            "$2a$04$",
+            "$2y$",
+            "$2b$04$" + "!" * 53,
+            "$2x$" + LEGACY_ASCII_80_HASH_BCRYPT4[4:],
+            "$argon2id$garbage",
+            "not_a_hash_at_all",
+            "",
+        ]
+        for bad in malformed:
+            for candidate in (LEGACY_ASCII_80_PASSWORD, "Short1pw"):
+                assert verify_password(candidate, bad) is False, (
+                    f"malformed hash {bad!r} must fail closed"
+                )
+
+
 class TestAccessToken:
     """Tests for create_access_token and decode_access_token."""
 
