@@ -18,7 +18,7 @@
 
 services:
   alloy:
-    image: grafana/alloy:v1.5.1
+    image: grafana/alloy:v1.22.0
     restart: unless-stopped
     command:
       - run
