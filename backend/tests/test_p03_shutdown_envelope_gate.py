@@ -185,6 +185,39 @@ class TestShutdownEnvelopeGate(unittest.TestCase):
                 f"{name} never waits on $WaitMs",
             )
 
+    def test_an_ambiguous_window_declaration_fails_the_gate(self):
+        # PowerShell lets the LAST assignment win, so a launcher that
+        # declares $GracefulWindowMs twice has an envelope-bounding window
+        # the gate cannot see. Reading the first declaration and passing
+        # would be a false pass: the gate must fail closed on the ambiguity.
+        import shutil
+        import tempfile
+
+        original_root = self.gate.ROOT
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            for name in ("start-services.ps1", "stop-services.ps1"):
+                shutil.copy(REPO / name, tmp_root / name)
+            launcher = tmp_root / "start-services.ps1"
+            text = launcher.read_text(encoding="utf-8")
+            text = text.replace(
+                "$GracefulWindowMs = 140000",
+                "$GracefulWindowMs = 140000\n        $GracefulWindowMs = 1000",
+                1,
+            )
+            launcher.write_text(text, encoding="utf-8")
+            try:
+                self.gate.ROOT = tmp_root
+                exit_code = self.gate.main()
+            finally:
+                self.gate.ROOT = original_root
+        self.assertEqual(
+            exit_code,
+            1,
+            "a launcher that declares the graceful window twice must fail "
+            "the gate: the last assignment is the one PowerShell uses",
+        )
+
 
 class tempfile_dockerfile:
     """A temporary file usable as a stand-in for the Dockerfile."""

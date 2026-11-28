@@ -294,20 +294,40 @@ def main() -> int:
     # the envelope, so it is read from its named constant.
     for name in _PS1_SURFACES:
         ps1_text = _read(ROOT / name)
-        graceful = _GRACEFUL_WINDOW_RE.search(ps1_text)
-        if graceful is None:
+        # The declared value must be the value the runtime CONSUMES. A
+        # second declaration would be the one PowerShell uses (the last
+        # assignment wins), so the gate reads ALL declarations and fails
+        # closed on an ambiguous one instead of reading the first and
+        # passing on a value nothing uses.
+        graceful_values = _GRACEFUL_WINDOW_RE.findall(ps1_text)
+        if not graceful_values:
             print(
                 f"FAIL: {name} declares no $GracefulWindowMs — the "
                 "envelope-bounding native stop wait must be a named "
                 "constant the gate can read"
             )
             return 1
-        failed_signal = _FAILED_SIGNAL_WAIT_RE.search(ps1_text)
-        if failed_signal is None:
+        if len(graceful_values) > 1:
+            print(
+                f"FAIL: {name} declares $GracefulWindowMs "
+                f"{len(graceful_values)} times ({', '.join(graceful_values)} ms) "
+                "— the last assignment is the one PowerShell uses, so the "
+                "envelope-bounding window is ambiguous; declare it once"
+            )
+            return 1
+        failed_values = _FAILED_SIGNAL_WAIT_RE.findall(ps1_text)
+        if not failed_values:
             print(
                 f"FAIL: {name} declares no $FailedSignalWaitMs — the "
                 "failed-signal fallback wait must be a named constant too, "
                 "so it cannot be mistaken for the graceful window"
+            )
+            return 1
+        if len(failed_values) > 1:
+            print(
+                f"FAIL: {name} declares $FailedSignalWaitMs "
+                f"{len(failed_values)} times ({', '.join(failed_values)} ms) — "
+                "the fallback wait is ambiguous; declare it once"
             )
             return 1
         if _WAIT_SELECTION_RE.search(ps1_text) is None:
@@ -322,8 +342,8 @@ def main() -> int:
                 "must be the ones the runtime waits on"
             )
             return 1
-        graceful_ms = int(graceful.group(1))
-        failed_ms = int(failed_signal.group(1))
+        graceful_ms = int(graceful_values[0])
+        failed_ms = int(failed_values[0])
         if failed_ms >= graceful_ms:
             print(
                 f"FAIL: {name} failed-signal fallback ({failed_ms}ms) must "
