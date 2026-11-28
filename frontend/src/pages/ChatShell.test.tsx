@@ -69,8 +69,33 @@ vi.mock("@/components/ui/sheet", () => ({
   Sheet: ({ children, open, modal }: { children: React.ReactNode; open?: boolean; modal?: boolean; onOpenChange?: (open: boolean) => void }) => {
     return <div data-testid="sheet-mock" data-open={open ? "true" : "false"} data-modal={modal === false ? "false" : "true"}>{open ? children : null}</div>;
   },
-  SheetContent: ({ children, className, side, overlay }: { children: React.ReactNode; className?: string; side?: string; overlay?: boolean }) => (
-    <div data-testid="sheet-content" data-side={side} data-overlay={overlay === false ? "false" : "true"} className={className}>
+  SheetContent: ({
+    children,
+    className,
+    side,
+    overlay,
+    onEscapeKeyDown,
+  }: {
+    children: React.ReactNode;
+    className?: string;
+    side?: string;
+    overlay?: boolean;
+    // Faithful to Radix DialogContent: DismissableLayer invokes this on
+    // Escape at document-capture (before window-level listeners), so the
+    // #1060 regression test drives it through the DOM-node property below.
+    onEscapeKeyDown?: (event: { preventDefault: () => void }) => void;
+  }) => (
+    <div
+      data-testid="sheet-content"
+      data-side={side}
+      data-overlay={overlay === false ? "false" : "true"}
+      className={className}
+      ref={(el) => {
+        if (el) {
+          (el as HTMLElement & { onEscapeKeyDown?: (event: { preventDefault: () => void }) => void }).onEscapeKeyDown = onEscapeKeyDown;
+        }
+      }}
+    >
       {children}
     </div>
   ),
@@ -1071,6 +1096,48 @@ describe("Evidence drawer non-modality + Escape focus restore (issue #508 WU-12)
     document.body.appendChild(chip);
 
     fireEvent.keyDown(window, { key: "Escape" });
+    expect(mockStoreState.closeRightPane).toHaveBeenCalledTimes(1);
+
+    await flushAnimationFrames();
+    expect(document.activeElement).toBe(chip);
+    document.body.removeChild(chip);
+  });
+
+  it("the mobile sheet's own Radix escape path closes the pane and restores chip focus (issue #1060)", async () => {
+    matchMediaMatches = true;
+    mockStoreState.rightPaneOpen = true;
+    mockStoreState.evidenceReturnFocusId = "msg-9";
+
+    render(
+      <BrowserRouter>
+        <ChatShell />
+      </BrowserRouter>
+    );
+
+    const chip = document.createElement("span");
+    chip.setAttribute("data-citation-chip-message", "msg-9");
+    chip.tabIndex = -1;
+    document.body.appendChild(chip);
+
+    // Radix's DismissableLayer consumes Escape at document-capture with
+    // preventDefault() BEFORE ChatShell's window-level listener, so while
+    // the sheet is mounted the window path never fires (issue #1060). Drive
+    // the sheet's own onEscapeKeyDown exactly as Radix does.
+    const bottom = Array.from(document.querySelectorAll("[data-testid='sheet-content']")).find(
+      (el) => el.getAttribute("data-side") === "bottom"
+    );
+    const onEscapeKeyDown = (bottom as unknown as {
+      onEscapeKeyDown?: (event: { preventDefault: () => void }) => void;
+    }).onEscapeKeyDown;
+    expect(onEscapeKeyDown).toBeInstanceOf(Function);
+
+    const event = { preventDefault: vi.fn() };
+    act(() => {
+      onEscapeKeyDown!(event);
+    });
+    // The handler consumes the event (standing Radix's own dismiss down)
+    // and drives the shared close-and-restore path itself.
+    expect(event.preventDefault).toHaveBeenCalledTimes(1);
     expect(mockStoreState.closeRightPane).toHaveBeenCalledTimes(1);
 
     await flushAnimationFrames();

@@ -66,11 +66,12 @@ updates:
     # - @radix-ui/react-dialog: 1.3.1 fails the k08-evidence-sheet-snap e2e
     #   spec 8/8 (#1060). 1.2.0 introduced the multi-aria-describedby change,
     #   so the hold starts at 1.2.0. Lift this when #1060 lands.
+    #   RESOLVED (#1060): hold lifted — the spec now word-matches the
+    #   composed aria-describedby list and the mobile sheet restores focus
+    #   on its own Radix escape path.
     ignore:
       - dependency-name: "oxc-transform-react"
         versions: [">=0.157.0"]
-      - dependency-name: "@radix-ui/react-dialog"
-        versions: [">=1.2.0"]
     groups:
       npm-minor-patch:
         update-types:

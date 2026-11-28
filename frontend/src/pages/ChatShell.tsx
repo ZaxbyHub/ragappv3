@@ -435,9 +435,28 @@ export default function ChatShell() {
   }, [isMobile]);
 
   // PRODUCT-ENH-10 (issue #508): Escape closes the evidence pane (desktop
-  // aside or mobile drawer) and restores focus — AFTER the close, via rAF so
-  // the DOM is stable — to the citation chip that opened it, falling back to
-  // the pane toggle button.
+  // aside or mobile drawer) and restores focus — AFTER the close, via rAF
+  // so the DOM is stable — to the citation chip that opened it, falling
+  // back to the pane toggle button. Shared by both close paths: the
+  // window-level listener below (desktop aside) and the mobile sheet's
+  // onEscapeKeyDown (Radix's DismissableLayer consumes Escape at
+  // document-capture with preventDefault(), so the window-level handler
+  // stands down whenever the Radix sheet is mounted — the sheet must
+  // close and restore focus itself; issue #1060).
+  const closePaneAndRestoreFocus = useCallback(() => {
+    closeRightPane();
+    requestAnimationFrame(() => {
+      const chip = evidenceReturnFocusId
+        ? document.querySelector(`[data-citation-chip-message="${evidenceReturnFocusId}"]`)
+        : null;
+      if (chip instanceof HTMLElement) {
+        chip.focus();
+      } else {
+        rightPaneToggleRef.current?.focus();
+      }
+    });
+  }, [closeRightPane, evidenceReturnFocusId]);
+
   useEffect(() => {
     if (!rightPaneOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -445,21 +464,11 @@ export default function ChatShell() {
       // Defer to handlers that already consumed Escape (e.g. SessionRail's
       // rename input preventDefaults so the window-level listeners stand down).
       if (event.defaultPrevented) return;
-      closeRightPane();
-      requestAnimationFrame(() => {
-        const chip = evidenceReturnFocusId
-          ? document.querySelector(`[data-citation-chip-message="${evidenceReturnFocusId}"]`)
-          : null;
-        if (chip instanceof HTMLElement) {
-          chip.focus();
-        } else {
-          rightPaneToggleRef.current?.focus();
-        }
-      });
+      closePaneAndRestoreFocus();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [rightPaneOpen, closeRightPane, evidenceReturnFocusId]);
+  }, [rightPaneOpen, closePaneAndRestoreFocus]);
 
   const handleResizeStart = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -777,6 +786,16 @@ export default function ChatShell() {
                untouched. */
             style={{ transitionDuration: "200ms" }}
             aria-describedby="evidence-sources-desc"
+            onEscapeKeyDown={(event) => {
+              // PRODUCT-ENH-10 via the Radix close path: DismissableLayer
+              // swallows Escape at document-capture with preventDefault()
+              // BEFORE the window-level handler above runs, so the mobile
+              // sheet closes and restores focus itself. Consuming the
+              // event here also stands Radix's own dismiss down — the
+              // controlled `open` prop follows closeRightPane().
+              event.preventDefault();
+              closePaneAndRestoreFocus();
+            }}
           >
             {/* Snap-point handle (issue #771 AC8): touch-action none keeps the
                 browser from converting a handle drag into a native pan; the

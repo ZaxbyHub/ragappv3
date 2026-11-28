@@ -22,14 +22,19 @@
 // is live, sendQuestion (the stub streams "Here is the streamed answer"
 // plus source S1), then click the "Source S1: handbook.pdf" citation chip
 // to open the below-lg evidence sheet
-// ([aria-describedby="evidence-sources-desc"], ChatShell.tsx).
+// ([aria-describedby~="evidence-sources-desc"], ChatShell.tsx).
 
 import { test, expect, type Page } from "@playwright/test";
 
 const STUB_PORT = process.env.E2E_STUB_PORT || "9090";
 const STUB_ORIGIN = `http://localhost:${STUB_PORT}`;
 
-const SHEET_SELECTOR = '[aria-describedby="evidence-sources-desc"]';
+// Word-boundary match (~=), not exact equality: @radix-ui/react-dialog
+// 1.2+ composes multiple aria-describedby ids into a space-separated list
+// (multiple-aria-describedby support), so the Content's attribute is no
+// longer exactly "evidence-sources-desc" even though the id is still in
+// the list. Issue #1060 AC1: the sheet locator must survive that change.
+const SHEET_SELECTOR = '[aria-describedby~="evidence-sources-desc"]';
 
 async function loginAndSelectVault(page: Page) {
   await page.goto("/login");
@@ -97,7 +102,7 @@ async function measureAnswerFirstLineUncovered(page: Page): Promise<boolean | nu
     }
     if (!(current.textContent || "").includes(marker)) return null;
     const line = current as HTMLElement;
-    const sheet = document.querySelector('[aria-describedby="evidence-sources-desc"]') as HTMLElement | null;
+    const sheet = document.querySelector('[aria-describedby~="evidence-sources-desc"]') as HTMLElement | null;
     if (!sheet) return null;
     const pRect = line.getBoundingClientRect();
     const sRect = sheet.getBoundingClientRect();
@@ -123,6 +128,46 @@ async function measureComposerUncovered(page: Page): Promise<boolean | null> {
 }
 
 test.describe("k08 evidence sheet snap (issue #771)", () => {
+  // #1060 AC1 — WHEN the frontend lock resolves @radix-ui/react-dialog to
+  // 1.3.1 or later THE SYSTEM SHALL render the chat evidence sheet after
+  // the citation chip is clicked. Radix 1.2+ composes the aria-describedby
+  // ids into a space-separated list, so the sheet is located by WORD match
+  // (SHEET_SELECTOR above). This check pins the rendered contract the
+  // upgrade must keep on the real primitive (the jsdom tier mocks the
+  // Sheet, so this browser path is the only real-Radix coverage):
+  //   - dialog semantics (role=dialog, describedby word-list contains the
+  //     evidence-sources-desc id),
+  //   - the content the citation chip promises (Evidence heading, the
+  //     "Sources (1)" tab),
+  //   - PRODUCT-ENH-10 (issue #508) focus return: after Escape closes the
+  //     sheet, focus lands on the citation chip that opened it
+  //     (evidenceReturnFocusId in the shell store).
+  test("evidence sheet renders dialog semantics, content, and focus return on the radix 1.3.x primitive", async ({ page }) => {
+    await page.request.post(`${STUB_ORIGIN}/_e2e/a11y-seed`, { data: {} });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await loginAndSelectVault(page);
+    await openEvidenceSheet(page);
+
+    const sheet = page.locator(SHEET_SELECTOR);
+    // Dialog semantics: role=dialog and the description id survives the
+    // 1.2+ multi-describedby composition (word, not exact, match).
+    await expect(sheet).toHaveRole("dialog");
+    await expect(sheet).toHaveAttribute("aria-describedby", /evidence-sources-desc/);
+    // Content: the sheet's Evidence heading and the Sources tab with the
+    // single stub source.
+    await expect(sheet.getByRole("heading", { name: "Evidence" }).first()).toBeVisible();
+    await expect(sheet.getByRole("tab", { name: /sources \(1\)/i })).toBeVisible();
+
+    // Focus return (PRODUCT-ENH-10): Escape closes the sheet and restores
+    // focus to the citation chip anchor that opened it — the
+    // data-citation-chip-message span (tabIndex=-1) the shell's rAF
+    // lookup targets via evidenceReturnFocusId.
+    const chip = page.locator("[data-citation-chip-message]").first();
+    await page.keyboard.press("Escape");
+    await expect(sheet).toBeHidden({ timeout: 10_000 });
+    await expect(chip).toBeFocused();
+  });
+
   // AC6 — #771: WHEN the evidence sheet opens from a citation chip at
   // 390x844 THE SYSTEM SHALL leave the first line of the latest assistant
   // message uncovered.
