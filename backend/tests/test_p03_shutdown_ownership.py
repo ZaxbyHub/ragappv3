@@ -149,16 +149,31 @@ class TestTailGatePredicate(unittest.IsolatedAsyncioTestCase):
         # (it popped the variable itself and asserted it was gone), while a
         # real lifespan test in the same worker could then inherit
         # RAGAPP_BOUNDED_EXIT=1 and os._exit(0) the pytest process.
+        import ast
+
         conftest_path = os.path.join(
             os.path.dirname(__file__), "conftest.py"
         )
         with open(conftest_path, encoding="utf-8") as fh:
             conftest_source = fh.read()
-        self.assertIn(
-            'os.environ.pop("RAGAPP_BOUNDED_EXIT"',
-            conftest_source,
-            "conftest.py must pop RAGAPP_BOUNDED_EXIT so a shell-exported "
-            "flag can never reach a test process",
+        # An AST check, not a substring: a COMMENT carrying the same text
+        # would satisfy a substring assertion while the pop was gone.
+        pops = [
+            node
+            for node in ast.walk(ast.parse(conftest_source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "pop"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "environ"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "RAGAPP_BOUNDED_EXIT"
+        ]
+        self.assertTrue(
+            pops,
+            "conftest.py must CALL os.environ.pop(\"RAGAPP_BOUNDED_EXIT\", "
+            "...) so a shell-exported flag can never reach a test process",
         )
         # And the invariant itself, unpatched: the flag is absent here.
         self.assertNotIn("RAGAPP_BOUNDED_EXIT", os.environ)
@@ -188,6 +203,7 @@ class TestRegistrationMapPin(unittest.TestCase):
         ("backend/app/api/routes/chat.py", "turn-finalizer-drain"): 1,
         ("backend/app/api/routes/draft_room.py", "upload-commit"): 1,
         ("backend/app/services/task_drain.py", "security-audit-drain"): 1,
+        ("backend/app/services/task_drain.py", "commit-audit-unit"): 1,
     }
 
     def test_registration_sites_are_complete(self):

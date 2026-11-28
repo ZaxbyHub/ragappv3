@@ -3811,8 +3811,39 @@ class BackgroundProcessor:
         """Apply the processor's terminal state (idempotent).
 
         Called on the normal shutdown path AND from ``_stop_guarded``'s
-        ``finally``, so an outside cancellation cannot skip it.
+        ``finally``, so an outside cancellation cannot skip it. It SIGNALS
+        the shutdown (the workers must stop), CANCELS the tasks that are
+        still owned, clears the ownership registries, releases the write
+        permit and clears the running flag. The cancellations are issued
+        without awaiting them: the shutdown sequence's own ordered
+        cancellations have already run on the normal path, and on the
+        cancellation path there is no time left to await.
         """
+        try:
+            self.shutdown_event.set()
+        except Exception:  # noqa: BLE001 — the terminal state must never raise
+            pass
+        for attr in (
+            "_worker_tasks",
+            "_enrichment_worker_task",
+            "_atom_enrichment_worker_task",
+            "_vector_delete_sweep_task",
+            "_artifact_delete_sweep_task",
+            "_reindex_worker_task",
+            "_retry_scheduler_task",
+            "_orphan_rescan_task",
+            "_ingest_janitor_task",
+        ):
+            owned = getattr(self, attr, None)
+            if owned is None:
+                continue
+            tasks = owned if isinstance(owned, (list, tuple, set)) else [owned]
+            for task in tasks:
+                try:
+                    if not task.done():
+                        task.cancel()
+                except Exception:  # noqa: BLE001 — best effort
+                    pass
         # partial-construction paths that predate these ownership registries.
         for state_name in (
             "_recovery_file_ids",

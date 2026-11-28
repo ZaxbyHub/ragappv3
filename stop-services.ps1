@@ -100,7 +100,12 @@ function Stop-BackendProcessGracefully {
         # lets the script SEE the sender's exit status, so a failed attach or
         # a failed CTRL_BREAK is reported instead of silently waiting out the
         # whole graceful window.
-        $SenderProc = Start-Process $SenderPy -ArgumentList @('"{0}"' -f $Sender, "$groupPid") -WindowStyle Hidden -Wait -PassThru
+        # The quoted path and the pid must be SEPARATE array elements:
+        # `@('"{0}"' -f $Sender, "$groupPid")` makes the pid a FORMAT
+        # OPERAND, so the array collapses to one element and the sender
+        # never receives the pid (verified with a PowerShell probe).
+        $QuotedSender = '"{0}"' -f $Sender
+        $SenderProc = Start-Process $SenderPy -ArgumentList @($QuotedSender, "$groupPid") -WindowStyle Hidden -Wait -PassThru
         if ($SenderProc.ExitCode -ne 0) {
             Write-Output "  ${Label}: the CTRL_BREAK sender reported exit code $($SenderProc.ExitCode) (attach or event delivery failed); the graceful window still applies"
         }

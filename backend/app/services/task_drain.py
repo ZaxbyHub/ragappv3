@@ -227,13 +227,23 @@ async def drain_commit_audit(
       ``CancelledError`` after the log.
     """
 
+    # The WHOLE unit is recovery-critical work, not just the audit write:
+    # the commit runs BEFORE the audit's own registration, so a registration
+    # that started only at the audit would leave the commit-to-audit window
+    # unprotected (the bounded tail exit could end the process with a
+    # committed mutation whose mandatory audit tail had not been written).
+    from app.services.shutdown_gate import critical_shutdown_work
+
     async def _unit() -> None:
         await asyncio.to_thread(conn.commit)
         if after_commit is not None:
             after_commit()
         await drain_audit(audit_factory())
 
-    cancelled, error = await drain_await(asyncio.ensure_future(_unit()))
+    async with critical_shutdown_work("commit-audit-unit"):
+        cancelled, error = await drain_await(
+            asyncio.ensure_future(_unit())
+        )
     await _settle_drained(cancelled, error, context="commit_audit")
 
 

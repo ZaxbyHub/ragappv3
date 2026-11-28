@@ -188,24 +188,96 @@ class TestDeclinedTailLogNamesTheBlockedWorkflow(unittest.IsolatedAsyncioTestCas
         )
 
 
+
+def _load_sender_with_fake_kernel32(*, attach_ok: bool, event_ok: bool):
+    """Import the Windows sender with a fake kernel32 (Linux-runnable)."""
+    import ctypes
+    import importlib.util
+
+    class _FakeKernel32:
+        def __init__(self):
+            self.calls = []
+
+        def FreeConsole(self):
+            self.calls.append("FreeConsole")
+            return 1
+
+        def AttachConsole(self, pid):
+            self.calls.append(f"AttachConsole({pid})")
+            return 1 if attach_ok else 0
+
+        def GenerateConsoleCtrlEvent(self, event, group):
+            self.calls.append(f"GenerateConsoleCtrlEvent({event},{group})")
+            return 1 if event_ok else 0
+
+    fake = _FakeKernel32()
+    original = ctypes.WinDLL
+    ctypes.WinDLL = lambda *args, **kwargs: fake
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "win_send_ctrl_break_under_test",
+            REPO / "scripts" / "win_send_ctrl_break.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        ctypes.WinDLL = original
+    return module
+
 class TestWindowsSenderAndMarker(unittest.TestCase):
     """The shipped Windows helpers report their outcome and agree on the
     marker format (both are Linux-runnable)."""
 
     def test_sender_reports_its_exit_status(self):
-        script = REPO / "scripts" / "win_send_ctrl_break.py"
-        proc = subprocess.run(
-            [sys.executable, str(script)],
-            capture_output=True,
-            text=True,
-            timeout=60,
+        """The sender's exit statuses are observable without a Windows box.
+
+        The script binds kernel32 at import time, so a Linux run cannot
+        even load it; the fake kernel32 makes the four outcomes
+        (usage / attach failed / event failed / delivered) testable
+        anywhere.
+        """
+        module = _load_sender_with_fake_kernel32(
+            attach_ok=True, event_ok=True
         )
         self.assertEqual(
-            proc.returncode,
+            module.main(),
             2,
-            "the sender must report a usage error (exit 2) when no pid is "
-            f"given; stdout={proc.stdout!r} stderr={proc.stderr!r}",
+            "no pid argument must be a usage error (exit 2)",
         )
+
+        # main() reads the pid from argv.
+        argv = sys.argv
+        try:
+            sys.argv = ["win_send_ctrl_break.py", "4242"]
+            module = _load_sender_with_fake_kernel32(
+                attach_ok=True, event_ok=True
+            )
+            self.assertEqual(
+                module.main(),
+                0,
+                "a delivered CTRL_BREAK must report success (exit 0)",
+            )
+
+            module = _load_sender_with_fake_kernel32(
+                attach_ok=False, event_ok=True
+            )
+            self.assertEqual(
+                module.main(),
+                3,
+                "a failed AttachConsole must be reported (exit 3), not silent",
+            )
+
+            module = _load_sender_with_fake_kernel32(
+                attach_ok=True, event_ok=False
+            )
+            self.assertEqual(
+                module.main(),
+                4,
+                "a failed GenerateConsoleCtrlEvent must be reported (exit 4), "
+                "not silent",
+            )
+        finally:
+            sys.argv = argv
 
     def test_sender_uses_the_windows_api_and_reports_failures(self):
         script = REPO / "scripts" / "win_send_ctrl_break.py"

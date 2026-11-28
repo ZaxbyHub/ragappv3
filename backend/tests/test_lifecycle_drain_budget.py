@@ -167,6 +167,17 @@ class TestStopHonorsOneAggregateDeadline(unittest.IsolatedAsyncioTestCase):
             flush_stall_seconds=FLUSH_STALL_SECONDS,
         )
         elapsed = await _run_stop_and_measure(processor, BUDGET_SECONDS)
+        # The composed case reaches the optimize at all: the aggregate
+        # deadline is CONSUMED by the slow drain phases, so the trailing
+        # optimize is never started. That is the property the composed
+        # case proves, so it is asserted directly (the isolated optimize
+        # case is the one that must reach the branch).
+        self.assertFalse(
+            processor.vector_store.entered,
+            "the aggregate deadline must be consumed by the drain phases, so "
+            "the trailing optimize is never started (the composed worst case "
+            "is one budget, not a budget per phase)",
+        )
         self.assertLessEqual(
             elapsed,
             BOUND_SECONDS,
