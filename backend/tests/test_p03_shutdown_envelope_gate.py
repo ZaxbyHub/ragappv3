@@ -143,13 +143,46 @@ class TestShutdownEnvelopeGate(unittest.TestCase):
         )
         for name in ("start-services.ps1", "stop-services.ps1"):
             text = (REPO / name).read_text(encoding="utf-8")
-            waits = [int(ms) for ms in self.gate._WAITFOREXIT_RE.findall(text)]
-            self.assertTrue(waits, f"{name} has no WaitForExit budget")
+            # The envelope-bounding deadline is the NAMED graceful window:
+            # the launchers also carry short fallbacks (a failed signal, a
+            # process with no marker match), and reading "the first
+            # WaitForExit literal" would bind the wrong one.
+            graceful = self.gate._GRACEFUL_WINDOW_RE.search(text)
+            self.assertIsNotNone(
+                graceful, f"{name} declares no $GracefulWindowMs"
+            )
             self.assertGreater(
-                max(waits) / 1000.0,
+                int(graceful.group(1)) / 1000.0,
                 total,
-                f"{name}'s grouped-backend stop wait must exceed the "
+                f"{name}'s grouped-backend graceful window must exceed the "
                 "composed envelope",
+            )
+            failed_signal = self.gate._FAILED_SIGNAL_WAIT_RE.search(text)
+            self.assertIsNotNone(
+                failed_signal, f"{name} declares no $FailedSignalWaitMs"
+            )
+            self.assertLess(
+                int(failed_signal.group(1)),
+                int(graceful.group(1)),
+                f"{name}'s failed-signal fallback must be shorter than the "
+                "graceful window: a failed signal starts no graceful "
+                "shutdown, so waiting out the full window buys nothing",
+            )
+
+    def test_the_named_windows_are_the_ones_the_runtime_waits_on(self):
+        # Declaring the constants is not enough: the launcher must SELECT
+        # between them on the sender's exit status and wait on the result,
+        # or the named value would be a comment in disguise.
+        for name in ("start-services.ps1", "stop-services.ps1"):
+            text = (REPO / name).read_text(encoding="utf-8")
+            self.assertIsNotNone(
+                self.gate._WAIT_SELECTION_RE.search(text),
+                f"{name} does not select between the failed-signal fallback "
+                "and the graceful window on the sender's exit status",
+            )
+            self.assertIsNotNone(
+                self.gate._WAITFOREXIT_NAMED_RE.search(text),
+                f"{name} never waits on $WaitMs",
             )
 
 

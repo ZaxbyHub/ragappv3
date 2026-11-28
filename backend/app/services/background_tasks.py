@@ -13,6 +13,7 @@ import os
 import re
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import List, Optional
@@ -3819,10 +3820,10 @@ class BackgroundProcessor:
         cancellations have already run on the normal path, and on the
         cancellation path there is no time left to await.
         """
-        try:
+        # The terminal state must never raise: a failing shutdown_event.set()
+        # must not abort the cleanup that follows.
+        with suppress(Exception):
             self.shutdown_event.set()
-        except Exception:  # noqa: BLE001 — the terminal state must never raise
-            pass
         for attr in (
             "_worker_tasks",
             "_enrichment_worker_task",
@@ -3845,11 +3846,11 @@ class BackgroundProcessor:
                 continue
             tasks = owned if isinstance(owned, (list, tuple, set)) else [owned]
             for task in tasks:
-                try:
+                # Best effort: a task whose cancel() raises must not stop
+                # the remaining tasks from being cancelled.
+                with suppress(Exception):
                     if not task.done():
                         task.cancel()
-                except Exception:  # noqa: BLE001 — best effort
-                    pass
         # partial-construction paths that predate these ownership registries.
         for state_name in (
             "_recovery_file_ids",

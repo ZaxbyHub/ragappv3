@@ -16,6 +16,7 @@ Each test pins ONE property that a plausible regression would break:
 """
 
 import asyncio
+import contextlib
 import os
 import subprocess
 import sys
@@ -189,8 +190,16 @@ class TestDeclinedTailLogNamesTheBlockedWorkflow(unittest.IsolatedAsyncioTestCas
 
 
 
-def _load_sender_with_fake_kernel32(*, attach_ok: bool, event_ok: bool):
-    """Import the Windows sender with a fake kernel32 (Linux-runnable)."""
+@contextlib.contextmanager
+def _sender_with_fake_kernel32(*, attach_ok: bool, event_ok: bool):
+    """Import the Windows sender with a fake kernel32 (Linux-runnable).
+
+    The fakes stay installed for the whole ``with`` block: the sender calls
+    ``ctypes.get_last_error()`` INSIDE ``main()`` (the failure paths), so
+    restoring the names right after the import would leave the call without
+    the attribute it needs -- and on Linux that attribute does not exist at
+    all.
+    """
     import ctypes
     import importlib.util
 
@@ -227,6 +236,7 @@ def _load_sender_with_fake_kernel32(*, attach_ok: bool, event_ok: bool):
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        yield module
     finally:
         if original_windll is sentinel:
             try:
@@ -242,7 +252,7 @@ def _load_sender_with_fake_kernel32(*, attach_ok: bool, event_ok: bool):
                 pass
         else:
             ctypes.get_last_error = original_get_last_error
-    return module
+
 
 class TestWindowsSenderAndMarker(unittest.TestCase):
     """The shipped Windows helpers report their outcome and agree on the
@@ -256,46 +266,46 @@ class TestWindowsSenderAndMarker(unittest.TestCase):
         (usage / attach failed / event failed / delivered) testable
         anywhere.
         """
-        module = _load_sender_with_fake_kernel32(
+        with _sender_with_fake_kernel32(
             attach_ok=True, event_ok=True
-        )
-        self.assertEqual(
-            module.main(),
-            2,
-            "no pid argument must be a usage error (exit 2)",
-        )
+        ) as module:
+            self.assertEqual(
+                module.main(),
+                2,
+                "no pid argument must be a usage error (exit 2)",
+            )
 
         # main() reads the pid from argv.
         argv = sys.argv
         try:
             sys.argv = ["win_send_ctrl_break.py", "4242"]
-            module = _load_sender_with_fake_kernel32(
+            with _sender_with_fake_kernel32(
                 attach_ok=True, event_ok=True
-            )
-            self.assertEqual(
-                module.main(),
-                0,
-                "a delivered CTRL_BREAK must report success (exit 0)",
-            )
+            ) as module:
+                self.assertEqual(
+                    module.main(),
+                    0,
+                    "a delivered CTRL_BREAK must report success (exit 0)",
+                )
 
-            module = _load_sender_with_fake_kernel32(
+            with _sender_with_fake_kernel32(
                 attach_ok=False, event_ok=True
-            )
-            self.assertEqual(
-                module.main(),
-                3,
-                "a failed AttachConsole must be reported (exit 3), not silent",
-            )
+            ) as module:
+                self.assertEqual(
+                    module.main(),
+                    3,
+                    "a failed AttachConsole must be reported (exit 3), not silent",
+                )
 
-            module = _load_sender_with_fake_kernel32(
+            with _sender_with_fake_kernel32(
                 attach_ok=True, event_ok=False
-            )
-            self.assertEqual(
-                module.main(),
-                4,
-                "a failed GenerateConsoleCtrlEvent must be reported (exit 4), "
-                "not silent",
-            )
+            ) as module:
+                self.assertEqual(
+                    module.main(),
+                    4,
+                    "a failed GenerateConsoleCtrlEvent must be reported (exit 4), "
+                    "not silent",
+                )
         finally:
             sys.argv = argv
 

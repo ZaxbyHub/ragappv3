@@ -150,10 +150,16 @@ function Stop-BackendProcessGracefully {
         # fragment and stop-services.ps1:
         #   enforced: 20 s (uvicorn request drain) + 65 s (lifespan aggregate) + 15 s (turn-finalizer drain) = 100 s; allowance: 30 s (SQLite-family executor-join tail) + 5 s (teardown) = 35 s; total 135 s
         # scripts/check_p03_shutdown_envelope.py owns that arithmetic.
+        # The two windows are NAMED: the envelope gate reads
+        # $GracefulWindowMs (the force-stop deadline the envelope bounds)
+        # and $FailedSignalWaitMs (a different path, below), so a literal
+        # inside a WaitForExit call can never be mistaken for the other.
+        $GracefulWindowMs = 140000
         # A FAILED signal delivery means no graceful shutdown was started:
         # waiting the whole 140 s graceful window buys nothing, so fall back
         # to the short bounded wait and then force-stop.
-        $WaitMs = if ($SenderFailed) { 15000 } else { 140000 }
+        $FailedSignalWaitMs = 15000
+        $WaitMs = if ($SenderFailed) { $FailedSignalWaitMs } else { $GracefulWindowMs }
         if (-not $Proc.WaitForExit($WaitMs)) {
             Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
             Write-Output "  ${Label}: graceful window expired; force-stopped (PID $($Proc.Id))"

@@ -28,15 +28,15 @@
       "skipped_tests": 1
     },
     "_totals": {
-      "CONFIDENCE.HIGH": 28,
+      "CONFIDENCE.HIGH": 27,
       "CONFIDENCE.LOW": 25,
       "CONFIDENCE.MEDIUM": 69,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 6,
-      "SEVERITY.LOW": 53,
+      "SEVERITY.LOW": 52,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 105415,
+      "loc": 105448,
       "nosec": 0,
       "skipped_tests": 73
     },
@@ -444,15 +444,15 @@
       "skipped_tests": 2
     },
     "backend/app/lifespan.py": {
-      "CONFIDENCE.HIGH": 1,
+      "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
       "CONFIDENCE.MEDIUM": 0,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 1,
+      "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1251,
+      "loc": 1249,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -777,7 +777,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 5262,
+      "loc": 5293,
       "nosec": 0,
       "skipped_tests": 6
     },
@@ -1726,7 +1726,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 221,
+      "loc": 225,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3341,27 +3341,6 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1578         _auth_executor.shutdown(wait=False)\n1579     except Exception:\n1580         pass\n1581     with contextlib_suppress(Exception):\n",
-      "col_offset": 4,
-      "end_col_offset": 12,
-      "filename": "backend/app/lifespan.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 703,
-        "link": "https://cwe.mitre.org/data/definitions/703.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1579,
-      "line_range": [
-        1579,
-        1580
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
-      "test_id": "B110",
-      "test_name": "try_except_pass"
-    },
-    {
       "code": "89 # and the warning below targets exactly it.\n90 if settings.users_enabled and settings.admin_secret_token == \"admin-secret-token\":\n91     logger.warning(\n",
       "col_offset": 61,
       "end_col_offset": 81,
@@ -3562,7 +3541,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "3145                 cursor = conn.execute(\n3146                     \"UPDATE files SET enrichment_status = (\"\n3147                     + est.aggregate_status_case_sql()\n3148                     + \"), enrichment_error = NULL, enrichment_updated_at = ? \"\n",
+      "code": "3146                 cursor = conn.execute(\n3147                     \"UPDATE files SET enrichment_status = (\"\n3148                     + est.aggregate_status_case_sql()\n3149                     + \"), enrichment_error = NULL, enrichment_updated_at = ? \"\n",
       "col_offset": 20,
       "end_col_offset": 60,
       "filename": "backend/app/services/background_tasks.py",
@@ -3573,10 +3552,10 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 3146,
+      "line_number": 3147,
       "line_range": [
-        3146,
-        3147
+        3147,
+        3148
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",

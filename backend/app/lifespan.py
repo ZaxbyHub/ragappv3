@@ -1579,11 +1579,9 @@ async def lifespan(app: FastAPI):
     turn_finalizers_drained, pool_closed = await _finalize_turns_and_close_pool(
         app, remaining=_remaining
     )
-    try:
+    with contextlib_suppress(Exception):
         from app.services.auth_service import _auth_executor
         _auth_executor.shutdown(wait=False)
-    except Exception:
-        pass
     with contextlib_suppress(Exception):
         # PR #1113 (swarm-pr-review N-05a): the wiki lint scan executor is
         # created at routes import time; shut it down with the same

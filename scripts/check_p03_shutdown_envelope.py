@@ -22,9 +22,11 @@ The derivation has two halves, and this gate keeps them apart:
 The gate enforces three properties:
 
 1. every force-kill limit (the compose ``stop_grace_period`` and each
-   native ``WaitForExit`` budget) is STRICTLY greater than the composed
-   total, so a shutdown that stays inside the enforced terms is never
-   cut short;
+   native launcher's ``$GracefulWindowMs``) is STRICTLY greater than the
+   composed total, so a shutdown that stays inside the enforced terms is
+   never cut short; the launchers NAME their windows, so the
+   envelope-bounding deadline cannot be confused with the short
+   failed-signal or no-marker fallbacks;
 2. every enforced term is read from its authoritative runtime source —
    a component that drifts in the code changes the derived total and
    fails every surface that still quotes the old one;
@@ -89,6 +91,33 @@ _TURN_CONST_RE = re.compile(
 # The compose grace and the native grouped-backend stop waits.
 _COMPOSE_GRACE_RE = re.compile(r"^\s*stop_grace_period:\s*(\S+)\s*$", re.MULTILINE)
 _WAITFOREXIT_RE = re.compile(r"WaitForExit\(\s*([0-9]+)\s*\)")
+# The native launchers NAME their two windows, because each launcher has
+# TWO waits and only ONE of them is the force-stop deadline the envelope
+# bounds:
+#
+#   $GracefulWindowMs   -- the wait after a DELIVERED CTRL_BREAK: the
+#                           deadline the composed envelope bounds;
+#   $FailedSignalWaitMs -- the short fallback after a FAILED signal
+#                           delivery: no graceful shutdown was started,
+#                           so waiting out the graceful window buys
+#                           nothing.
+#
+# Reading the named constant (instead of "the first WaitForExit literal
+# after the CTRL_BREAK line") is what keeps the two apart: a literal
+# inside any WaitForExit call can no longer be mistaken for the
+# envelope-bounding deadline.
+_GRACEFUL_WINDOW_RE = re.compile(
+    r"^\s*\$GracefulWindowMs\s*=\s*([0-9]+)\s*$", re.MULTILINE
+)
+_FAILED_SIGNAL_WAIT_RE = re.compile(
+    r"^\s*\$FailedSignalWaitMs\s*=\s*([0-9]+)\s*$", re.MULTILINE
+)
+# The runtime must CONSUME the named windows, not merely declare them.
+_WAIT_SELECTION_RE = re.compile(
+    r"\$WaitMs\s*=\s*if\s*\(\s*\$SenderFailed\s*\)\s*\{\s*"
+    r"\$FailedSignalWaitMs\s*\}\s*else\s*\{\s*\$GracefulWindowMs\s*\}"
+)
+_WAITFOREXIT_NAMED_RE = re.compile(r"WaitForExit\(\s*\$WaitMs\s*\)")
 
 _UNIT_SECONDS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
 
@@ -258,50 +287,62 @@ def main() -> int:
     )
 
     # ── 1. native WaitForExit budgets ─────────────────────────────────────
-    # Each .ps1 has TWO waits: the graceful window for the GROUPED backend
-    # (the one this envelope bounds) and a short fallback wait for a
-    # process with no marker match (a different path, not this envelope).
-    # Only the grouped graceful wait is bound by the envelope, so it is
-    # located by the CTRL_BREAK send that precedes it.
+    # Each .ps1 has THREE waits: the graceful window for the GROUPED
+    # backend after a DELIVERED signal (the one this envelope bounds), the
+    # short fallback after a FAILED signal delivery, and a short bounded
+    # wait for a process with no marker match. Only the first is bound by
+    # the envelope, so it is read from its named constant.
     for name in _PS1_SURFACES:
         ps1_text = _read(ROOT / name)
-        lines = ps1_text.splitlines()
-        send_index = next(
-            (
-                index
-                for index, line in enumerate(lines)
-                if "CTRL_BREAK" in line and "graceful" in line
-            ),
-            None,
-        )
-        if send_index is None:
-            print(f"FAIL: {name} does not send a graceful CTRL_BREAK")
-            return 1
-        grouped_wait_ms = next(
-            (
-                int(match.group(1))
-                for line in lines[send_index:]
-                if (match := _WAITFOREXIT_RE.search(line))
-            ),
-            None,
-        )
-        if grouped_wait_ms is None:
+        graceful = _GRACEFUL_WINDOW_RE.search(ps1_text)
+        if graceful is None:
             print(
-                f"FAIL: {name} sends a graceful CTRL_BREAK but never waits "
-                "for the process to exit"
+                f"FAIL: {name} declares no $GracefulWindowMs — the "
+                "envelope-bounding native stop wait must be a named "
+                "constant the gate can read"
             )
             return 1
-        wait_seconds = grouped_wait_ms / 1000.0
+        failed_signal = _FAILED_SIGNAL_WAIT_RE.search(ps1_text)
+        if failed_signal is None:
+            print(
+                f"FAIL: {name} declares no $FailedSignalWaitMs — the "
+                "failed-signal fallback wait must be a named constant too, "
+                "so it cannot be mistaken for the graceful window"
+            )
+            return 1
+        if _WAIT_SELECTION_RE.search(ps1_text) is None:
+            print(
+                f"FAIL: {name} does not select between $FailedSignalWaitMs "
+                "and $GracefulWindowMs on the sender's exit status"
+            )
+            return 1
+        if _WAITFOREXIT_NAMED_RE.search(ps1_text) is None:
+            print(
+                f"FAIL: {name} never waits on $WaitMs — the named windows "
+                "must be the ones the runtime waits on"
+            )
+            return 1
+        graceful_ms = int(graceful.group(1))
+        failed_ms = int(failed_signal.group(1))
+        if failed_ms >= graceful_ms:
+            print(
+                f"FAIL: {name} failed-signal fallback ({failed_ms}ms) must "
+                f"be SHORTER than the graceful window ({graceful_ms}ms): the "
+                "fallback exists so a failed signal does not wait out the "
+                "graceful window"
+            )
+            return 1
+        wait_seconds = graceful_ms / 1000.0
         if not wait_seconds > total:
             print(
-                f"FAIL: {name} grouped-backend WaitForExit({grouped_wait_ms}) "
-                f"= {wait_seconds:g}s must be strictly greater than the "
-                f"{total:g}s composed envelope"
+                f"FAIL: {name} grouped-backend graceful window "
+                f"({graceful_ms}ms = {wait_seconds:g}s) must be strictly "
+                f"greater than the {total:g}s composed envelope"
             )
             return 1
         print(
             f"OK {name} grouped-backend native stop wait "
-            f"{grouped_wait_ms}ms ({wait_seconds:g}s) exceeds the "
+            f"{graceful_ms}ms ({wait_seconds:g}s) exceeds the "
             f"{total:g}s envelope"
         )
 

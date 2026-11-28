@@ -47,10 +47,10 @@ stops quoting the derivation verbatim. The two ALLOWANCE terms are declared
 in that script as policy: no code bounds the executor-join tail (the
 abandoned-parse worker keeps running) or the interpreter teardown.
 
-The compose grace is 150 s and the native stop wait is 140 s — both strictly
-above the 135 s composed envelope, so a shutdown that stays inside the
-enforced 100 s is never force-killed mid-flight IN STATE A (the bounded
-tail exit fired). In State B the tail exit is skipped while a
+The compose grace is 150 s and the native launchers' graceful window is
+140 s — both strictly above the 135 s composed envelope, so a shutdown that
+stays inside the enforced 100 s is never force-killed mid-flight IN STATE A
+(the bounded tail exit fired). In State B the tail exit is skipped while a
 recovery-critical workflow is in flight: the process then exits through the
 normal path and the outer grace MAY terminate it.
 
@@ -137,9 +137,14 @@ fails the gate to the ungrouped fallback), then
 `scripts/win_send_ctrl_break.py` — a sacrificial sender that detaches its
 own console, attaches to the backend's, and delivers a TARGETED CTRL_BREAK
 to the nonzero group — waits up to 140 s (above the 135 s composed
-envelope), and only then force-stops. The graceful path belongs to the
-BACKEND port only: the frontend and Ollama processes get the immediate force
-stop they had at base (they are not signal-handling console apps).
+envelope), and only then force-stops. The sender's exit status is checked:
+a DELIVERED signal gets the full 140 s graceful window, while a FAILED
+delivery (attach or event delivery failed) starts no graceful shutdown at
+all, so it falls back to a short 15 s bounded wait and then force-stops
+instead of waiting out a window nothing is using. The graceful path belongs
+to the BACKEND port only: the frontend and Ollama processes get the
+immediate force stop they had at base (they are not signal-handling console
+apps).
 
 **The venv shape.** On Windows a venv's `Scripts\python.exe` is a REDIRECTOR
 that starts the real interpreter as a CHILD, so the process that owns the
@@ -218,7 +223,7 @@ restarts working.
 - backend/tests/test_p03_lifecycle_behavioral.py (C13/C14/C15/C16 behavioral)
 - backend/tests/test_p03_shutdown_ownership.py (registry, tail-gate matrices, executor recreation, env pop pin)
 - scripts/check_p03_graceful_shutdown.py (C5 structural; wired into the CI Quality contracts job by this PR)
-- scripts/check_p03_shutdown_envelope.py (new in this PR; wired into the CI Quality contracts job — it owns the ONE envelope derivation: it reads every ENFORCED term from the code that enforces it, declares the two ALLOWANCE terms explicitly, and fails if the compose grace, either native stop wait, or any surface's quoted derivation drifts from the 135 s composed envelope)
+- scripts/check_p03_shutdown_envelope.py (new in this PR; wired into the CI Quality contracts job — it owns the ONE envelope derivation: it reads every ENFORCED term from the code that enforces it, declares the two ALLOWANCE terms explicitly, and fails if the compose grace, either native launcher's named graceful window, or any surface's quoted derivation drifts from the 135 s composed envelope)
 
 UX note: only the BACKEND port gets the graceful path. The frontend and
 Ollama processes are not signal-handling console apps, so they keep the
