@@ -21,6 +21,10 @@
   focus itself; the desktop-aside path is unchanged.
 - `.github/dependabot.yml`: removed the `@radix-ui/react-dialog`
   `>=1.2.0` ignore entry PR #1212 parked for this issue.
+- `frontend/src/pages/ChatShell.test.tsx`: the Sheet mock now forwards
+  `onEscapeKeyDown` (as Radix DialogContent does), and a new unit test
+  drives the mobile sheet's own escape path — preventDefault, pane close,
+  and focus return to the citation chip anchor.
 
 ## Why
 
@@ -52,7 +56,10 @@ npm-minor-patch group again.
 - The jsdom tier mocks the Sheet (`ChatShell.test.tsx`), so the
   real-Radix dialog semantics and focus-return contract are covered only
   by `frontend/e2e/k08-evidence-sheet-snap.spec.ts` — it must keep
-  running in the Playwright CI job.
+  running in the Playwright CI job. ChatShell's escape wiring is now also
+  unit-covered (`ChatShell.test.tsx` drives the mocked sheet's
+  `onEscapeKeyDown`), but the real primitive's behavior is still
+  Playwright-only.
 - Verified at resolved `1.3.1` (8 legacy tests + 1 new AC test pass) and
   at the `1.1.23` baseline before the bump (8/8 pass); versions beyond
   1.3.1 inherit the same word-match contract.
