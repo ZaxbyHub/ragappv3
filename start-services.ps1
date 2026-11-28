@@ -21,6 +21,13 @@ param(
 
 $ErrorActionPreference = "SilentlyContinue"
 
+# The CTRL_BREAK sender's OWN failure codes (2 = usage, 3 = the console
+# attach failed, 4 = the event delivery failed). Only these mean the
+# signal was NOT delivered; any other non-zero status is UNKNOWN and the
+# full graceful window applies (a shortened window could force-kill a
+# graceful shutdown that is still inside the enforced envelope).
+$SENDER_DELIVERY_FAILURE_CODES = @(2, 3, 4)
+
 $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path
 $BackendDir = Join-Path $RepoRoot "backend"
 $FrontendDir = Join-Path $RepoRoot "frontend"
@@ -138,9 +145,18 @@ function Stop-BackendProcessGracefully {
         # never receives the pid (verified with a PowerShell probe).
         $QuotedSender = '"{0}"' -f $Sender
         $SenderProc = Start-Process $SenderPy -ArgumentList @($QuotedSender, "$groupPid") -WindowStyle Hidden -Wait -PassThru
-        $SenderFailed = $SenderProc.ExitCode -ne 0
+        $SenderExit = $SenderProc.ExitCode
+        # Only the sender's OWN failure codes mean the signal was NOT
+        # delivered. Any other non-zero status is UNKNOWN (e.g. the
+        # interpreter's exit-time flush failure, 120) and the signal may
+        # well have been delivered, so the FULL graceful window applies:
+        # shortening it could force-kill a graceful shutdown that is still
+        # inside the enforced envelope.
+        $SenderFailed = $SenderExit -in $SENDER_DELIVERY_FAILURE_CODES
         if ($SenderFailed) {
-            Write-Output "  ${Label}: the CTRL_BREAK sender reported exit code $($SenderProc.ExitCode) (attach or event delivery failed); the signal was NOT delivered"
+            Write-Output "  ${Label}: the CTRL_BREAK sender reported exit code $SenderExit (attach or event delivery failed); the signal was NOT delivered"
+        } elseif ($SenderExit -ne 0) {
+            Write-Output "  ${Label}: the CTRL_BREAK sender reported exit code $SenderExit, which is not one of its own status codes ($($SENDER_DELIVERY_FAILURE_CODES -join ', ')); the delivery status is UNKNOWN, so the full graceful window applies"
         }
         Write-Output "  ${Label}: sent graceful CTRL_BREAK to grouped backend (group $groupPid, owner PID $($Proc.Id)); waiting..."
         # 140 s > the composed shutdown envelope, so the force fallback

@@ -355,12 +355,83 @@ class TestWindowsSenderAndMarker(unittest.TestCase):
             "the sender must deliver the CTRL_BREAK to the group",
         )
         # The failure paths must be distinguishable from success.
-        for marker in ("return 3", "return 4", "return 0"):
+        for marker in (
+            "EXIT_USAGE = 2",
+            "EXIT_ATTACH_FAILED = 3",
+            "EXIT_EVENT_FAILED = 4",
+            "EXIT_DELIVERED = 0",
+        ):
             self.assertIn(
                 marker,
                 source,
                 f"the sender must expose {marker} so a failed attach or "
                 "event delivery is distinguishable from success",
+            )
+
+    def test_the_exit_status_is_exact_even_with_a_broken_stdout(self):
+        """The launcher reads the sender's exit status, so it must be exact.
+
+        With the interpreter's own exit, a broken standard handle makes
+        CPython exit 120 ("could not flush stdout at exit") — a status that
+        says nothing about the signal. The host run caught exactly that: a
+        DELIVERED signal reported as 120, which the launcher read as a
+        failed delivery and shortened the graceful window (a graceful
+        shutdown still inside the enforced envelope could be force-killed
+        at 15 s). The sender leaves through os._exit, so the status is
+        exactly what it chose.
+        """
+        script = REPO / "scripts" / "win_send_ctrl_break.py"
+        code = (
+            "import importlib.util, os\n"
+            f"spec = importlib.util.spec_from_file_location('sender', r'{script}')\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(module)\n"
+            "os.close(1)\n"
+            "module._exit(42)\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(
+            proc.returncode,
+            42,
+            "the sender's exit status must be exact even when its standard "
+            "handles are unusable: 120 (the interpreter's flush-failure "
+            "status) says nothing about the signal, and the launcher reads "
+            "the status to decide whether the graceful window applies",
+        )
+
+    def test_only_the_senders_own_failure_codes_shorten_the_window(self):
+        """A non-zero status the sender did not define is UNKNOWN.
+
+        Only the sender's own codes (2 = usage, 3 = attach failed, 4 =
+        event delivery failed) mean the signal was not delivered. Any other
+        non-zero status may follow a DELIVERED signal, and shortening the
+        window on it could force-kill a graceful shutdown that is still
+        inside the enforced envelope.
+        """
+        for name in ("start-services.ps1", "stop-services.ps1"):
+            text = (REPO / name).read_text(encoding="utf-8")
+            self.assertIn(
+                "$SENDER_DELIVERY_FAILURE_CODES = @(2, 3, 4)",
+                text,
+                f"{name} must name the sender's own failure codes",
+            )
+            self.assertIn(
+                "$SenderFailed = $SenderExit -in $SENDER_DELIVERY_FAILURE_CODES",
+                text,
+                f"{name} must treat only the sender's own failure codes as a "
+                "failed delivery",
+            )
+            self.assertIn(
+                "the delivery status is UNKNOWN, so the full graceful "
+                "window applies",
+                text,
+                f"{name} must say what it does with an unknown status and "
+                "keep the full graceful window",
             )
 
     def test_marker_line_format_matches_the_stop_parser(self):
