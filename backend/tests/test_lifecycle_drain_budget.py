@@ -167,17 +167,9 @@ class TestStopHonorsOneAggregateDeadline(unittest.IsolatedAsyncioTestCase):
             flush_stall_seconds=FLUSH_STALL_SECONDS,
         )
         elapsed = await _run_stop_and_measure(processor, BUDGET_SECONDS)
-        # The composed case reaches the optimize at all: the aggregate
-        # deadline is CONSUMED by the slow drain phases, so the trailing
-        # optimize is never started. That is the property the composed
-        # case proves, so it is asserted directly (the isolated optimize
-        # case is the one that must reach the branch).
-        self.assertFalse(
-            processor.vector_store.entered,
-            "the aggregate deadline must be consumed by the drain phases, so "
-            "the trailing optimize is never started (the composed worst case "
-            "is one budget, not a budget per phase)",
-        )
+        # NOTE: the FROZEN ORACLE assertion (the elapsed bound) comes FIRST:
+        # it is what makes this check discriminating at the base, so nothing
+        # may shadow it.
         self.assertLessEqual(
             elapsed,
             BOUND_SECONDS,
@@ -191,6 +183,17 @@ class TestStopHonorsOneAggregateDeadline(unittest.IsolatedAsyncioTestCase):
             "enforce one aggregate deadline across the whole drain sequence "
             "(or the Compose grace must be sized for the measured composed "
             "worst case).",
+        )
+        # The composed case reaches the optimize at all: the aggregate
+        # deadline is CONSUMED by the slow drain phases, so the trailing
+        # optimize is never started. That is the property the composed
+        # case proves, so it is asserted directly (the isolated optimize
+        # case is the one that must reach the branch).
+        self.assertFalse(
+            processor.vector_store.entered,
+            "the aggregate deadline must be consumed by the drain phases, so "
+            "the trailing optimize is never started (the composed worst case "
+            "is one budget, not a budget per phase)",
         )
 
     async def test_drain_phases_share_one_budget(self):
