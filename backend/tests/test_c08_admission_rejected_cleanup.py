@@ -210,9 +210,12 @@ async def test_rejection_cancels_overlap_tasks():
 async def test_rejection_leaves_no_unawaited_embed_coroutines():
     """AC13 (issue #713, T1-32-S2-03): with query transformation disabled (one
     'original' variant), an AdmissionRejected streaming turn must leave zero
-    ``RuntimeWarning``s containing "never awaited" after the generator ends
-    and ``gc.collect()`` runs. RED at the base commit (the variant's
-    ``_embed_one`` coroutine is dropped), GREEN after the fix."""
+    un-awaited of the engine's OWN ``_embed_one`` coroutines after the
+    generator ends and ``gc.collect()`` runs — foreign mock garbage from
+    other tests' AsyncMock leftovers is flushed before the capture window
+    and filtered out of the count (issue #1226). RED at the base commit
+    (the variant's ``_embed_one`` coroutine is dropped), GREEN after the
+    fix."""
     release = threading.Event()
     engine = _make_engine(_BlockingMemoryStore(release))
     controller = _RejectEmbeddingController()
@@ -226,6 +229,14 @@ async def test_rejection_leaves_no_unawaited_embed_coroutines():
         patch.object(settings, "query_transformation_enabled", False),
     ):
         agen = engine.query("test query", [], stream=True)
+        # Flush foreign garbage OUTSIDE the capture window (issue #1226):
+        # earlier tests on the same xdist worker can leave un-awaited
+        # AsyncMock coroutines in reference cycles, and finalizing them
+        # inside the block below would attribute their warnings to this
+        # test. Recorded and discarded — they are not this test's signal.
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            gc.collect()
         with warnings.catch_warnings(record=True) as recorded:
             warnings.simplefilter("always")
             try:
@@ -240,6 +251,12 @@ async def test_rejection_leaves_no_unawaited_embed_coroutines():
                 for w in recorded
                 if issubclass(w.category, RuntimeWarning)
                 and "never awaited" in str(w.message)
+                # Only the engine's own embed coroutine counts (issue
+                # #1226): the dropped coroutine this check pins is
+                # rag_engine's nested ``_embed_one``; foreign mock garbage
+                # names ``AsyncMockMixin._execute_mock_call`` and must not
+                # fail this test.
+                and "_embed_one" in str(w.message)
             ]
 
     assert len(never_awaited) == 0, (
