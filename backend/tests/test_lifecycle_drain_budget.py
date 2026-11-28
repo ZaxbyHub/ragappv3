@@ -68,12 +68,20 @@ class _SlowJoinable:
 
 
 class _SlowVectorStore:
-    """Vector store double whose optimize stalls ``stall_seconds``."""
+    """Vector store double whose optimize stalls ``stall_seconds``.
+
+    ``entered`` records that flush_optimize() was actually CALLED: the
+    bounded-optimize assertions are only meaningful when the optimize
+    branch ran (a stop implementation that skipped it would otherwise
+    satisfy the timing assertion).
+    """
 
     def __init__(self, stall_seconds: float):
         self._stall_seconds = stall_seconds
+        self.entered = False
 
     async def flush_optimize(self):
+        self.entered = True
         await asyncio.sleep(self._stall_seconds)
 
 
@@ -106,8 +114,11 @@ def _build_minimal_processor(
                 drain_seconds=join_stall_seconds
             )
             self.shutdown_event = asyncio.Event()
+            self.vector_store = _SlowVectorStore(
+                stall_seconds=flush_stall_seconds
+            )
             self.processor = SimpleNamespace(
-                vector_store=_SlowVectorStore(stall_seconds=flush_stall_seconds),
+                vector_store=self.vector_store,
                 pool=None,
             )
             self._worker_tasks = ()
@@ -201,6 +212,11 @@ class TestStopHonorsOneAggregateDeadline(unittest.IsolatedAsyncioTestCase):
             flush_stall_seconds=FLUSH_STALL_SECONDS,
         )
         elapsed = await _run_stop_and_measure(processor, BUDGET_SECONDS)
+        self.assertTrue(
+            processor.vector_store.entered,
+            "flush_optimize() must actually have been called — otherwise "
+            "this test proves nothing about the bounded optimize",
+        )
         self.assertLessEqual(
             elapsed,
             BOUND_SECONDS,

@@ -70,7 +70,10 @@ logger = logging.getLogger(__name__)  # noqa: E402
 # the 15 s is the turn-finalizer drain's 5 s producer retirement plus its
 # 10 s drain.) The 135 s composed envelope sits below the 140 s native
 # stop wait and the 150 s compose grace, so a shutdown that stays inside
-# the enforced 100 s is never force-killed mid-flight.
+# the enforced 100 s is never force-killed mid-flight IN STATE A (the
+# bounded tail exit fired). In State B the tail exit is skipped while a
+# recovery-critical workflow is in flight: the process then exits through the
+# normal path and the outer grace MAY terminate it.
 # scripts/check_p03_shutdown_envelope.py owns that arithmetic: it reads
 # every enforced term from the code that enforces it and fails when a
 # surface stops quoting this line.
@@ -1673,13 +1676,25 @@ def _bounded_tail_exit(turn_finalizers_drained: bool, pool_closed: bool) -> bool
                 handler.flush()
         os._exit(0)
         return True  # pragma: no cover — os._exit does not return
+    # Name the workflow that is still live: an operator triaging a
+    # force-cut needs to know WHICH recovery protocol was unfinished.
+    critical_work = "unreadable"
+    try:
+        from app.services.shutdown_gate import active_critical_work
+
+        critical_work = ",".join(sorted(active_critical_work())) or "none"
+    except Exception:  # noqa: BLE001 — diagnostics must never raise
+        critical_work = "unreadable"
     logging.getLogger().info(
-        "ragapp: critical work incomplete at the tail (finalizers=%s "
-        "pool_closed=%s uploads_pending=%s) — normal exit; recovery "
-        "contracts govern",
+        "ragapp: bounded tail exit SKIPPED — critical work incomplete at "
+        "the tail (finalizers=%s pool_closed=%s uploads_pending=%s "
+        "critical=%s); the normal shutdown path continues (executor joins) "
+        "and the outer force boundary may terminate the process; the "
+        "recovery contracts govern",
         turn_finalizers_drained,
         pool_closed,
         uploads_pending,
+        critical_work,
     )
     for handler in logging.getLogger().handlers:
         with contextlib_suppress(Exception):

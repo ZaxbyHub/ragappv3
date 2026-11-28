@@ -3412,13 +3412,47 @@ class BackgroundProcessor:
         existing-shaped warning and the sequence proceeds; janitor/
         startup-recovery backstops own anything left un-finished.
 
+        THE BOUND IS NOT A HARD WALL-CLOCK CEILING. A stage is bounded by
+        ``asyncio.wait_for``, which CANCELS the awaited work and then
+        waits for that cancellation to land: a stage whose cancellation is
+        delayed (a to_thread worker finishing a statement under the SQLite
+        busy_timeout, for example) can hold the sequence past its slice.
+        The delay is bounded by that work, not by this budget. When the
+        CALLER cancels ``stop()`` from outside (the lifespan's
+        ``_stop_stage`` does that when the stage budget expires), the
+        processor still reaches its terminal state: ``_stop_guarded``
+        applies it from a ``finally``. What an outside cancellation can
+        skip is the work that had not finished yet — the lease
+        hand-back and the parked-retry reset — and the janitor and the
+        next startup's recovery own those.
+
         Args:
             timeout: Aggregate shutdown budget (default: 60 seconds)
         """
         if not self._running:
             logger.warning("Background processor is not running")
             return
+        await self._stop_guarded(self._stop_sequence(timeout))
 
+    async def _stop_guarded(self, sequence) -> None:
+        """Run the shutdown sequence, ALWAYS reaching the terminal state.
+
+        The lifespan's ``_stop_stage`` cancels the stage task when the
+        stage's budget expires, so a cancellation can arrive inside
+        ``stop()`` and abort it. The processor's terminal state (the
+        shutdown event, the remaining task cancellations, the registry
+        clears, the permit release and ``_running = False``) must be
+        applied in that case too: a half-stopped processor keeps its
+        worker threads alive and its write permit held, which would
+        outlive the composed envelope at interpreter exit.
+        """
+        try:
+            await sequence
+        finally:
+            self._finalize_stop_state()
+
+    async def _stop_sequence(self, timeout: float) -> None:
+        """The composed shutdown sequence (the body of the old ``stop()``)."""
         logger.info("Stopping background processor...")
         deadline = time.monotonic() + timeout
 
@@ -3772,6 +3806,30 @@ class BackgroundProcessor:
         self._write_semaphore = None
         self._running = False
         logger.info("Background processor stopped")
+
+    def _finalize_stop_state(self) -> None:
+        """Apply the processor's terminal state (idempotent).
+
+        Called on the normal shutdown path AND from ``_stop_guarded``'s
+        ``finally``, so an outside cancellation cannot skip it.
+        """
+        # partial-construction paths that predate these ownership registries.
+        for state_name in (
+            "_recovery_file_ids",
+            "_queued_file_ids",
+            "_reindex_job_ids",
+        ):
+            state = getattr(self, state_name, None)
+            if state is not None:
+                state.clear()
+        # issue #704 review (PRR-009): release the pool-carried permit so
+        # post-stop writers return to the documented no-serialization
+        # contract instead of acquiring an orphaned loop-bound semaphore.
+        if getattr(self.processor, "pool", None) is not None:
+            self.processor.pool.write_permit = None
+        self.processor._write_semaphore = None
+        self._write_semaphore = None
+        self._running = False
 
     async def enqueue(
         self,

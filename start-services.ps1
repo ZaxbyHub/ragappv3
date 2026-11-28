@@ -127,7 +127,15 @@ function Stop-BackendProcessGracefully {
         # names) -- GenerateConsoleCtrlEvent's group argument must be the
         # group leader, and with a venv that is the redirector, not the port
         # owner.
-        Start-Process $SenderPy -ArgumentList ($Sender, "$groupPid") -WindowStyle Hidden | Out-Null
+        # The sender path is path-valued: quote it (Windows PowerShell 5.1
+        # splits an unquoted -ArgumentList element on spaces). -Wait -PassThru
+        # lets the script SEE the sender's exit status, so a failed attach or
+        # a failed CTRL_BREAK is reported instead of silently waiting out the
+        # whole graceful window.
+        $SenderProc = Start-Process $SenderPy -ArgumentList @('"{0}"' -f $Sender, "$groupPid") -WindowStyle Hidden -Wait -PassThru
+        if ($SenderProc.ExitCode -ne 0) {
+            Write-Output "  ${Label}: the CTRL_BREAK sender reported exit code $($SenderProc.ExitCode) (attach or event delivery failed); the graceful window still applies"
+        }
         Write-Output "  ${Label}: sent graceful CTRL_BREAK to grouped backend (group $groupPid, owner PID $($Proc.Id)); waiting..."
         # 140 s > the composed shutdown envelope, so the force fallback
         # never fires before a graceful shutdown that stayed inside the
@@ -167,7 +175,7 @@ function Stop-ProcessOnPort {
                 # frontend process gets the immediate force stop it had at
                 # base (a bounded wait bought nothing for it).
                 Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-                Write-Output "  port $Port: force-stopped (PID $($proc.Id))"
+                Write-Output "  port ${Port}: force-stopped (PID $($proc.Id))"
             }
         }
     }
@@ -177,6 +185,19 @@ if ($StopExisting) {
     Stop-ProcessOnPort $BackendPort -Graceful
     Stop-ProcessOnPort $FrontendPort
     Start-Sleep -Seconds 2
+}
+
+# A SECOND launch while the backend port is already held must not run: the
+# grouped wrapper writes the pid marker right after spawning, so the new
+# (failing) child would overwrite the live backend's marker and the stop
+# path would fall back to the force branch. Without -StopExisting the
+# operator asked to keep what is running.
+$BackendPortHeld = [bool](Get-NetTCPConnection -LocalPort ([int]$BackendPort) -ErrorAction SilentlyContinue)
+if ($BackendPortHeld) {
+    Write-Output "  ${BackendPort} (Backend): already in use - skipping the backend launch (use -StopExisting to replace it)"
+    $SkipBackendLaunch = $true
+} else {
+    $SkipBackendLaunch = $false
 }
 
 if (-not $SkipOllama) {
@@ -269,14 +290,24 @@ if (-not $SkipEmbedding) {
 # RAGAPP_BOUNDED_EXIT=1 (inherited by the child only for this launch)
 # enables the lifespan's bounded tail exit — same contract as the Dockerfile.
 $BackendArgs = @("-m","uvicorn","app.main:app","--host","0.0.0.0","--port",$BackendPort,"--no-access-log","--timeout-graceful-shutdown","20")
-$env:RAGAPP_BOUNDED_EXIT = "1"
-$env:RAGAPP_MARKER_DIR = $RepoRoot
-Start-Process $BackendPython `
-    -ArgumentList (@((Join-Path $RepoRoot "scripts\win_grouped_backend.py"), $BackendPython) + $BackendArgs) `
-    -WorkingDirectory $BackendDir `
-    -WindowStyle Hidden
-$env:RAGAPP_BOUNDED_EXIT = $null
-$env:RAGAPP_MARKER_DIR = $null
+if (-not $SkipBackendLaunch) {
+    $env:RAGAPP_BOUNDED_EXIT = "1"
+    $env:RAGAPP_MARKER_DIR = $RepoRoot
+    # Windows PowerShell 5.1 joins -ArgumentList array elements with spaces
+    # and does NOT quote them, so a path-valued element (a repo root
+    # containing a space) is split into two argv entries and the interpreter
+    # exits before it starts. Every path-valued element therefore carries
+    # embedded quotes.
+    $WrapperScript = Join-Path $RepoRoot "scripts\win_grouped_backend.py"
+    $QuotedWrapper = '"{0}"' -f $WrapperScript
+    $QuotedBackendPython = '"{0}"' -f $BackendPython
+    Start-Process $BackendPython `
+        -ArgumentList (@($QuotedWrapper, $QuotedBackendPython) + $BackendArgs) `
+        -WorkingDirectory $BackendDir `
+        -WindowStyle Hidden
+    $env:RAGAPP_BOUNDED_EXIT = $null
+    $env:RAGAPP_MARKER_DIR = $null
+}
 
 # Use cmd /c to avoid npm .cmd being opened in Notepad by Start-Process.
 Start-Process cmd `

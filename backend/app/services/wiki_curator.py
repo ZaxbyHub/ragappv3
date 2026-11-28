@@ -493,14 +493,21 @@ class WikiCurator:
             # never a failure (the curator must not fail the job).
             from app.services.wiki_compiler import CURATOR_SHUTDOWN
 
-            if CURATOR_SHUTDOWN.is_set():
-                return (None, None)
             prompt = build_user_prompt(
                 [chunk],
                 deterministic_summary=deterministic_summary,
                 existing_entities_brief=existing_entities_brief,
             )
             async with semaphore:
+                # The cooperative shutdown check lives INSIDE the semaphore,
+                # immediately before the propose call: gather() starts every
+                # chunk task at once, so a check made before the semaphore
+                # is passed by every chunk before the flag is ever set and
+                # the abort never fires for an orchestration already
+                # running. Here a chunk that reaches the front of the
+                # queue AFTER the flag is set skips its propose.
+                if CURATOR_SHUTDOWN.is_set():
+                    return (None, None)
                 try:
                     text = await self.client.propose(
                         [

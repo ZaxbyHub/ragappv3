@@ -95,7 +95,15 @@ function Stop-BackendProcessGracefully {
         # names) -- GenerateConsoleCtrlEvent's group argument must be the
         # group leader, and with a venv that is the redirector, not the port
         # owner.
-        Start-Process $SenderPy -ArgumentList ($Sender, "$groupPid") -WindowStyle Hidden | Out-Null
+        # The sender path is path-valued: quote it (Windows PowerShell 5.1
+        # splits an unquoted -ArgumentList element on spaces). -Wait -PassThru
+        # lets the script SEE the sender's exit status, so a failed attach or
+        # a failed CTRL_BREAK is reported instead of silently waiting out the
+        # whole graceful window.
+        $SenderProc = Start-Process $SenderPy -ArgumentList @('"{0}"' -f $Sender, "$groupPid") -WindowStyle Hidden -Wait -PassThru
+        if ($SenderProc.ExitCode -ne 0) {
+            Write-Output "  ${Label}: the CTRL_BREAK sender reported exit code $($SenderProc.ExitCode) (attach or event delivery failed); the graceful window still applies"
+        }
         Write-Output "  ${Label}: sent graceful CTRL_BREAK to grouped backend (group $groupPid, owner PID $($Proc.Id)); waiting..."
         # 140 s > the composed shutdown envelope, so the force fallback
         # never fires before a graceful shutdown that stayed inside the

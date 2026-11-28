@@ -49,7 +49,10 @@ abandoned-parse worker keeps running) or the interpreter teardown.
 
 The compose grace is 150 s and the native stop wait is 140 s — both strictly
 above the 135 s composed envelope, so a shutdown that stays inside the
-enforced 100 s is never force-killed mid-flight.
+enforced 100 s is never force-killed mid-flight IN STATE A (the bounded
+tail exit fired). In State B the tail exit is skipped while a
+recovery-critical workflow is in flight: the process then exits through the
+normal path and the outer grace MAY terminate it.
 
 **The residency settle ends on its bound, not on a task's cooperation.**
 Awaiting a residency task DIRECTLY forwards the enclosing scope's

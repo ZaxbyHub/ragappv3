@@ -144,12 +144,24 @@ class TestTailGatePredicate(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_conftest_pops_the_env(self):
-        # The pin for the conftest pop: with conftest applied, a shell-
-        # exported flag cannot reach the test process. Simulate by calling
-        # the same pop logic conftest runs at import.
-        with mock.patch.dict(os.environ, {"RAGAPP_BOUNDED_EXIT": "1"}):
-            os.environ.pop("RAGAPP_BOUNDED_EXIT", None)
-            self.assertNotIn("RAGAPP_BOUNDED_EXIT", os.environ)
+        # The guard must pin CONFTEST's pop, not repeat it: deleting
+        # conftest.py's pop would leave the old version of this test green
+        # (it popped the variable itself and asserted it was gone), while a
+        # real lifespan test in the same worker could then inherit
+        # RAGAPP_BOUNDED_EXIT=1 and os._exit(0) the pytest process.
+        conftest_path = os.path.join(
+            os.path.dirname(__file__), "conftest.py"
+        )
+        with open(conftest_path, encoding="utf-8") as fh:
+            conftest_source = fh.read()
+        self.assertIn(
+            'os.environ.pop("RAGAPP_BOUNDED_EXIT"',
+            conftest_source,
+            "conftest.py must pop RAGAPP_BOUNDED_EXIT so a shell-exported "
+            "flag can never reach a test process",
+        )
+        # And the invariant itself, unpatched: the flag is absent here.
+        self.assertNotIn("RAGAPP_BOUNDED_EXIT", os.environ)
 
 
 class TestRegistrationMapPin(unittest.TestCase):
@@ -175,6 +187,7 @@ class TestRegistrationMapPin(unittest.TestCase):
         ("backend/app/api/routes/memories.py", "memory-transaction"): 1,
         ("backend/app/api/routes/chat.py", "turn-finalizer-drain"): 1,
         ("backend/app/api/routes/draft_room.py", "upload-commit"): 1,
+        ("backend/app/services/task_drain.py", "security-audit-drain"): 1,
     }
 
     def test_registration_sites_are_complete(self):
@@ -694,7 +707,14 @@ class TestBoundedOptimizeModel(unittest.IsolatedAsyncioTestCase):
         from app.services.background_tasks import BackgroundProcessor
 
         class _SlowStore:
+            def __init__(self):
+                # ``entered`` proves the optimize branch RAN: the timing
+                # assertion below is only meaningful when flush_optimize()
+                # was actually called.
+                self.entered = False
+
             async def flush_optimize(self):
+                self.entered = True
                 await asyncio.sleep(30)
 
         class _Proc(BackgroundProcessor):
@@ -714,8 +734,18 @@ class TestBoundedOptimizeModel(unittest.IsolatedAsyncioTestCase):
 
         proc = _Proc()
         started = _time.monotonic()
-        await asyncio.wait_for(proc.stop(timeout=1.0), timeout=6.0)
+        # The optimize branch is gated on settings.optimize_on_shutdown:
+        # pin it, or the test can pass without the optimize ever running.
+        from app.config import settings
+
+        with mock.patch.object(settings, "optimize_on_shutdown", True):
+            await asyncio.wait_for(proc.stop(timeout=1.0), timeout=6.0)
         elapsed = _time.monotonic() - started
+        self.assertTrue(
+            proc.processor.vector_store.entered,
+            "flush_optimize() must actually have been called — otherwise "
+            "the boundedness assertion proves nothing",
+        )
         self.assertLessEqual(elapsed, 3.0)
         self.assertFalse(proc._running)
 

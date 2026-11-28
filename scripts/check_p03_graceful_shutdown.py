@@ -133,10 +133,13 @@ def main() -> int:
         print("FAIL: Dockerfile has no CMD line")
         return 1
 
-    flag_line = next(
-        (line for line in cmd_lines if FLAG_TOKEN_RE.search(line)), None
-    )
-    if flag_line is None:
+    # Docker runs the LAST CMD instruction of a stage, and argparse lets
+    # the LAST occurrence of a repeated option win: the gate must read the
+    # CMD that actually runs and the flag value the runtime actually
+    # receives (the envelope gate reads the same two things, so the two
+    # gates cannot disagree about the operative command).
+    flag_line = cmd_lines[-1]
+    if not FLAG_TOKEN_RE.search(flag_line):
         print("FAIL: Dockerfile uvicorn CMD has no --timeout-graceful-shutdown")
         return 1
 

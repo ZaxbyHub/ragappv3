@@ -72,7 +72,18 @@ async def drain_audit(audit_coro: Coroutine) -> None:
     retried, so it is logged loudly rather than returned silently
     (swarm-pr-review F-06).
     """
-    cancelled, error = await drain_await(asyncio.ensure_future(audit_coro))
+    # The audit write is a DURABILITY unit like the vault committed-audit
+    # arm: the bounded tail exit must not fire while the row is being
+    # written on a checked-out connection the pool close does not touch
+    # (the write would be lost and the security_events row is never
+    # regenerated). Registering here covers EVERY caller of this helper in
+    # one place.
+    from app.services.shutdown_gate import critical_shutdown_work
+
+    async with critical_shutdown_work("security-audit-drain"):
+        cancelled, error = await drain_await(
+            asyncio.ensure_future(audit_coro)
+        )
     if error is not None:
         if isinstance(error, asyncio.CancelledError):
             logger.warning(

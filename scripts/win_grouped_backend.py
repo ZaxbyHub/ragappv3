@@ -33,7 +33,13 @@ def main() -> int:
     # within a tolerance, so wall-clock precision is sufficient for PID-reuse
     # detection (a reused PID differs by minutes, not microseconds).
     start_ticks = int(time.time() * 10_000_000 + 116444736000000000)
-    marker_dir = os.environ.get("RAGAPP_MARKER_DIR", ".")
+    # The marker dir defaults to the REPOSITORY ROOT derived from this
+    # script's own location (scripts/win_grouped_backend.py -> the parent),
+    # not the current working directory: the stop path always reads
+    # <repo-root>/.cache/backend.pid, so a CWD-relative default would
+    # write the marker where the stop script never looks.
+    default_marker_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    marker_dir = os.environ.get("RAGAPP_MARKER_DIR") or default_marker_dir
     try:
         os.makedirs(os.path.join(marker_dir, ".cache"), exist_ok=True)
         with open(

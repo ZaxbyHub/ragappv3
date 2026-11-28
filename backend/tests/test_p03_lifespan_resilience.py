@@ -225,8 +225,9 @@ class TestFTSRemediationPointerExists(unittest.TestCase):
     """AC7: lifespan must not direct operators at a nonexistent method."""
 
     def test_lifespan_does_not_point_at_missing_fts_method(self):
-        vector_store_module = pytest.importorskip("app.services.vector_store")
-        vector_store = vector_store_module.VectorStore
+        # A plain import, not importorskip: a skip would report the guard
+        # as passed when the vector store could not be imported at all.
+        from app.services.vector_store import VectorStore as vector_store
         source = _lifespan_source()
         ok = ("_ensure_fts_index" not in source) or hasattr(
             vector_store, "_ensure_fts_index"
